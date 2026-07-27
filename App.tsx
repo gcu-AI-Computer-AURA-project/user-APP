@@ -2875,6 +2875,7 @@ function ScreenShell({
         style={styles.content}
         contentContainerStyle={[styles.contentInner, compactTop && styles.contentInnerCompact]}
         showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
       >
         {children}
       </ScrollView>
@@ -2884,24 +2885,7 @@ function ScreenShell({
 }
 
 function DeviceStatusBar({ compact }: { compact?: boolean }) {
-  const [now, setNow] = useState(() => new Date());
-
-  useEffect(() => {
-    const timer = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const timeLabel = now.toLocaleTimeString('ko-KR', {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: false,
-  });
-
-  return (
-    <View style={compact ? styles.statusBarRow : styles.statusOnly}>
-      <Text style={styles.statusTime}>{timeLabel}</Text>
-    </View>
-  );
+  return <View style={compact ? styles.statusBarRow : styles.statusOnly} />;
 }
 
 function BottomNav() {
@@ -3387,49 +3371,12 @@ function YearRangeSlider({ range, setRange }: { range: MonthRange; setRange: Rea
   const rangeRef = useRef(range);
   const startFrom = useRef(range.from);
   const startTo = useRef(range.to);
-  const mouseStartX = useRef(0);
-  const mouseStartMonth = useRef(0);
-  const activeMouseThumb = useRef<'from' | 'to' | null>(null);
   const left = ((range.from - minScanMonthIndex) / (maxScanMonthIndex - minScanMonthIndex)) * trackWidth;
   const right = ((range.to - minScanMonthIndex) / (maxScanMonthIndex - minScanMonthIndex)) * trackWidth;
 
   useEffect(() => {
     rangeRef.current = range;
   }, [range]);
-
-  useEffect(() => {
-    const onMove = (event: MouseEvent) => {
-      if (!activeMouseThumb.current) return;
-      const next = clampScanMonth(mouseStartMonth.current + Math.round((event.clientX - mouseStartX.current) / monthStep));
-      setRange((items) => {
-        const updated =
-          activeMouseThumb.current === 'from'
-            ? { ...items, from: Math.min(next, items.to) }
-            : { ...items, to: Math.max(next, items.from) };
-        rangeRef.current = updated;
-        return updated;
-      });
-    };
-
-    const onUp = () => {
-      activeMouseThumb.current = null;
-    };
-
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [monthStep, setRange]);
-
-  const startMouseDrag = (thumb: 'from' | 'to', event: { clientX: number; preventDefault?: () => void; stopPropagation?: () => void }) => {
-    event.preventDefault?.();
-    event.stopPropagation?.();
-    activeMouseThumb.current = thumb;
-    mouseStartX.current = event.clientX;
-    mouseStartMonth.current = thumb === 'from' ? rangeRef.current.from : rangeRef.current.to;
-  };
 
   const fromResponder = useRef(
     PanResponder.create({
@@ -3474,14 +3421,12 @@ function YearRangeSlider({ range, setRange }: { range: MonthRange; setRange: Rea
         <View
           style={[styles.yearHandle, { left: left - 22 }]}
           {...fromResponder.panHandlers}
-          {...({ onMouseDown: (event: MouseEvent) => startMouseDrag('from', event) } as object)}
         >
           <Text style={styles.yearHandleText}>{formatMonthShortLabel(range.from)}</Text>
         </View>
         <View
           style={[styles.yearHandle, { left: right - 22 }]}
           {...toResponder.panHandlers}
-          {...({ onMouseDown: (event: MouseEvent) => startMouseDrag('to', event) } as object)}
         >
           <Text style={styles.yearHandleText}>{formatMonthShortLabel(range.to)}</Text>
         </View>
@@ -4899,21 +4844,17 @@ function ProgressCircle({ progress, compact }: { progress: number; compact?: boo
 const styles = StyleSheet.create({
   page: {
     flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#DFE8E5',
+    alignItems: 'stretch',
+    justifyContent: 'flex-start',
+    backgroundColor: '#FFFFFF',
   },
   phone: {
-    width: 360,
-    height: 780,
+    flex: 1,
+    width: '100%',
+    height: '100%',
     overflow: 'hidden',
     backgroundColor: '#FFFFFF',
-    borderRadius: 18,
-    shadowColor: '#09233F',
-    shadowOpacity: 0.18,
-    shadowRadius: 24,
-    shadowOffset: { width: 0, height: 12 },
-    elevation: 10,
+    borderRadius: 0,
   },
   screenTransition: {
     flex: 1,
@@ -5024,26 +4965,26 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
   },
   header: {
-    height: 98,
-    paddingTop: 8,
+    height: 76,
+    paddingTop: 2,
     paddingHorizontal: 18,
     borderBottomWidth: 1,
     borderBottomColor: line,
     justifyContent: 'flex-start',
   },
   headerNoBack: {
-    height: 104,
+    height: 82,
     borderBottomWidth: 0,
   },
   statusOnly: {
-    height: 28,
+    height: 0,
     flexDirection: 'row',
     alignItems: 'flex-end',
     justifyContent: 'space-between',
     paddingHorizontal: 18,
   },
   statusBarRow: {
-    height: 22,
+    height: 0,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -5066,7 +5007,7 @@ const styles = StyleSheet.create({
     backgroundColor: text,
   },
   headerTitleRow: {
-    marginTop: 5,
+    marginTop: 8,
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 18,
