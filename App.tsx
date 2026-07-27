@@ -1,11 +1,11 @@
 import React, { useContext, useEffect, useRef, useState } from 'react';
 import {
   Animated,
+  BackHandler,
   Easing,
   Image,
   PanResponder,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   StatusBar,
@@ -13,6 +13,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 type Screen =
   | 'initial'
@@ -76,7 +77,7 @@ type ScanListItem = {
   detailSubtitle?: string;
 };
 type StorageMailItem = { id: string; title: string; subtitle: string; meta: string; badge?: string };
-type StorageDriveItem = { id: string; type: string; title: string; subtitle: string };
+type StorageDriveItem = { id: string; type: string; title: string; subtitle: string; fullPath?: string };
 type ScanSummary = {
   mailItems: ScanListItem[];
   driveItems: ScanListItem[];
@@ -214,6 +215,12 @@ const getBackFallbackForScreen = (screen: Screen): Screen => {
   return 'home';
 };
 
+const defaultTabScreens: Record<MainTab, Screen> = {
+  home: 'home',
+  storage: 'storageMail',
+  settings: 'settings',
+};
+
 const NavigationContext = React.createContext<{
   current: Screen;
   currentTab: MainTab | null;
@@ -256,6 +263,48 @@ const driveFolderOptions = [
   { name: '내 Drive › 문서 보관함 › 과제 백업', meta: '파일 1개 · 820MB' },
   { name: '내 Drive › 사진 백업', meta: '하위 폴더 1개 · 1.2GB' },
   { name: '내 Drive › 사진 백업 › 2020 여행', meta: '파일 1개 · 1.2GB' },
+];
+
+const driveRootPath = '내 Drive';
+const splitDrivePath = (path: string) => path.split('›').map((part) => part.trim()).filter(Boolean);
+const getDriveParentPath = (path: string) => {
+  const parts = splitDrivePath(path);
+  if (parts.length <= 1) return null;
+  return parts.slice(0, -1).join(' › ');
+};
+const getDriveFolderName = (path: string) => splitDrivePath(path).at(-1) ?? path;
+const getDirectDriveFolders = (parentPath: string) => {
+  const parentParts = splitDrivePath(parentPath);
+  return driveFolderOptions.filter((folder) => {
+    const parts = splitDrivePath(folder.name);
+    return parts.length === parentParts.length + 1 && parentParts.every((part, index) => parts[index] === part);
+  });
+};
+const getVisibleDriveFolders = (currentPath: string, search: string) => {
+  const query = search.trim().toLowerCase();
+  if (query) {
+    return driveFolderOptions.filter((folder) => folder.name.toLowerCase().includes(query));
+  }
+
+  return getDirectDriveFolders(currentPath);
+};
+const hasDriveFolderChildren = (path: string) => getDirectDriveFolders(path).length > 0;
+const getDirectDriveFiles = (folderPath: string) => auraDriveFiles.filter((file) => file.folderPath === folderPath);
+const getStorageDriveItemsForFolder = (folderPath: string): StorageDriveItem[] => [
+  ...getDirectDriveFolders(folderPath).map((folder) => ({
+    id: `storage-folder-${folder.name}`,
+    type: 'F',
+    title: getDriveFolderName(folder.name),
+    subtitle: `${folder.name} · 폴더`,
+    fullPath: folder.name,
+  })),
+  ...getDirectDriveFiles(folderPath).map((file) => ({
+    id: `storage-${file.id}`,
+    type: file.type,
+    title: file.title,
+    subtitle: `${file.type} · ${formatDataSize(file.sizeMB)} · 수정 ${file.modifiedAt} · ${file.folderPath}`,
+    fullPath: file.folderPath,
+  })),
 ];
 
 const sampleTrashItems: StorageMailItem[] = [
@@ -514,6 +563,8 @@ export default function App() {
   const [includeMailAttachments, setIncludeMailAttachments] = useState(false);
   const [scanSources, setScanSources] = useState({ gmail: true, drive: false, folder: false });
   const [driveFolderSearch, setDriveFolderSearch] = useState('');
+  const [driveCurrentFolder, setDriveCurrentFolder] = useState(driveRootPath);
+  const [storageDriveFolder, setStorageDriveFolder] = useState(driveRootPath);
   const [selectedDriveFolders, setSelectedDriveFolders] = useState<string[]>([]);
   const [includeSubFolders, setIncludeSubFolders] = useState(true);
   const [periodRange, setPeriodRange] = useState('3년 이상');
@@ -602,10 +653,35 @@ export default function App() {
     return getBackFallbackForScreen(target);
   };
 
+  const getResolvedBackParent = (target: Screen): Screen => {
+    if (target === 'privacy' || target === 'login') return 'initial';
+    if (target === 'permissions') return 'login';
+    if (target === 'gmailPermission' || target === 'drivePermission' || target === 'notificationPermission') return 'permissions';
+    if (target === 'connected') return 'permissions';
+    if (target === 'onboardingGhost') return 'connected';
+    if (target === 'onboardingCarbon') return 'onboardingGhost';
+
+    const tab = getResolvedTabForScreen(target);
+    if (tab) return defaultTabScreens[tab];
+
+    return getResolvedBackFallback(target);
+  };
+
   const navigateTab = (tab: MainTab) => {
-    const next = lastTabScreens[tab];
-    if (screen === next) return;
     const currentTab = getResolvedTabForScreen(screen);
+
+    if (currentTab === tab) {
+      const defaultScreen = defaultTabScreens[tab];
+      setLastTabScreens((items) => ({ ...items, [tab]: defaultScreen }));
+      setTabHistories((items) => ({ ...items, [tab]: [] }));
+      transitionDirection.current = 1;
+      setHistory([]);
+      setScreen(defaultScreen);
+      return;
+    }
+
+    const next = lastTabScreens[tab] ?? defaultTabScreens[tab];
+
     if (currentTab) {
       setTabHistories((items) => ({ ...items, [currentTab]: history }));
     }
@@ -817,6 +893,8 @@ export default function App() {
     setIncludeMailAttachments(false);
     setScanSources({ gmail: true, drive: false, folder: false });
     setDriveFolderSearch('');
+    setDriveCurrentFolder(driveRootPath);
+    setStorageDriveFolder(driveRootPath);
     setSelectedDriveFolders([]);
     setIncludeSubFolders(true);
     setOpenedYearRange({ from: toMonthIndex(2023, 1), to: maxScanMonthIndex });
@@ -978,19 +1056,24 @@ export default function App() {
   };
 
   const toggleAllDriveFolders = () => {
-    if (!driveFolderOptions.length) {
+    const visibleFolders = getVisibleDriveFolders(driveCurrentFolder, driveFolderSearch);
+
+    if (!visibleFolders.length) {
       showToast('선택할 Drive 폴더가 없어요');
       return;
     }
 
-    const allSelected = driveFolderOptions.every((folder) => selectedDriveFolders.includes(folder.name));
+    const allSelected = visibleFolders.every((folder) => selectedDriveFolders.includes(folder.name));
     if (allSelected) {
-      setSelectedDriveFolders([]);
-      setScanSources((items) => ({ ...items, folder: false }));
+      setSelectedDriveFolders((items) => {
+        const next = items.filter((item) => !visibleFolders.some((folder) => folder.name === item));
+        setScanSources((sources) => ({ ...sources, folder: Boolean(next.length), drive: next.length ? true : sources.drive }));
+        return next;
+      });
       return;
     }
 
-    setSelectedDriveFolders(driveFolderOptions.map((folder) => folder.name));
+    setSelectedDriveFolders((items) => Array.from(new Set([...items, ...visibleFolders.map((folder) => folder.name)])));
     setScanSources((items) => ({ ...items, drive: true, folder: true }));
   };
 
@@ -1013,11 +1096,9 @@ export default function App() {
     }
 
     transitionDirection.current = 1;
-    setHistory((items) => {
-      const next = [...items];
-      setScreen(next.pop() ?? getResolvedBackFallback(screen));
-      return next;
-    });
+    const parent = getResolvedBackParent(screen);
+    setHistory([]);
+    setScreen(parent);
   };
 
   const openCleanupComplete = () => {
@@ -1052,6 +1133,59 @@ export default function App() {
     markPrivacyConsent();
     replace('initial');
   };
+
+  useEffect(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (withdrawSheetVisible) {
+        closeWithdrawSheet();
+        return true;
+      }
+
+      if (keywordSheetType) {
+        closeKeywordSheet();
+        return true;
+      }
+
+      if (keywordChoiceVisible) {
+        closeKeywordChoiceSheet();
+        return true;
+      }
+
+      if (yearSheetType) {
+        closeYearSheet();
+        return true;
+      }
+
+      if (filterSheetVisible) {
+        closeFilterSheet();
+        return true;
+      }
+
+      if (carbonHelpVisible) {
+        setCarbonHelpVisible(false);
+        return true;
+      }
+
+      if (screen === 'initial') {
+        return true;
+      }
+
+      back();
+      return true;
+    });
+
+    return () => subscription.remove();
+  }, [
+    carbonHelpVisible,
+    filterSheetVisible,
+    history,
+    keywordChoiceVisible,
+    keywordSheetType,
+    privacyDetailChecked,
+    screen,
+    withdrawSheetVisible,
+    yearSheetType,
+  ]);
 
   useEffect(() => {
     screenRef.current = screen;
@@ -1347,8 +1481,10 @@ export default function App() {
   };
 
   const render = () => {
-    const filteredDriveFolders = driveFolderOptions.filter((folder) => folder.name.includes(driveFolderSearch.trim()));
-    const allDriveFoldersSelected = driveFolderOptions.length > 0 && driveFolderOptions.every((folder) => selectedDriveFolders.includes(folder.name));
+    const visibleDriveFolders = getVisibleDriveFolders(driveCurrentFolder, driveFolderSearch);
+    const allDriveFoldersSelected = visibleDriveFolders.length > 0 && visibleDriveFolders.every((folder) => selectedDriveFolders.includes(folder.name));
+    const driveParentFolder = getDriveParentPath(driveCurrentFolder);
+    const isDriveSearching = Boolean(driveFolderSearch.trim());
     const activeScanResult = lastScan?.result ?? scanResultRef.current;
     const promoMailItems = activeScanResult.mailItems.filter((item) => item.desc.includes('광고') || item.desc.includes('프로모션'));
     const oldMailItems = activeScanResult.mailItems.filter((item) => !promoMailItems.some((mail) => mail.id === item.id));
@@ -1832,18 +1968,34 @@ export default function App() {
               <View style={styles.infoMain}>
                 <Text style={styles.infoTitle}>{allDriveFoldersSelected ? '전체 선택 해제' : '전체 선택'}</Text>
                 <Text style={styles.infoDesc}>
-                  {driveFolderOptions.length ? `${selectedDriveFolders.length}/${driveFolderOptions.length}개 폴더 선택됨` : '선택할 폴더가 없어요'}
+                  {visibleDriveFolders.length
+                    ? `${visibleDriveFolders.filter((folder) => selectedDriveFolders.includes(folder.name)).length}/${visibleDriveFolders.length}개 폴더 선택됨`
+                    : '선택할 폴더가 없어요'}
                 </Text>
               </View>
             </Pressable>
-            {filteredDriveFolders.length ? (
-              filteredDriveFolders.map((folder) => (
+            {!isDriveSearching && driveCurrentFolder !== driveRootPath ? (
+              <Pressable
+                style={styles.folderBreadcrumbCard}
+                onPress={() => setDriveCurrentFolder(driveParentFolder ?? driveRootPath)}
+              >
+                <Text style={styles.folderBreadcrumbTitle}>‹ 상위 폴더로</Text>
+                <Text style={styles.folderBreadcrumbText}>{driveCurrentFolder}</Text>
+              </Pressable>
+            ) : null}
+            {visibleDriveFolders.length ? (
+              visibleDriveFolders.map((folder) => (
                 <FolderRow
                   key={folder.name}
-                  title={folder.name}
-                  desc={folder.meta}
+                  title={isDriveSearching ? folder.name : getDriveFolderName(folder.name)}
+                  desc={isDriveSearching ? folder.meta : `${folder.meta} · ${folder.name}`}
                   selected={selectedDriveFolders.includes(folder.name)}
+                  canOpen={hasDriveFolderChildren(folder.name)}
                   onPress={() => toggleDriveFolder(folder.name)}
+                  onOpen={() => {
+                    setDriveFolderSearch('');
+                    setDriveCurrentFolder(folder.name);
+                  }}
                 />
               ))
             ) : (
@@ -2012,7 +2164,7 @@ export default function App() {
             title={activeMailListTitle}
             prefix="mail"
             items={activeMailListItems}
-            goNext={() => go('selectedReview')}
+            goNext={back}
             checked={checked}
             toggle={toggleCheck}
             setAll={setAll}
@@ -2030,7 +2182,7 @@ export default function App() {
             title="Drive 결과 목록"
             prefix="drive"
             items={filteredDriveItems}
-            goNext={() => go('selectedReview')}
+            goNext={back}
             checked={checked}
             toggle={toggleCheck}
             setAll={setAll}
@@ -2048,7 +2200,7 @@ export default function App() {
             title="대용량 파일"
             prefix="drive"
             items={filteredLargeItems}
-            goNext={() => go('selectedReview')}
+            goNext={back}
             checked={checked}
             toggle={toggleCheck}
             setAll={setAll}
@@ -2278,6 +2430,8 @@ export default function App() {
             goMail={() => replace('storageMail')}
             goDrive={() => replace('storageDrive')}
             goTrash={() => replace(screen === 'storageDrive' || screen === 'storageDriveTrash' ? 'storageDriveTrash' : 'storageTrash')}
+            storageDriveFolder={storageDriveFolder}
+            setStorageDriveFolder={setStorageDriveFolder}
           />
         );
 
@@ -2518,7 +2672,7 @@ export default function App() {
 
       case 'analysisHistoryAll':
         return (
-          <ScreenShell title="전체보기 눌렀을 시">
+          <ScreenShell title="정리 기록 전체보기" subtitle="탄소 절감 기록에 포함할 항목 선택">
             {lastScan ? (
               <>
                 <Text style={styles.infoDesc}>탄소 절감 기록에 포함할 정리 기록을 선택하세요.</Text>
@@ -2592,19 +2746,20 @@ export default function App() {
   };
 
   return (
-    <NavigationContext.Provider
-      value={{
-        current: screen,
-        currentTab: getResolvedTabForScreen(screen),
-        navigate: replace,
-        navigateTab,
-        back,
-        connectedInstant: screen === 'connected' && skipConnectedAnimation,
-      }}
-    >
-      <SafeAreaView style={styles.page}>
-        <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" translucent={false} />
-        <View style={styles.phone}>
+    <SafeAreaProvider>
+      <NavigationContext.Provider
+        value={{
+          current: screen,
+          currentTab: getResolvedTabForScreen(screen),
+          navigate: replace,
+          navigateTab,
+          back,
+          connectedInstant: screen === 'connected' && skipConnectedAnimation,
+        }}
+      >
+        <SafeAreaView style={styles.page} edges={['top', 'bottom']}>
+          <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" translucent={false} />
+          <View style={styles.phone}>
           <Animated.View
             style={[
               styles.screenTransition,
@@ -2820,9 +2975,10 @@ export default function App() {
               </Pressable>
             </Animated.View>
           ) : null}
-        </View>
-      </SafeAreaView>
-    </NavigationContext.Provider>
+          </View>
+        </SafeAreaView>
+      </NavigationContext.Provider>
+    </SafeAreaProvider>
   );
 }
 
@@ -3039,7 +3195,21 @@ function ScanSourceCard({
   );
 }
 
-function FolderRow({ title, desc, selected, onPress }: { title: string; desc: string; selected: boolean; onPress: () => void }) {
+function FolderRow({
+  title,
+  desc,
+  selected,
+  canOpen,
+  onPress,
+  onOpen,
+}: {
+  title: string;
+  desc: string;
+  selected: boolean;
+  canOpen?: boolean;
+  onPress: () => void;
+  onOpen?: () => void;
+}) {
   return (
     <Pressable style={[styles.folderRow, selected && styles.folderRowSelected]} onPress={onPress}>
       <View style={styles.folderIcon}>
@@ -3049,6 +3219,11 @@ function FolderRow({ title, desc, selected, onPress }: { title: string; desc: st
         <Text style={styles.infoTitle}>{title}</Text>
         <Text style={styles.infoDesc}>{desc}</Text>
       </View>
+      {canOpen ? (
+        <Pressable style={styles.folderNavigateButton} onPress={onOpen ?? onPress} hitSlop={8}>
+          <Text style={styles.folderNavigateText}>›</Text>
+        </Pressable>
+      ) : null}
       <CheckBox checked={selected} onPress={onPress} compact />
     </Pressable>
   );
@@ -3901,6 +4076,8 @@ function StorageScreen({
   goMail,
   goDrive,
   goTrash,
+  storageDriveFolder,
+  setStorageDriveFolder,
 }: {
   mode: 'storageMail' | 'storageDrive' | 'storageTrash' | 'storageDriveTrash';
   scan: ScanRecord | null;
@@ -3914,6 +4091,8 @@ function StorageScreen({
   goMail: () => void;
   goDrive: () => void;
   goTrash: () => void;
+  storageDriveFolder: string;
+  setStorageDriveFolder: (folder: string) => void;
 }) {
   const isDrive = mode === 'storageDrive' || mode === 'storageDriveTrash';
   const isTrash = mode === 'storageTrash' || mode === 'storageDriveTrash';
@@ -3923,7 +4102,12 @@ function StorageScreen({
   const prefix = mode === 'storageDriveTrash' ? 'storageDriveTrash' : isTrash ? 'storageTrash' : isDrive ? 'storageDrive' : 'storageMail';
   const summary = scan?.result ?? emptyScanSummary;
   const mailItems = summary.storageMailItems;
-  const driveItems = summary.storageDriveItems;
+  const currentStorageDriveItems = getStorageDriveItemsForFolder(storageDriveFolder);
+  const driveItems = isDrive && !isTrash ? currentStorageDriveItems : summary.storageDriveItems;
+  const storageDriveBreadcrumbs = splitDrivePath(storageDriveFolder).map((part, index, parts) => ({
+    label: part,
+    path: parts.slice(0, index + 1).join(' › '),
+  }));
   const trashItems = isTrash
     ? summary.storageTrashItems.filter((item) => mode === 'storageDriveTrash' ? item.id.startsWith('trash-drive-') : !item.id.startsWith('trash-drive-'))
     : summary.storageTrashItems;
@@ -3990,7 +4174,22 @@ function StorageScreen({
               <Text style={styles.storageFilterText}>필터/정렬</Text>
             </Pressable>
           </View>
-          {isDrive && !isTrash ? <View style={styles.storagePathCard}><Text style={styles.infoTitle}>{summary.folderLabel}</Text></View> : null}
+          {isDrive && !isTrash ? (
+            <View style={styles.storagePathCard}>
+              <View style={styles.storageBreadcrumbRow}>
+                {storageDriveBreadcrumbs.map((crumb, index) => (
+                  <React.Fragment key={crumb.path}>
+                    <Pressable onPress={() => setStorageDriveFolder(crumb.path)} hitSlop={8}>
+                      <Text style={[styles.storageBreadcrumbText, index === storageDriveBreadcrumbs.length - 1 && styles.storageBreadcrumbCurrent]}>
+                        {crumb.label}
+                      </Text>
+                    </Pressable>
+                    {index < storageDriveBreadcrumbs.length - 1 ? <Text style={styles.storageBreadcrumbDivider}>›</Text> : null}
+                  </React.Fragment>
+                ))}
+              </View>
+            </View>
+          ) : null}
           {!isDrive && !isTrash ? (
             <GmailStoragePanel
               items={mailItems}
@@ -4017,6 +4216,7 @@ function StorageScreen({
                     checked={checked[`${prefix}:${item.id}`] ?? true}
                     toggle={toggle}
                     onMoveStart={() => setMovingDriveItem(item.title)}
+                    onOpenFolder={item.type === 'F' && item.fullPath ? () => setStorageDriveFolder(item.fullPath as string) : undefined}
                   />
               ))
               : mailItems.map((item) => (
@@ -4227,28 +4427,43 @@ function StorageDriveCard({
   checked,
   toggle,
   onMoveStart,
+  onOpenFolder,
 }: {
   prefix: string;
-  item: { id: string; type: string; title: string; subtitle: string };
+  item: StorageDriveItem;
   checked: boolean;
   toggle: (key: string) => void;
   onMoveStart: () => void;
+  onOpenFolder?: () => void;
 }) {
   const isFolder = item.type === 'F';
   const icon = isFolder ? '▰' : item.type === 'PDF' ? 'PDF' : item.type === 'ZIP' ? 'ZIP' : item.type === 'JPG' ? 'IMG' : 'DOC';
   return (
-    <Pressable style={styles.storageItemCard} onPress={() => toggle(`${prefix}:${item.id}`)} onLongPress={onMoveStart} delayLongPress={420}>
+    <View style={styles.storageItemCard}>
       <CheckBox checked={checked} onPress={() => toggle(`${prefix}:${item.id}`)} compact />
-      <View style={[styles.fileTypeIcon, isFolder && styles.folderTypeIcon]}>
-        <Text style={[styles.fileTypeText, isFolder && styles.folderTypeText]}>{icon}</Text>
-      </View>
-      <View style={styles.infoMain}>
-        <Text style={styles.infoTitle}>{item.title}</Text>
-        <Text style={styles.infoDesc}>{item.subtitle}</Text>
-        <Text style={styles.storageHintText}>길게 눌러 폴더 이동</Text>
-      </View>
-      <Text style={styles.chevron}>›</Text>
-    </Pressable>
+      <Pressable
+        style={styles.storageDriveItemPressArea}
+        onPress={() => toggle(`${prefix}:${item.id}`)}
+        onLongPress={onMoveStart}
+        delayLongPress={420}
+      >
+        <View style={[styles.fileTypeIcon, isFolder && styles.folderTypeIcon]}>
+          <Text style={[styles.fileTypeText, isFolder && styles.folderTypeText]}>{icon}</Text>
+        </View>
+        <View style={styles.infoMain}>
+          <Text style={styles.infoTitle}>{item.title}</Text>
+          <Text style={styles.infoDesc}>{item.subtitle}</Text>
+          <Text style={styles.storageHintText}>길게 눌러 폴더 이동</Text>
+        </View>
+      </Pressable>
+      {isFolder && onOpenFolder ? (
+        <Pressable style={styles.storageFolderOpenButton} onPress={onOpenFolder} hitSlop={10}>
+          <Text style={styles.chevron}>›</Text>
+        </Pressable>
+      ) : (
+        <Text style={styles.chevron}>›</Text>
+      )}
+    </View>
   );
 }
 
@@ -4917,15 +5132,16 @@ const styles = StyleSheet.create({
   },
   toastOverlay: {
     position: 'absolute',
-    left: 22,
-    right: 22,
+    left: 16,
+    right: 16,
     bottom: 64,
-    minHeight: 46,
-    borderRadius: 12,
+    minHeight: 58,
+    borderRadius: 14,
     backgroundColor: 'rgba(11, 53, 102, 0.78)',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
     zIndex: 999,
     elevation: 999,
     shadowColor: '#0B2A4A',
@@ -4938,16 +5154,19 @@ const styles = StyleSheet.create({
   },
   toastPressable: {
     width: '100%',
+    minHeight: 34,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 8,
+    paddingVertical: 4,
   },
   toastText: {
     color: '#FFFFFF',
-    fontSize: 13,
-    lineHeight: 18,
+    fontSize: 13.5,
+    lineHeight: 21,
     fontWeight: '900',
     textAlign: 'center',
+    flexShrink: 1,
+    width: '100%',
   },
   toastHintText: {
     marginTop: 2,
@@ -6051,6 +6270,28 @@ const styles = StyleSheet.create({
     gap: 12,
     backgroundColor: '#F7FBFF',
   },
+  folderBreadcrumbCard: {
+    minHeight: 54,
+    borderWidth: 1,
+    borderColor: line,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: '#F7FBFF',
+    justifyContent: 'center',
+  },
+  folderBreadcrumbTitle: {
+    color: navy,
+    fontSize: 13,
+    fontWeight: '900',
+    marginBottom: 3,
+  },
+  folderBreadcrumbText: {
+    color: '#49677C',
+    fontSize: 11.5,
+    lineHeight: 16,
+    fontWeight: '800',
+  },
   currentLocationCard: {
     minHeight: 62,
     borderWidth: 1,
@@ -6091,6 +6332,24 @@ const styles = StyleSheet.create({
     color: navy,
     fontSize: 16,
     fontWeight: '900',
+  },
+  folderNavigateButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    borderWidth: 1,
+    borderColor: line,
+    backgroundColor: '#F7FBFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: -2,
+  },
+  folderNavigateText: {
+    color: navy,
+    fontSize: 26,
+    lineHeight: 28,
+    fontWeight: '900',
+    marginTop: -2,
   },
   periodHeroCard: {
     minHeight: 70,
@@ -7035,6 +7294,26 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     justifyContent: 'center',
   },
+  storageBreadcrumbRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  storageBreadcrumbText: {
+    color: '#49677C',
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  storageBreadcrumbCurrent: {
+    color: text,
+    fontSize: 16,
+  },
+  storageBreadcrumbDivider: {
+    color: text,
+    fontSize: 18,
+    fontWeight: '900',
+  },
   storageItemCard: {
     minHeight: 78,
     borderWidth: 1,
@@ -7043,6 +7322,12 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 14,
     paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  storageDriveItemPressArea: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
@@ -7361,6 +7646,12 @@ const styles = StyleSheet.create({
     fontSize: 10.5,
     fontWeight: '800',
   },
+  storageFolderOpenButton: {
+    minWidth: 32,
+    height: 44,
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
   driveMovePanel: {
     borderWidth: 1,
     borderColor: navy,
@@ -7591,7 +7882,8 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '900',
     textAlign: 'center',
-    marginTop: 2,
+    marginTop: 'auto',
+    paddingTop: 14,
   },
   settingsBottomSpacer: {
     height: 72,
