@@ -289,7 +289,10 @@ const getVisibleDriveFolders = (currentPath: string, search: string) => {
   return getDirectDriveFolders(currentPath);
 };
 const hasDriveFolderChildren = (path: string) => getDirectDriveFolders(path).length > 0;
+const getDriveDescendantFolders = (path: string) => driveFolderOptions.filter((folder) => folder.name.startsWith(`${path} ›`));
+const getDriveFolderSelectionGroup = (path: string) => [path, ...getDriveDescendantFolders(path).map((folder) => folder.name)];
 const getDirectDriveFiles = (folderPath: string) => auraDriveFiles.filter((file) => file.folderPath === folderPath);
+const hasDriveFolderContents = (path: string) => hasDriveFolderChildren(path) || getDirectDriveFiles(path).length > 0;
 const getStorageDriveItemsForFolder = (folderPath: string): StorageDriveItem[] => [
   ...getDirectDriveFolders(folderPath).map((folder) => ({
     id: `storage-folder-${folder.name}`,
@@ -565,6 +568,8 @@ export default function App() {
   const [driveFolderSearch, setDriveFolderSearch] = useState('');
   const [driveCurrentFolder, setDriveCurrentFolder] = useState(driveRootPath);
   const [storageDriveFolder, setStorageDriveFolder] = useState(driveRootPath);
+  const [storageTrashMovedKeys, setStorageTrashMovedKeys] = useState<string[]>([]);
+  const [storageDeletedKeys, setStorageDeletedKeys] = useState<string[]>([]);
   const [selectedDriveFolders, setSelectedDriveFolders] = useState<string[]>([]);
   const [includeSubFolders, setIncludeSubFolders] = useState(true);
   const [periodRange, setPeriodRange] = useState('3년 이상');
@@ -665,6 +670,32 @@ export default function App() {
     if (tab) return defaultTabScreens[tab];
 
     return getResolvedBackFallback(target);
+  };
+
+  const getHistoryBackIndex = () => {
+    const currentTab = getResolvedTabForScreen(screen);
+
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const candidate = history[index];
+      const candidateTab = getResolvedTabForScreen(candidate);
+
+      if (
+        (screen === 'gmailPermission' || screen === 'drivePermission' || screen === 'notificationPermission') &&
+        (candidate === 'account' || candidate === 'permissions')
+      ) {
+        return index;
+      }
+
+      if (currentTab && candidateTab === currentTab) {
+        return index;
+      }
+
+      if (!currentTab && !candidateTab) {
+        return index;
+      }
+    }
+
+    return -1;
   };
 
   const navigateTab = (tab: MainTab) => {
@@ -895,6 +926,8 @@ export default function App() {
     setDriveFolderSearch('');
     setDriveCurrentFolder(driveRootPath);
     setStorageDriveFolder(driveRootPath);
+    setStorageTrashMovedKeys([]);
+    setStorageDeletedKeys([]);
     setSelectedDriveFolders([]);
     setIncludeSubFolders(true);
     setOpenedYearRange({ from: toMonthIndex(2023, 1), to: maxScanMonthIndex });
@@ -974,7 +1007,6 @@ export default function App() {
     }
     setPermissionToast('');
     setToastTarget(null);
-    setHomeScanNotice('none');
     replace('candidateSummary');
   };
 
@@ -1063,17 +1095,18 @@ export default function App() {
       return;
     }
 
-    const allSelected = visibleFolders.every((folder) => selectedDriveFolders.includes(folder.name));
+    const visibleFolderGroups = visibleFolders.flatMap((folder) => getDriveFolderSelectionGroup(folder.name));
+    const allSelected = visibleFolderGroups.every((folder) => selectedDriveFolders.includes(folder));
     if (allSelected) {
       setSelectedDriveFolders((items) => {
-        const next = items.filter((item) => !visibleFolders.some((folder) => folder.name === item));
+        const next = items.filter((item) => !visibleFolderGroups.includes(item));
         setScanSources((sources) => ({ ...sources, folder: Boolean(next.length), drive: next.length ? true : sources.drive }));
         return next;
       });
       return;
     }
 
-    setSelectedDriveFolders((items) => Array.from(new Set([...items, ...visibleFolders.map((folder) => folder.name)])));
+    setSelectedDriveFolders((items) => Array.from(new Set([...items, ...visibleFolderGroups])));
     setScanSources((items) => ({ ...items, drive: true, folder: true }));
   };
 
@@ -1096,6 +1129,14 @@ export default function App() {
     }
 
     transitionDirection.current = 1;
+    const historyBackIndex = getHistoryBackIndex();
+    if (historyBackIndex >= 0) {
+      const target = history[historyBackIndex];
+      setHistory((items) => items.slice(0, historyBackIndex));
+      setScreen(target);
+      return;
+    }
+
     const parent = getResolvedBackParent(screen);
     setHistory([]);
     setScreen(parent);
@@ -1107,6 +1148,7 @@ export default function App() {
     }
     setPermissionToast('');
     setToastTarget(null);
+    setHomeScanNotice('none');
     replace('cleanupComplete');
   };
 
@@ -1297,7 +1339,6 @@ export default function App() {
               notifyScanComplete();
             }
             if (screenRef.current === 'scanProgress') {
-              setHomeScanNotice('none');
               replace('candidateSummary');
             }
           }, 420);
@@ -1319,6 +1360,7 @@ export default function App() {
           clearInterval(timer);
           setDeleteJobStatus('completed');
           setTimeout(() => {
+            setHomeScanNotice('none');
             if (screenRef.current === 'deleteProcessing') {
               replace('cleanupComplete');
             } else {
@@ -1474,7 +1516,11 @@ export default function App() {
 
   const toggleDriveFolder = (folder: string) => {
     setSelectedDriveFolders((items) => {
-      const next = items.includes(folder) ? items.filter((item) => item !== folder) : [...items, folder];
+      const folderGroup = getDriveFolderSelectionGroup(folder);
+      const isSelected = folderGroup.every((item) => items.includes(item));
+      const next = isSelected
+        ? items.filter((item) => !folderGroup.includes(item))
+        : Array.from(new Set([...items, ...folderGroup]));
       setScanSources((sources) => ({ ...sources, drive: next.length ? true : sources.drive, folder: Boolean(next.length) }));
       return next;
     });
@@ -1482,7 +1528,9 @@ export default function App() {
 
   const render = () => {
     const visibleDriveFolders = getVisibleDriveFolders(driveCurrentFolder, driveFolderSearch);
-    const allDriveFoldersSelected = visibleDriveFolders.length > 0 && visibleDriveFolders.every((folder) => selectedDriveFolders.includes(folder.name));
+    const visibleDriveFolderGroups = visibleDriveFolders.flatMap((folder) => getDriveFolderSelectionGroup(folder.name));
+    const allDriveFoldersSelected = visibleDriveFolderGroups.length > 0 && visibleDriveFolderGroups.every((folder) => selectedDriveFolders.includes(folder));
+    const visibleDriveFilePreviews = driveFolderSearch.trim() ? [] : getDirectDriveFiles(driveCurrentFolder);
     const driveParentFolder = getDriveParentPath(driveCurrentFolder);
     const isDriveSearching = Boolean(driveFolderSearch.trim());
     const activeScanResult = lastScan?.result ?? scanResultRef.current;
@@ -1968,8 +2016,8 @@ export default function App() {
               <View style={styles.infoMain}>
                 <Text style={styles.infoTitle}>{allDriveFoldersSelected ? '전체 선택 해제' : '전체 선택'}</Text>
                 <Text style={styles.infoDesc}>
-                  {visibleDriveFolders.length
-                    ? `${visibleDriveFolders.filter((folder) => selectedDriveFolders.includes(folder.name)).length}/${visibleDriveFolders.length}개 폴더 선택됨`
+                  {visibleDriveFolderGroups.length
+                    ? `${visibleDriveFolderGroups.filter((folder) => selectedDriveFolders.includes(folder)).length}/${visibleDriveFolderGroups.length}개 폴더 선택됨`
                     : '선택할 폴더가 없어요'}
                 </Text>
               </View>
@@ -1990,7 +2038,7 @@ export default function App() {
                   title={isDriveSearching ? folder.name : getDriveFolderName(folder.name)}
                   desc={isDriveSearching ? folder.meta : `${folder.meta} · ${folder.name}`}
                   selected={selectedDriveFolders.includes(folder.name)}
-                  canOpen={hasDriveFolderChildren(folder.name)}
+                  canOpen={hasDriveFolderContents(folder.name)}
                   onPress={() => toggleDriveFolder(folder.name)}
                   onOpen={() => {
                     setDriveFolderSearch('');
@@ -1998,19 +2046,16 @@ export default function App() {
                   }}
                 />
               ))
-            ) : (
+            ) : null}
+            {visibleDriveFilePreviews.map((file) => (
+              <DriveFolderFileRow key={file.id} file={file} />
+            ))}
+            {!visibleDriveFolders.length && !visibleDriveFilePreviews.length ? (
               <EmptyState
-                title="폴더 없음"
-                desc={driveFolderSearch.trim() ? '검색 결과에 해당하는 폴더가 없어요.' : '현재 선택할 수 있는 Drive 폴더가 없어요.'}
+                title={driveFolderSearch.trim() ? '폴더 없음' : '비어있는 폴더'}
+                desc={driveFolderSearch.trim() ? '검색 결과에 해당하는 폴더가 없어요.' : '현재 폴더 안에 하위 폴더나 문서가 없어요.'}
               />
-            )}
-            <Pressable style={styles.attachmentOptionCard} onPress={() => setIncludeSubFolders((value) => !value)}>
-              <View style={styles.infoMain}>
-                <Text style={styles.infoTitle}>하위 폴더도 함께 분석</Text>
-                <Text style={styles.infoDesc}>선택한 폴더와 하위 폴더만 분석합니다</Text>
-              </View>
-              <CheckBox checked={includeSubFolders} onPress={() => setIncludeSubFolders((value) => !value)} compact />
-            </Pressable>
+            ) : null}
             <PrimaryButton title="폴더 분석하기" onPress={() => (scanSourceEditOnly ? replace('scanFlowSource') : back())} />
           </ScreenShell>
         );
@@ -2310,7 +2355,7 @@ export default function App() {
                   },
                 ]}
               >
-                <View style={styles.modalHandle} />
+                <SheetHandle onClose={back} />
                 <Text style={styles.deleteApprovalTitle}>휴지통 이동을 승인하시겠어요?</Text>
                 <Text style={styles.deleteApprovalDesc}>선택한 {selectedCandidateCount}개 항목 · {checkedCleanupSizeLabel}를 휴지통으로 이동합니다.</Text>
                 <View style={styles.deleteApprovalInfoBox}>
@@ -2356,7 +2401,7 @@ export default function App() {
 
       case 'cleanupComplete':
         return (
-          <ScreenShell title="정리 완료" subtitle="삭제 항목은 휴지통에서 복원할 수 있어요">
+          <ScreenShell title="정리 완료" subtitle="삭제 항목은 휴지통에서 복원할 수 있어요" hideBack>
             <View style={styles.cleanupCheckCircle}>
               <Text style={styles.cleanupCheckText}>✓</Text>
             </View>
@@ -2432,12 +2477,16 @@ export default function App() {
             goTrash={() => replace(screen === 'storageDrive' || screen === 'storageDriveTrash' ? 'storageDriveTrash' : 'storageTrash')}
             storageDriveFolder={storageDriveFolder}
             setStorageDriveFolder={setStorageDriveFolder}
+            storageTrashMovedKeys={storageTrashMovedKeys}
+            storageDeletedKeys={storageDeletedKeys}
+            setStorageTrashMovedKeys={setStorageTrashMovedKeys}
+            setStorageDeletedKeys={setStorageDeletedKeys}
           />
         );
 
       case 'settings':
         return (
-          <ScreenShell title="프로필 및 설정" subtitle="계정 · 알림 · 스캔 · 개인정보" hideBack>
+          <ScreenShell title="프로필 및 설정" subtitle="계정 · 알림 · 스캔 · 개인정보" hideBack tightBottom>
             <Pressable style={styles.settingsProfileCard} onPress={() => go('account')}>
               <View style={styles.infoMain}>
                 <Text style={styles.infoTitleLarge}>user@gmail.com</Text>
@@ -2809,7 +2858,7 @@ export default function App() {
                   },
                 ]}
               >
-                <View style={styles.modalHandle} />
+                <SheetHandle onClose={closeKeywordChoiceSheet} />
                 <Text style={styles.modalTitle}>메일 키워드 설정</Text>
                 <Text style={styles.infoDesc}>설정할 키워드 조건을 선택하세요.</Text>
                 <Pressable style={styles.keywordChoiceRow} onPress={() => closeKeywordChoiceSheet('include')}>
@@ -2897,7 +2946,7 @@ export default function App() {
                   },
                 ]}
               >
-                <View style={styles.modalHandle} />
+                <SheetHandle onClose={closeWithdrawSheet} />
                 <View style={styles.rowBetween}>
                   <Text style={styles.modalTitle}>AURA 서비스 탈퇴</Text>
                 </View>
@@ -2991,6 +3040,7 @@ function ScreenShell({
   onBack,
   closeIcon,
   hideBack,
+  tightBottom,
 }: {
   title?: string;
   subtitle?: string;
@@ -3000,6 +3050,7 @@ function ScreenShell({
   onBack?: () => void;
   closeIcon?: boolean;
   hideBack?: boolean;
+  tightBottom?: boolean;
 }) {
   const navigation = useContext(NavigationContext);
   const handleBack = hideBack ? undefined : onBack ?? navigation?.back;
@@ -3029,7 +3080,7 @@ function ScreenShell({
       )}
       <ScrollView
         style={styles.content}
-        contentContainerStyle={[styles.contentInner, compactTop && styles.contentInnerCompact]}
+        contentContainerStyle={[styles.contentInner, compactTop && styles.contentInnerCompact, tightBottom && styles.contentInnerTightBottom]}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
       >
@@ -3138,6 +3189,26 @@ function Card({ children, tint, style }: { children: React.ReactNode; tint?: boo
   return <View style={[styles.card, tint && styles.cardTint, style]}>{children}</View>;
 }
 
+function SheetHandle({ onClose }: { onClose: () => void }) {
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: (_, gesture) => gesture.dy > 4,
+      onPanResponderRelease: (_, gesture) => {
+        if (gesture.dy > 12) {
+          onClose();
+        }
+      },
+    })
+  ).current;
+
+  return (
+    <Pressable style={styles.modalHandleHitArea} onPress={onClose} {...panResponder.panHandlers}>
+      <View style={styles.modalHandle} />
+    </Pressable>
+  );
+}
+
 function InfoRow({
   title,
   desc,
@@ -3229,6 +3300,20 @@ function FolderRow({
   );
 }
 
+function DriveFolderFileRow({ file }: { file: AuraDriveFile }) {
+  return (
+    <View style={styles.folderFileRow}>
+      <View style={styles.fileTypeIcon}>
+        <Text style={styles.fileTypeText}>{file.type}</Text>
+      </View>
+      <View style={styles.infoMain}>
+        <Text style={styles.infoTitle}>{file.title}</Text>
+        <Text style={styles.infoDesc}>{file.type} · {formatDataSize(file.sizeMB)} · 수정 {file.modifiedAt}</Text>
+      </View>
+    </View>
+  );
+}
+
 function KeywordBottomSheet({
   type,
   motion,
@@ -3282,7 +3367,7 @@ function KeywordBottomSheet({
           },
         ]}
       >
-        <View style={styles.modalHandle} />
+        <SheetHandle onClose={onClose} />
         <View style={styles.rowBetween}>
           <Text style={styles.modalTitle}>{isInclude ? '포함 키워드 설정' : '제외 키워드 설정'}</Text>
           <Pressable onPress={onClose} hitSlop={10}>
@@ -3393,7 +3478,7 @@ function YearRangeSheet({
           },
         ]}
       >
-        <View style={styles.modalHandle} />
+        <SheetHandle onClose={onClose} />
         <View style={styles.rowBetween}>
           <Text style={styles.modalTitle}>{isOpened ? '마지막으로 연 날짜' : '마지막 수정일'}</Text>
           <Pressable onPress={onClose} hitSlop={10}>
@@ -3508,7 +3593,7 @@ function FilterSortSheet({
           },
         ]}
       >
-        <View style={styles.modalHandle} />
+        <SheetHandle onClose={onClose} />
         <View style={styles.rowBetween}>
           <Text style={styles.modalTitle}>필터 및 정렬</Text>
           <Pressable onPress={onClose} hitSlop={10}>
@@ -4078,6 +4163,10 @@ function StorageScreen({
   goTrash,
   storageDriveFolder,
   setStorageDriveFolder,
+  storageTrashMovedKeys,
+  storageDeletedKeys,
+  setStorageTrashMovedKeys,
+  setStorageDeletedKeys,
 }: {
   mode: 'storageMail' | 'storageDrive' | 'storageTrash' | 'storageDriveTrash';
   scan: ScanRecord | null;
@@ -4093,6 +4182,10 @@ function StorageScreen({
   goTrash: () => void;
   storageDriveFolder: string;
   setStorageDriveFolder: (folder: string) => void;
+  storageTrashMovedKeys: string[];
+  storageDeletedKeys: string[];
+  setStorageTrashMovedKeys: React.Dispatch<React.SetStateAction<string[]>>;
+  setStorageDeletedKeys: React.Dispatch<React.SetStateAction<string[]>>;
 }) {
   const isDrive = mode === 'storageDrive' || mode === 'storageDriveTrash';
   const isTrash = mode === 'storageTrash' || mode === 'storageDriveTrash';
@@ -4108,11 +4201,19 @@ function StorageScreen({
     label: part,
     path: parts.slice(0, index + 1).join(' › '),
   }));
-  const trashItems = isTrash
+  const rawTrashItems = isTrash
     ? summary.storageTrashItems.filter((item) => mode === 'storageDriveTrash' ? item.id.startsWith('trash-drive-') : !item.id.startsWith('trash-drive-'))
     : summary.storageTrashItems;
+  const itemStorageKey = (id: string) => `${prefix}:${id}`;
+  const isHiddenFromCurrentList = (id: string) => {
+    const key = itemStorageKey(id);
+    return storageDeletedKeys.includes(key) || (!isTrash && storageTrashMovedKeys.includes(key));
+  };
+  const trashItems = rawTrashItems.filter((item) => !isHiddenFromCurrentList(item.id));
+  const visibleMailItems = mailItems.filter((item) => !isHiddenFromCurrentList(item.id));
+  const visibleDriveItems = driveItems.filter((item) => !isHiddenFromCurrentList(item.id));
   const serviceConnected = mode === 'storageDriveTrash' ? permissions.drive : isTrash ? permissions.gmail : isDrive ? permissions.drive : permissions.gmail;
-  const activeItems = isTrash ? trashItems : isDrive ? driveItems : mailItems;
+  const activeItems = isTrash ? trashItems : isDrive ? visibleDriveItems : visibleMailItems;
   const ids = activeItems.map((item) => item.id);
   const allChecked = ids.every((id) => checked[`${prefix}:${id}`] ?? true);
   const selectedItems = activeItems.filter((item) => checked[`${prefix}:${item.id}`] ?? true);
@@ -4139,8 +4240,17 @@ function StorageScreen({
       return;
     }
     const permanent = deleteSheetMode === 'permanent';
+    const selectedKeys = selectedItems.map((item) => itemStorageKey(item.id));
     closeDeleteSheet();
-    showToast(permanent ? '영구 삭제가 완료됐어요' : '선택 항목을 휴지통으로 이동했어요');
+    if (permanent) {
+      setStorageDeletedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
+      showToast('영구 삭제가 완료됐어요');
+      return;
+    }
+
+    setStorageTrashMovedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
+    showToast('선택 항목을 휴지통으로 이동했어요');
+    goTrash();
   };
 
   return (
@@ -4168,7 +4278,7 @@ function StorageScreen({
         <>
           <View style={styles.storageSummaryBar}>
             <Text style={styles.storageSummaryText}>
-              {isTrash ? `휴지통 ${trashItems.length}개` : isDrive ? `Drive ${driveItems.length}개` : `메일 ${mailItems.length}개`}
+              {isTrash ? `휴지통 ${trashItems.length}개` : isDrive ? `Drive ${visibleDriveItems.length}개` : `메일 ${visibleMailItems.length}개`}
             </Text>
             <Pressable onPress={openFilter} hitSlop={8}>
               <Text style={styles.storageFilterText}>필터/정렬</Text>
@@ -4190,9 +4300,14 @@ function StorageScreen({
               </View>
             </View>
           ) : null}
-          {!isDrive && !isTrash ? (
+          {!activeItems.length ? (
+            <EmptyState
+              title={isTrash ? '휴지통이 비어있어요' : isDrive ? '현재 폴더가 비어있어요' : '메일이 없어요'}
+              desc={isDrive && !isTrash ? '이 위치 아래에 표시할 폴더나 파일이 없어요.' : '현재 표시할 항목이 없어요.'}
+            />
+          ) : !isDrive && !isTrash ? (
             <GmailStoragePanel
-              items={mailItems}
+              items={visibleMailItems}
               checked={checked}
               prefix={prefix}
               toggle={toggle}
@@ -4208,7 +4323,7 @@ function StorageScreen({
                 />
               ))
             : isDrive
-              ? driveItems.map((item) => (
+              ? visibleDriveItems.map((item) => (
                   <StorageDriveCard
                     key={item.id}
                     prefix={prefix}
@@ -4219,7 +4334,7 @@ function StorageScreen({
                     onOpenFolder={item.type === 'F' && item.fullPath ? () => setStorageDriveFolder(item.fullPath as string) : undefined}
                   />
               ))
-              : mailItems.map((item) => (
+              : visibleMailItems.map((item) => (
                   <StorageMailCard
                     key={item.id}
                     prefix={prefix}
@@ -4242,14 +4357,18 @@ function StorageScreen({
               <OutlineButton title="이동 취소" onPress={() => setMovingDriveItem(null)} />
             </View>
           ) : null}
-          <Pressable style={styles.storageSelectAllRow} onPress={() => setAll(prefix, ids)}>
-            <CheckBox checked={allChecked} onPress={() => setAll(prefix, ids)} compact />
-            <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택하기'}</Text>
-          </Pressable>
-          <View style={styles.twoButtons}>
-            <OutlineButton title={isTrash ? '복구하기' : '삭제하기'} onPress={() => (isTrash ? showToast('복구 기능은 발표용 화면에서는 실행하지 않아요') : openDeleteSheet('trash'))} half />
-            <PrimaryButton title={isDrive && !isTrash ? '폴더 이동' : isTrash ? '삭제하기' : '메일 읽기'} onPress={() => (isTrash ? openDeleteSheet('permanent') : isDrive ? showToast('이동할 파일을 길게 눌러 폴더를 선택하세요') : showToast('메일 읽기는 발표용 화면에서는 실행하지 않아요'))} half />
-          </View>
+          {activeItems.length ? (
+            <>
+              <Pressable style={styles.storageSelectAllRow} onPress={() => setAll(prefix, ids)}>
+                <CheckBox checked={allChecked} onPress={() => setAll(prefix, ids)} compact />
+                <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택하기'}</Text>
+              </Pressable>
+              <View style={styles.twoButtons}>
+                <OutlineButton title={isTrash ? '복구하기' : '삭제하기'} onPress={() => (isTrash ? showToast('복구 기능은 발표용 화면에서는 실행하지 않아요') : openDeleteSheet('trash'))} half />
+                <PrimaryButton title={isDrive && !isTrash ? '폴더 이동' : isTrash ? '삭제하기' : '메일 읽기'} onPress={() => (isTrash ? openDeleteSheet('permanent') : isDrive ? showToast('이동할 파일을 길게 눌러 폴더를 선택하세요') : showToast('메일 읽기는 발표용 화면에서는 실행하지 않아요'))} half />
+              </View>
+            </>
+          ) : null}
         </>
       ) : (
         <EmptyState
@@ -4308,7 +4427,7 @@ function StorageDeleteSheet({
     <View style={styles.storageDeleteOverlay}>
       <Pressable style={StyleSheet.absoluteFill} onPress={onCancel} />
       <View style={styles.storageDeleteSheet}>
-        <View style={styles.modalHandle} />
+        <SheetHandle onClose={onCancel} />
         <View style={styles.rowBetween}>
           <Text style={styles.storageDeleteTitle}>{permanent ? '영구 삭제할까요?' : '휴지통으로 이동할까요?'}</Text>
           <Pressable onPress={onCancel} hitSlop={10}>
@@ -5288,6 +5407,9 @@ const styles = StyleSheet.create({
   },
   contentInnerCompact: {
     paddingTop: 10,
+  },
+  contentInnerTightBottom: {
+    paddingBottom: 18,
   },
   heroSpacer: {
     height: 78,
@@ -6317,6 +6439,18 @@ const styles = StyleSheet.create({
   folderRowSelected: {
     borderColor: navy,
     backgroundColor: pale,
+  },
+  folderFileRow: {
+    minHeight: 74,
+    borderWidth: 1,
+    borderColor: line,
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
   },
   folderIcon: {
     width: 38,
@@ -7882,8 +8016,8 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '900',
     textAlign: 'center',
-    marginTop: 'auto',
-    paddingTop: 14,
+    marginTop: 10,
+    paddingTop: 0,
   },
   settingsBottomSpacer: {
     height: 72,
@@ -8083,6 +8217,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#C8D5DD',
     alignSelf: 'center',
     marginBottom: 8,
+  },
+  modalHandleHitArea: {
+    alignSelf: 'center',
+    minWidth: 92,
+    minHeight: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: -2,
   },
   modalTitle: {
     color: text,
