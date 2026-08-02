@@ -2340,22 +2340,7 @@ export default function App() {
               ]}
             >
               <Pressable style={StyleSheet.absoluteFill} onPress={back} />
-              <Animated.View
-                style={[
-                  styles.deleteApprovalPanel,
-                  {
-                    transform: [
-                      {
-                        translateY: deleteConfirmMotion.interpolate({
-                          inputRange: [0, 1],
-                          outputRange: [0, 360],
-                        }),
-                      },
-                    ],
-                  },
-                ]}
-              >
-                <SheetHandle onClose={back} />
+              <BottomSheetPanel motion={deleteConfirmMotion} outputRange={[0, 360]} style={styles.deleteApprovalPanel} onClose={back}>
                 <Text style={styles.deleteApprovalTitle}>휴지통 이동을 승인하시겠어요?</Text>
                 <Text style={styles.deleteApprovalDesc}>선택한 {selectedCandidateCount}개 항목 · {checkedCleanupSizeLabel}를 휴지통으로 이동합니다.</Text>
                 <View style={styles.deleteApprovalInfoBox}>
@@ -2371,7 +2356,7 @@ export default function App() {
                     half
                   />
                 </View>
-              </Animated.View>
+              </BottomSheetPanel>
             </Animated.View>
           </View>
         );
@@ -2843,22 +2828,7 @@ export default function App() {
               ]}
             >
               <Pressable style={StyleSheet.absoluteFill} onPress={() => closeKeywordChoiceSheet()} />
-              <Animated.View
-                style={[
-                  styles.keywordChoiceSheet,
-                  {
-                    transform: [
-                      {
-                        translateY: keywordChoiceMotion.interpolate({
-                          inputRange: [0, 1],
-                          outputRange: [0, 220],
-                        }),
-                      },
-                    ],
-                  },
-                ]}
-              >
-                <SheetHandle onClose={closeKeywordChoiceSheet} />
+              <BottomSheetPanel motion={keywordChoiceMotion} outputRange={[0, 220]} style={styles.keywordChoiceSheet} onClose={closeKeywordChoiceSheet}>
                 <Text style={styles.modalTitle}>메일 키워드 설정</Text>
                 <Text style={styles.infoDesc}>설정할 키워드 조건을 선택하세요.</Text>
                 <Pressable style={styles.keywordChoiceRow} onPress={() => closeKeywordChoiceSheet('include')}>
@@ -2875,7 +2845,7 @@ export default function App() {
                   </View>
                   <Text style={styles.chevron}>›</Text>
                 </Pressable>
-              </Animated.View>
+              </BottomSheetPanel>
             </Animated.View>
           ) : null}
           {keywordSheetType ? (
@@ -2931,22 +2901,7 @@ export default function App() {
               ]}
             >
               <Pressable style={StyleSheet.absoluteFill} onPress={closeWithdrawSheet} />
-              <Animated.View
-                style={[
-                  styles.withdrawSheet,
-                  {
-                    transform: [
-                      {
-                        translateY: withdrawSheetMotion.interpolate({
-                          inputRange: [0, 1],
-                          outputRange: [0, 360],
-                        }),
-                      },
-                    ],
-                  },
-                ]}
-              >
-                <SheetHandle onClose={closeWithdrawSheet} />
+              <BottomSheetPanel motion={withdrawSheetMotion} outputRange={[0, 360]} style={styles.withdrawSheet} onClose={closeWithdrawSheet}>
                 <View style={styles.rowBetween}>
                   <Text style={styles.modalTitle}>AURA 서비스 탈퇴</Text>
                 </View>
@@ -2982,7 +2937,7 @@ export default function App() {
                     <Text style={styles.dangerText}>서비스 탈퇴하기</Text>
                   </Pressable>
                 </View>
-              </Animated.View>
+              </BottomSheetPanel>
             </Animated.View>
           ) : null}
           {permissionToast ? (
@@ -3189,23 +3144,63 @@ function Card({ children, tint, style }: { children: React.ReactNode; tint?: boo
   return <View style={[styles.card, tint && styles.cardTint, style]}>{children}</View>;
 }
 
-function SheetHandle({ onClose }: { onClose: () => void }) {
+function BottomSheetPanel({
+  motion,
+  outputRange,
+  style,
+  onClose,
+  children,
+}: {
+  motion: Animated.Value;
+  outputRange: [number, number];
+  style: object;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  const dragY = useRef(new Animated.Value(0)).current;
   const panResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: (_, gesture) => gesture.dy > 4,
+      onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 3,
+      onPanResponderMove: (_, gesture) => {
+        dragY.setValue(Math.max(0, gesture.dy));
+      },
       onPanResponderRelease: (_, gesture) => {
-        if (gesture.dy > 12) {
+        if (gesture.dy > 58 || gesture.vy > 0.85) {
           onClose();
+          return;
         }
+        Animated.spring(dragY, {
+          toValue: 0,
+          speed: 18,
+          bounciness: 5,
+          useNativeDriver: false,
+        }).start();
+      },
+      onPanResponderTerminate: () => {
+        Animated.spring(dragY, {
+          toValue: 0,
+          speed: 18,
+          bounciness: 5,
+          useNativeDriver: false,
+        }).start();
       },
     })
   ).current;
 
+  const baseTranslateY = motion.interpolate({
+    inputRange: [0, 1],
+    outputRange,
+  });
+  const translateY = Animated.add(baseTranslateY, dragY);
+
   return (
-    <Pressable style={styles.modalHandleHitArea} onPress={onClose} {...panResponder.panHandlers}>
-      <View style={styles.modalHandle} />
-    </Pressable>
+    <Animated.View style={[style, { transform: [{ translateY }] }]}>
+      <Pressable style={styles.modalHandleHitArea} onPress={onClose} {...panResponder.panHandlers}>
+        <View style={styles.modalHandle} />
+      </Pressable>
+      {children}
+    </Animated.View>
   );
 }
 
@@ -3352,22 +3347,7 @@ function KeywordBottomSheet({
       ]}
     >
       <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
-      <Animated.View
-        style={[
-          styles.keywordSheet,
-          {
-            transform: [
-              {
-                translateY: motion.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [0, 360],
-                }),
-              },
-            ],
-          },
-        ]}
-      >
-        <SheetHandle onClose={onClose} />
+      <BottomSheetPanel motion={motion} outputRange={[0, 360]} style={styles.keywordSheet} onClose={onClose}>
         <View style={styles.rowBetween}>
           <Text style={styles.modalTitle}>{isInclude ? '포함 키워드 설정' : '제외 키워드 설정'}</Text>
           <Pressable onPress={onClose} hitSlop={10}>
@@ -3398,7 +3378,7 @@ function KeywordBottomSheet({
           ))}
         </View>
         <PrimaryButton title={isInclude ? '포함 키워드 적용' : '제외 키워드 적용'} onPress={onClose} inline />
-      </Animated.View>
+      </BottomSheetPanel>
     </Animated.View>
   );
 }
@@ -3463,22 +3443,7 @@ function YearRangeSheet({
       ]}
     >
       <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
-      <Animated.View
-        style={[
-          styles.keywordSheet,
-          {
-            transform: [
-              {
-                translateY: motion.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [0, 360],
-                }),
-              },
-            ],
-          },
-        ]}
-      >
-        <SheetHandle onClose={onClose} />
+      <BottomSheetPanel motion={motion} outputRange={[0, 360]} style={styles.keywordSheet} onClose={onClose}>
         <View style={styles.rowBetween}>
           <Text style={styles.modalTitle}>{isOpened ? '마지막으로 연 날짜' : '마지막 수정일'}</Text>
           <Pressable onPress={onClose} hitSlop={10}>
@@ -3541,7 +3506,7 @@ function YearRangeSheet({
           }}
           inline
         />
-      </Animated.View>
+      </BottomSheetPanel>
     </Animated.View>
   );
 }
@@ -3578,22 +3543,7 @@ function FilterSortSheet({
       ]}
     >
       <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
-      <Animated.View
-        style={[
-          styles.filterSheet,
-          {
-            transform: [
-              {
-                translateY: motion.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [0, 420],
-                }),
-              },
-            ],
-          },
-        ]}
-      >
-        <SheetHandle onClose={onClose} />
+      <BottomSheetPanel motion={motion} outputRange={[0, 420]} style={styles.filterSheet} onClose={onClose}>
         <View style={styles.rowBetween}>
           <Text style={styles.modalTitle}>필터 및 정렬</Text>
           <Pressable onPress={onClose} hitSlop={10}>
@@ -3620,7 +3570,7 @@ function FilterSortSheet({
           ))}
         </View>
         <PrimaryButton title="필터 적용하기" onPress={onClose} inline />
-      </Animated.View>
+      </BottomSheetPanel>
     </Animated.View>
   );
 }
@@ -4423,11 +4373,21 @@ function StorageDeleteSheet({
   onCancel: () => void;
   onConfirm: () => void;
 }) {
+  const sheetMotion = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    sheetMotion.setValue(1);
+    Animated.timing(sheetMotion, {
+      toValue: 0,
+      duration: 240,
+      useNativeDriver: false,
+    }).start();
+  }, [sheetMotion]);
+
   return (
     <View style={styles.storageDeleteOverlay}>
       <Pressable style={StyleSheet.absoluteFill} onPress={onCancel} />
-      <View style={styles.storageDeleteSheet}>
-        <SheetHandle onClose={onCancel} />
+      <BottomSheetPanel motion={sheetMotion} outputRange={[0, 360]} style={styles.storageDeleteSheet} onClose={onCancel}>
         <View style={styles.rowBetween}>
           <Text style={styles.storageDeleteTitle}>{permanent ? '영구 삭제할까요?' : '휴지통으로 이동할까요?'}</Text>
           <Pressable onPress={onCancel} hitSlop={10}>
@@ -4456,7 +4416,7 @@ function StorageDeleteSheet({
             <Text style={styles.dangerText}>{permanent ? '영구 삭제' : '휴지통 이동'}</Text>
           </Pressable>
         </View>
-      </View>
+      </BottomSheetPanel>
     </View>
   );
 }
