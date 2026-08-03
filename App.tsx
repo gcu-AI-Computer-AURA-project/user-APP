@@ -4293,6 +4293,13 @@ function StorageScreen({
     setMovingDriveItem(item);
   };
   const closeMoveSheet = () => setMovingDriveItem(null);
+  const getMoveTargetFolders = (item: StorageDriveItem) => {
+    const currentPath = item.fullPath ?? '';
+    const currentParent = item.type === 'F' ? getDriveParentPath(currentPath) : currentPath;
+    return Array.from(new Set([driveRootPath, ...driveFolderOptions.map((folder) => folder.name)]))
+      .filter((folder) => folder !== currentParent)
+      .filter((folder) => item.type !== 'F' || (folder !== currentPath && !folder.startsWith(`${currentPath} ›`)));
+  };
   const moveDriveItem = (targetFolder: string) => {
     if (!movingDriveItem) return;
     setStorageDriveMoveTargets((items) => {
@@ -4460,9 +4467,7 @@ function StorageScreen({
     {movingDriveItem ? (
       <StorageMoveSheet
         item={movingDriveItem}
-        folders={driveFolderOptions
-          .map((folder) => folder.name)
-          .filter((folder) => movingDriveItem.type !== 'F' || (folder !== movingDriveItem.fullPath && !folder.startsWith(`${movingDriveItem.fullPath} ›`)))}
+        folders={getMoveTargetFolders(movingDriveItem)}
         onCancel={closeMoveSheet}
         onMove={moveDriveItem}
       />
