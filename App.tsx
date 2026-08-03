@@ -4428,10 +4428,14 @@ function StorageScreen({
                 <CheckBox checked={allChecked} onPress={() => setAll(prefix, ids)} compact />
                 <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택하기'}</Text>
               </Pressable>
-              <View style={styles.twoButtons}>
-                <OutlineButton title={isTrash ? '복구하기' : '삭제하기'} onPress={() => (isTrash ? showToast('복구 기능은 발표용 화면에서는 실행하지 않아요') : openDeleteSheet('trash'))} half />
-                <PrimaryButton title={isDrive && !isTrash ? '파일 보기' : isTrash ? '삭제하기' : '메일 읽기'} onPress={() => (isTrash ? openDeleteSheet('permanent') : isDrive ? showToast('폴더 이동은 Drive 칸을 꾹 눌러 실행하세요') : showToast('메일 읽기는 발표용 화면에서는 실행하지 않아요'))} half />
-              </View>
+              {isDrive && !isTrash ? (
+                <OutlineButton title="삭제하기" onPress={() => openDeleteSheet('trash')} />
+              ) : (
+                <View style={styles.twoButtons}>
+                  <OutlineButton title={isTrash ? '복구하기' : '삭제하기'} onPress={() => (isTrash ? showToast('복구 기능은 발표용 화면에서는 실행하지 않아요') : openDeleteSheet('trash'))} half />
+                  <PrimaryButton title={isTrash ? '삭제하기' : '메일 읽기'} onPress={() => (isTrash ? openDeleteSheet('permanent') : showToast('메일 읽기는 발표용 화면에서는 실행하지 않아요'))} half />
+                </View>
+              )}
             </>
           ) : null}
         </>
