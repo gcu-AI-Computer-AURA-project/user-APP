@@ -4209,7 +4209,7 @@ function StorageScreen({
 }) {
   const isDrive = mode === 'storageDrive' || mode === 'storageDriveTrash';
   const isTrash = mode === 'storageTrash' || mode === 'storageDriveTrash';
-  const [moveSheetVisible, setMoveSheetVisible] = useState(false);
+  const [movingDriveItem, setMovingDriveItem] = useState<StorageDriveItem | null>(null);
   const [deleteSheetMode, setDeleteSheetMode] = useState<'trash' | 'permanent' | null>(null);
   const [deleteConfirmChecked, setDeleteConfirmChecked] = useState(false);
   const prefix = mode === 'storageDriveTrash' ? 'storageDriveTrash' : isTrash ? 'storageTrash' : isDrive ? 'storageDrive' : 'storageMail';
@@ -4289,25 +4289,17 @@ function StorageScreen({
     return sum + extractStorageSizeMB(sizeText);
   }, 0);
   const selectedStorageSizeLabel = formatDataSize(selectedStorageSize);
-  const selectedDriveMoveItems = isDrive && !isTrash ? selectedItems.filter((item): item is StorageDriveItem => 'type' in item) : [];
-  const openMoveSheet = () => {
-    if (!selectedDriveMoveItems.length) {
-      showToast('이동할 Drive 항목을 체크해주세요');
-      return;
-    }
-    setMoveSheetVisible(true);
+  const openMoveSheet = (item: StorageDriveItem) => {
+    setMovingDriveItem(item);
   };
-  const closeMoveSheet = () => setMoveSheetVisible(false);
-  const moveSelectedDriveItems = (targetFolder: string) => {
+  const closeMoveSheet = () => setMovingDriveItem(null);
+  const moveDriveItem = (targetFolder: string) => {
+    if (!movingDriveItem) return;
     setStorageDriveMoveTargets((items) => {
-      const next = { ...items };
-      selectedDriveMoveItems.forEach((item) => {
-        next[item.id] = targetFolder;
-      });
-      return next;
+      return { ...items, [movingDriveItem.id]: targetFolder };
     });
-    setMoveSheetVisible(false);
-    showToast(`선택 항목을 ${getDriveFolderName(targetFolder)} 폴더로 이동했어요`);
+    setMovingDriveItem(null);
+    showToast(`${movingDriveItem.title}을 ${getDriveFolderName(targetFolder)} 폴더로 이동했어요`);
   };
   const openDeleteSheet = (modeToOpen: 'trash' | 'permanent') => {
     if (!selectedItems.length) {
@@ -4417,6 +4409,7 @@ function StorageScreen({
                     item={item}
                     checked={checked[`${prefix}:${item.id}`] ?? true}
                     toggle={toggle}
+                    onMoveStart={() => openMoveSheet(item)}
                     onOpenFolder={item.type === 'F' && item.fullPath ? () => setStorageDriveFolder(item.fullPath as string) : undefined}
                   />
               ))
@@ -4429,20 +4422,6 @@ function StorageScreen({
                     toggle={toggle}
                   />
                 ))}
-          {isDrive && !isTrash && moveSheetVisible ? (
-            <View style={styles.driveMovePanel}>
-              <Text style={styles.infoTitle}>폴더 이동</Text>
-              <Text style={styles.infoDesc}>체크한 {selectedDriveMoveItems.length}개 항목을 이동할 폴더를 선택하세요.</Text>
-              <View style={styles.driveMoveTargets}>
-                {driveFolderOptions.map((folder) => (
-                  <Pressable key={folder.name} style={styles.driveMoveTarget} onPress={() => moveSelectedDriveItems(folder.name)}>
-                    <Text style={styles.driveMoveTargetText}>{folder.name}</Text>
-                  </Pressable>
-                ))}
-              </View>
-              <OutlineButton title="이동 취소" onPress={closeMoveSheet} />
-            </View>
-          ) : null}
           {activeItems.length ? (
             <>
               <Pressable style={styles.storageSelectAllRow} onPress={() => setAll(prefix, ids)}>
@@ -4451,7 +4430,7 @@ function StorageScreen({
               </Pressable>
               <View style={styles.twoButtons}>
                 <OutlineButton title={isTrash ? '복구하기' : '삭제하기'} onPress={() => (isTrash ? showToast('복구 기능은 발표용 화면에서는 실행하지 않아요') : openDeleteSheet('trash'))} half />
-                <PrimaryButton title={isDrive && !isTrash ? '폴더 이동' : isTrash ? '삭제하기' : '메일 읽기'} onPress={() => (isTrash ? openDeleteSheet('permanent') : isDrive ? openMoveSheet() : showToast('메일 읽기는 발표용 화면에서는 실행하지 않아요'))} half />
+                <PrimaryButton title={isDrive && !isTrash ? '파일 보기' : isTrash ? '삭제하기' : '메일 읽기'} onPress={() => (isTrash ? openDeleteSheet('permanent') : isDrive ? showToast('폴더 이동은 Drive 칸을 꾹 눌러 실행하세요') : showToast('메일 읽기는 발표용 화면에서는 실행하지 않아요'))} half />
               </View>
             </>
           ) : null}
@@ -4472,6 +4451,16 @@ function StorageScreen({
         onToggle={() => setDeleteConfirmChecked((value) => !value)}
         onCancel={closeDeleteSheet}
         onConfirm={confirmStorageDelete}
+      />
+    ) : null}
+    {movingDriveItem ? (
+      <StorageMoveSheet
+        item={movingDriveItem}
+        folders={driveFolderOptions
+          .map((folder) => folder.name)
+          .filter((folder) => movingDriveItem.type !== 'F' || (folder !== movingDriveItem.fullPath && !folder.startsWith(`${movingDriveItem.fullPath} ›`)))}
+        onCancel={closeMoveSheet}
+        onMove={moveDriveItem}
       />
     ) : null}
     </View>
@@ -4551,6 +4540,64 @@ function StorageDeleteSheet({
           <Pressable style={[styles.storageDeleteDangerButton, !checked && styles.dangerButtonDisabled, styles.halfButton]} onPress={onConfirm}>
             <Text style={styles.dangerText}>{permanent ? '영구 삭제' : '휴지통 이동'}</Text>
           </Pressable>
+        </View>
+      </BottomSheetPanel>
+    </View>
+  );
+}
+
+function StorageMoveSheet({
+  item,
+  folders,
+  onCancel,
+  onMove,
+}: {
+  item: StorageDriveItem;
+  folders: string[];
+  onCancel: () => void;
+  onMove: (folder: string) => void;
+}) {
+  const sheetMotion = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    sheetMotion.setValue(1);
+    Animated.timing(sheetMotion, {
+      toValue: 0,
+      duration: 240,
+      useNativeDriver: false,
+    }).start();
+  }, [sheetMotion]);
+
+  return (
+    <View style={styles.storageDeleteOverlay}>
+      <Pressable style={StyleSheet.absoluteFill} onPress={onCancel} />
+      <BottomSheetPanel motion={sheetMotion} outputRange={[0, 420]} style={styles.storageMoveSheet} onClose={onCancel}>
+        <View style={styles.rowBetween}>
+          <View style={styles.infoMain}>
+            <Text style={styles.storageDeleteTitle}>폴더 이동</Text>
+            <Text style={styles.infoDesc}>{item.title}을 이동할 위치를 선택하세요</Text>
+          </View>
+          <Pressable onPress={onCancel} hitSlop={10}>
+            <Text style={styles.modalClose}>×</Text>
+          </Pressable>
+        </View>
+        <View style={styles.storageMoveCurrentBox}>
+          <Text style={styles.infoTitle}>{item.title}</Text>
+          <Text style={styles.infoDesc}>{item.subtitle}</Text>
+        </View>
+        <View style={styles.storageMoveTargetList}>
+          {folders.map((folder) => (
+            <Pressable key={folder} style={styles.storageMoveTargetRow} onPress={() => onMove(folder)}>
+              <View style={styles.folderTypeIcon}>
+                <Text style={styles.folderTypeText}>—</Text>
+              </View>
+              <View style={styles.infoMain}>
+                <Text style={styles.infoTitle}>{getDriveFolderName(folder)}</Text>
+                <Text style={styles.infoDesc}>{folder}</Text>
+              </View>
+              <Text style={styles.chevron}>›</Text>
+            </Pressable>
+          ))}
         </View>
       </BottomSheetPanel>
     </View>
@@ -4641,12 +4688,14 @@ function StorageDriveCard({
   item,
   checked,
   toggle,
+  onMoveStart,
   onOpenFolder,
 }: {
   prefix: string;
   item: StorageDriveItem;
   checked: boolean;
   toggle: (key: string) => void;
+  onMoveStart: () => void;
   onOpenFolder?: () => void;
 }) {
   const isFolder = item.type === 'F';
@@ -4657,6 +4706,8 @@ function StorageDriveCard({
       <Pressable
         style={styles.storageDriveItemPressArea}
         onPress={() => toggle(`${prefix}:${item.id}`)}
+        onLongPress={onMoveStart}
+        delayLongPress={420}
       >
         <View style={[styles.fileTypeIcon, isFolder && styles.folderTypeIcon]}>
           <Text style={[styles.fileTypeText, isFolder && styles.folderTypeText]}>{icon}</Text>
@@ -7903,6 +7954,49 @@ const styles = StyleSheet.create({
     color: navy,
     fontSize: 11,
     fontWeight: '900',
+  },
+  storageMoveSheet: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    maxHeight: '78%',
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 24,
+    gap: 14,
+    shadowColor: '#0B2A4A',
+    shadowOpacity: 0.16,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: -6 },
+    elevation: 16,
+  },
+  storageMoveCurrentBox: {
+    borderWidth: 1,
+    borderColor: line,
+    borderRadius: 14,
+    backgroundColor: pale,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 4,
+  },
+  storageMoveTargetList: {
+    gap: 8,
+  },
+  storageMoveTargetRow: {
+    minHeight: 64,
+    borderWidth: 1,
+    borderColor: line,
+    borderRadius: 14,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
   },
   filterSheet: {
     position: 'absolute',
