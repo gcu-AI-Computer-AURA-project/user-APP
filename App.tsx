@@ -3782,7 +3782,7 @@ function FolderRow({
   return (
     <Pressable style={[styles.folderRow, selected && styles.folderRowSelected]} onPress={onPress}>
       <CheckBox checked={selected} onPress={onPress} compact />
-      <Text style={styles.folderRowEmoji}>📁</Text>
+      <FolderOutlineIcon />
       <View style={styles.infoMain}>
         <View style={styles.folderTitleLine}>
           <Text style={styles.folderTitleText} numberOfLines={1}>{title}</Text>
@@ -3801,13 +3801,50 @@ function FolderRow({
 function DriveFolderFileRow({ file, selected }: { file: AuraDriveFile; selected: boolean }) {
   return (
     <View style={[styles.folderFileRow, selected && styles.folderRowSelected]}>
-      <View style={styles.fileTypeIcon}>
-        <Text style={styles.fileTypeText}>{file.type}</Text>
-      </View>
+      <FileOutlineIcon type={file.type} />
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{file.title}</Text>
       </View>
       <Text style={styles.folderSizeText}>{formatDataSize(file.sizeMB)}</Text>
+    </View>
+  );
+}
+
+function FolderOutlineIcon() {
+  return (
+    <View style={styles.folderOutlineIcon}>
+      <View style={styles.folderOutlineTab} />
+      <View style={styles.folderOutlineBody} />
+    </View>
+  );
+}
+
+function FileOutlineIcon({ type }: { type: string }) {
+  const normalizedType = type.toUpperCase();
+  const isImage = ['JPG', 'JPEG', 'PNG', 'SVG'].includes(normalizedType);
+  const isArchive = ['ZIP', 'RAR', '7Z'].includes(normalizedType);
+
+  return (
+    <View style={styles.fileOutlineIcon}>
+      <View style={styles.fileOutlineFold} />
+      {isImage ? (
+        <>
+          <View style={styles.fileImageSun} />
+          <View style={styles.fileImageMountain} />
+        </>
+      ) : isArchive ? (
+        <View style={styles.fileZipRail}>
+          {[0, 1, 2, 3].map((item) => (
+            <View key={item} style={styles.fileZipTooth} />
+          ))}
+        </View>
+      ) : (
+        <>
+          <View style={styles.fileDocLineWide} />
+          <View style={styles.fileDocLine} />
+          <View style={styles.fileDocLineShort} />
+        </>
+      )}
     </View>
   );
 }
@@ -5433,7 +5470,6 @@ function StorageDriveCard({
   rightSizeDanger?: boolean;
 }) {
   const isFolder = item.type === 'F';
-  const icon = item.type === 'PDF' ? 'PDF' : item.type === 'ZIP' ? 'ZIP' : item.type === 'JPG' ? 'IMG' : 'DOC';
   const key = `${prefix}:${item.id}`;
   const handleSelect = () => {
     if (onSelect) {
@@ -5460,11 +5496,9 @@ function StorageDriveCard({
         style={styles.storageDriveItemPressArea}
       >
         {isFolder ? (
-          <Text style={styles.storageFolderEmoji}>📁</Text>
+          <FolderOutlineIcon />
         ) : (
-          <View style={styles.fileTypeIcon}>
-            <Text style={styles.fileTypeText}>{icon}</Text>
-          </View>
+          <FileOutlineIcon type={item.type} />
         )}
         <View style={styles.infoMain}>
           <Text style={styles.infoTitle}>{item.title}</Text>
@@ -7690,11 +7724,31 @@ const styles = StyleSheet.create({
     borderColor: navy,
     backgroundColor: pale,
   },
-  folderRowEmoji: {
-    width: 28,
-    color: text,
-    fontSize: 22,
-    textAlign: 'center',
+  folderOutlineIcon: {
+    width: 30,
+    height: 28,
+    justifyContent: 'flex-end',
+  },
+  folderOutlineTab: {
+    position: 'absolute',
+    left: 3,
+    top: 2,
+    width: 14,
+    height: 9,
+    borderTopLeftRadius: 4,
+    borderTopRightRadius: 5,
+    borderWidth: 2,
+    borderBottomWidth: 0,
+    borderColor: navy,
+    backgroundColor: '#FFFFFF',
+  },
+  folderOutlineBody: {
+    width: 30,
+    height: 22,
+    borderRadius: 7,
+    borderWidth: 2,
+    borderColor: navy,
+    backgroundColor: '#FFFFFF',
   },
   folderFileRow: {
     minHeight: 74,
@@ -9070,13 +9124,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 12,
   },
-  storageFolderEmoji: {
-    width: 34,
-    color: text,
-    fontSize: 24,
-    lineHeight: 30,
-    textAlign: 'center',
-  },
   storageChevronButton: {
     width: 38,
     height: 44,
@@ -9262,20 +9309,83 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  fileTypeIcon: {
-    width: 34,
+  fileOutlineIcon: {
+    width: 30,
     height: 34,
-    borderRadius: 9,
-    borderWidth: 1,
-    borderColor: '#8EC8DA',
-    backgroundColor: '#DDF4F9',
+    borderRadius: 7,
+    borderWidth: 2,
+    borderColor: navy,
+    backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
+    overflow: 'hidden',
   },
-  fileTypeText: {
-    color: navy,
-    fontSize: 15,
-    fontWeight: '900',
+  fileOutlineFold: {
+    position: 'absolute',
+    top: -2,
+    right: -2,
+    width: 12,
+    height: 12,
+    borderLeftWidth: 2,
+    borderBottomWidth: 2,
+    borderColor: navy,
+    backgroundColor: '#DDF4F9',
+    transform: [{ rotate: '45deg' }],
+  },
+  fileDocLineWide: {
+    width: 16,
+    height: 2,
+    borderRadius: 2,
+    backgroundColor: navy,
+    marginTop: 7,
+    marginBottom: 4,
+  },
+  fileDocLine: {
+    width: 13,
+    height: 2,
+    borderRadius: 2,
+    backgroundColor: navy,
+    marginBottom: 4,
+  },
+  fileDocLineShort: {
+    width: 9,
+    height: 2,
+    borderRadius: 2,
+    backgroundColor: navy,
+  },
+  fileImageSun: {
+    position: 'absolute',
+    top: 10,
+    right: 7,
+    width: 5,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: navy,
+  },
+  fileImageMountain: {
+    position: 'absolute',
+    left: 7,
+    bottom: 8,
+    width: 16,
+    height: 16,
+    borderLeftWidth: 2,
+    borderBottomWidth: 2,
+    borderColor: navy,
+    transform: [{ rotate: '-45deg' }],
+  },
+  fileZipRail: {
+    width: 8,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  fileZipTooth: {
+    width: 6,
+    height: 4,
+    borderRadius: 1,
+    borderWidth: 1.5,
+    borderColor: navy,
+    backgroundColor: '#DDF4F9',
   },
   folderTypeIcon: {
     backgroundColor: '#FFF4CC',
