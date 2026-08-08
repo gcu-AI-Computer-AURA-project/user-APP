@@ -1,10 +1,14 @@
 import React, { useContext, useEffect, useRef, useState } from 'react';
 import {
+  Alert,
   Animated,
   BackHandler,
   Easing,
   Image,
+  KeyboardAvoidingView,
   PanResponder,
+  PermissionsAndroid,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -14,11 +18,11 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import Svg, { Circle, Line, Path, Text as SvgText } from 'react-native-svg';
 
 type Screen =
   | 'initial'
   | 'privacy'
-  | 'login'
   | 'permissions'
   | 'gmailPermission'
   | 'drivePermission'
@@ -42,6 +46,7 @@ type Screen =
   | 'mailList'
   | 'driveList'
   | 'largeList'
+  | 'protectedList'
   | 'mailDetail'
   | 'fileDetail'
   | 'selectedReview'
@@ -51,6 +56,7 @@ type Screen =
   | 'carbonBasis'
   | 'storageMail'
   | 'storageDrive'
+  | 'storageDetail'
   | 'storageTrash'
   | 'storageDriveTrash'
   | 'settings'
@@ -62,12 +68,15 @@ type Screen =
   | 'serviceWithdraw'
   | 'notice';
 
-type MainTab = 'home' | 'storage' | 'settings';
+type MainTab = 'home' | 'storage' | 'history' | 'settings';
+type PermissionScreen = 'gmailPermission' | 'drivePermission' | 'notificationPermission';
+type PermissionState = { gmail: boolean; drive: boolean; alarm: boolean };
+type SettingsTogglesState = { scanComplete: boolean; aiNudge: boolean; marketing: boolean; autoScan: boolean };
 type MonthRange = { from: number; to: number };
 type ScanListItem = {
   id: string;
   title: string;
-  desc: string;
+  desc?: string;
   sizeMB: number;
   dateLabel: string;
   sortText: string;
@@ -78,11 +87,13 @@ type ScanListItem = {
 };
 type StorageMailItem = { id: string; title: string; subtitle: string; meta: string; badge?: string };
 type StorageDriveItem = { id: string; type: string; title: string; subtitle: string; fullPath?: string };
+type StorageDetailItem = { title: string; meta: string; source: 'mail' | 'drive' };
 type StorageDriveMoveTargets = Record<string, string>;
 type ScanSummary = {
   mailItems: ScanListItem[];
   driveItems: ScanListItem[];
   largeItems: ScanListItem[];
+  protectedItems: ScanListItem[];
   storageMailItems: StorageMailItem[];
   storageDriveItems: StorageDriveItem[];
   storageTrashItems: StorageMailItem[];
@@ -125,6 +136,8 @@ const pale = '#EAF7F2';
 const text = '#0B2A4A';
 const auraLogo = require('./assets/wireframes/AURA-logo-concept.png');
 const navHomeIcon = require('./assets/nav/home-house-navy.png');
+const gmailIcon = require('./assets/gmail-icon.png');
+const googleDriveIcon = require('./assets/google-drive-icon.png');
 const toMonthIndex = (year: number, month: number) => year * 12 + month - 1;
 const nowForScanRange = new Date();
 const minScanMonthIndex = toMonthIndex(2018, 2);
@@ -147,6 +160,7 @@ const getMainTabForScreen = (screen: Screen): MainTab | null => {
   if (
     screen === 'storageMail' ||
     screen === 'storageDrive' ||
+    screen === 'storageDetail' ||
     screen === 'storageTrash' ||
     screen === 'storageDriveTrash'
   ) {
@@ -181,17 +195,23 @@ const getMainTabForScreen = (screen: Screen): MainTab | null => {
     screen === 'mailList' ||
     screen === 'driveList' ||
     screen === 'largeList' ||
+    screen === 'protectedList' ||
     screen === 'mailDetail' ||
     screen === 'fileDetail' ||
     screen === 'selectedReview' ||
     screen === 'deleteConfirm' ||
     screen === 'deleteProcessing' ||
     screen === 'cleanupComplete' ||
-    screen === 'carbonBasis' ||
+    screen === 'carbonBasis'
+  ) {
+    return 'home';
+  }
+
+  if (
     screen === 'analysisHistory' ||
     screen === 'analysisHistoryAll'
   ) {
-    return 'home';
+    return 'history';
   }
 
   return null;
@@ -219,8 +239,11 @@ const getBackFallbackForScreen = (screen: Screen): Screen => {
 const defaultTabScreens: Record<MainTab, Screen> = {
   home: 'home',
   storage: 'storageMail',
+  history: 'analysisHistory',
   settings: 'settings',
 };
+const loginFlowScreens: Screen[] = ['initial', 'privacy', 'permissions', 'connected', 'onboardingGhost', 'onboardingCarbon'];
+const mainTabOrder: MainTab[] = ['home', 'storage', 'history', 'settings'];
 
 const NavigationContext = React.createContext<{
   current: Screen;
@@ -242,10 +265,21 @@ const auraMailMessages: AuraMailMessage[] = [
 
 const mailAttachmentIds = new Set(['mail-promo-summer', 'mail-newsletter', 'mail-meeting-old']);
 const mailGhostCandidateIds = new Set(['mail-promo-summer', 'mail-market-event', 'mail-newsletter', 'mail-coupon', 'mail-meeting-old']);
+const similarDuplicateDriveIds = new Set(['drive-report-copy', 'drive-photo-zip']);
+const storageSelectionPrefixes = new Set(['storageMail', 'storageDrive', 'storageTrash', 'storageDriveTrash']);
+const isDefaultCandidateSelected = (prefix: string, id: string) => prefix !== 'drive' || !similarDuplicateDriveIds.has(id);
+const isDefaultSelectionForKey = (key: string) => {
+  const [prefix, ...idParts] = key.split(':');
+  const id = idParts.join(':');
+  if (!/^(mail|drive|large|storageMail|storageDrive|storageTrash|storageDriveTrash)$/.test(prefix)) return false;
+  if (storageSelectionPrefixes.has(prefix)) return false;
+  return isDefaultCandidateSelected(prefix, id);
+};
 
 const auraDriveFiles: AuraDriveFile[] = [
+  { id: 'drive-root-unfiled-pdf', folderPath: '내 Drive', type: 'PDF', title: '정리되지_않은_회의자료.pdf', sizeMB: 74, modifiedAt: '2024.12.02', reason: '루트 경로 파일' },
   { id: 'drive-plan-pdf', folderPath: '내 Drive › 학술제 자료', type: 'PDF', title: 'AURA_기획서.pdf', sizeMB: 184, modifiedAt: '2025.11.12', reason: '대용량 PDF' },
-  { id: 'drive-slide-v1', folderPath: '내 Drive › 학술제 자료 › 발표자료', type: 'PDF', title: '발표자료_v1.pdf', sizeMB: 320, modifiedAt: '2026.07.01', reason: '발표자료 백업' },
+  { id: 'drive-slide-v1', folderPath: '내 Drive › 학술제 자료 › 발표자료', type: 'PDF', title: '발표자료_v1.pdf', sizeMB: 510, modifiedAt: '2026.07.01', reason: '발표자료 백업' },
   { id: 'drive-slide-old', folderPath: '내 Drive › 학술제 자료 › 발표자료', type: 'PDF', title: '발표자료_구버전.pdf', sizeMB: 410, modifiedAt: '2024.03.08', reason: '오래된 발표자료' },
   { id: 'drive-mockup-old', folderPath: '내 Drive › 디자인 백업 › Old Mockups', type: 'JPG', title: 'old_mockup.png', sizeMB: 96, modifiedAt: '2023.02.20', reason: '오래된 이미지' },
   { id: 'drive-figma-export', folderPath: '내 Drive › 디자인 백업 › Figma Export', type: 'ZIP', title: 'figma_export_backup.zip', sizeMB: 760, modifiedAt: '2022.12.16', reason: '대용량 디자인 백업' },
@@ -272,6 +306,11 @@ const getDriveParentPath = (path: string) => {
   const parts = splitDrivePath(path);
   if (parts.length <= 1) return null;
   return parts.slice(0, -1).join(' › ');
+};
+const getDriveAncestorFolders = (path: string) => {
+  const parts = splitDrivePath(path);
+  if (parts.length <= 2) return [];
+  return parts.slice(1, -1).map((_, index) => parts.slice(0, index + 2).join(' › '));
 };
 const getDriveFolderName = (path: string) => splitDrivePath(path).at(-1) ?? path;
 const getDirectDriveFolders = (parentPath: string) => {
@@ -329,15 +368,84 @@ const getAllStorageDriveItems = (): StorageDriveItem[] => [
   })),
 ];
 
+const getDirectDriveTrashFolders = (parentPath: string) => {
+  const parentParts = splitDrivePath(parentPath);
+  return driveTrashFolderOptions.filter((folder) => {
+    const parts = splitDrivePath(folder.name);
+    return parts.length === parentParts.length + 1 && parentParts.every((part, index) => parts[index] === part);
+  });
+};
+const getDirectDriveTrashFiles = (folderPath: string) => driveTrashFiles.filter((file) => file.folderPath === folderPath);
+const getStorageDriveTrashItemsForFolder = (folderPath: string): StorageDriveItem[] => [
+  ...getDirectDriveTrashFolders(folderPath).map((folder) => ({
+    id: `trash-drive-folder-${folder.name}`,
+    type: 'F',
+    title: getDriveFolderName(folder.name),
+    subtitle: `${folder.name} · 폴더`,
+    fullPath: folder.name,
+  })),
+  ...getDirectDriveTrashFiles(folderPath).map((file) => ({
+    id: `trash-drive-file-${file.id}`,
+    type: file.type,
+    title: file.title,
+    subtitle: `${file.type} · ${formatDataSize(file.sizeMB)} · ${file.folderPath}`,
+    fullPath: file.folderPath,
+  })),
+];
+const getAllStorageDriveTrashItems = (): StorageDriveItem[] => [
+  ...driveTrashFolderOptions.map((folder) => ({
+    id: `trash-drive-folder-${folder.name}`,
+    type: 'F',
+    title: getDriveFolderName(folder.name),
+    subtitle: `${folder.name} · 폴더`,
+    fullPath: folder.name,
+  })),
+  ...driveTrashFiles.map((file) => ({
+    id: `trash-drive-file-${file.id}`,
+    type: file.type,
+    title: file.title,
+    subtitle: `${file.type} · ${formatDataSize(file.sizeMB)} · ${file.folderPath}`,
+    fullPath: file.folderPath,
+  })),
+];
+
 const sampleTrashItems: StorageMailItem[] = [
-  { id: 'trash-coupon', title: '프로모션 쿠폰 메일', subtitle: '이동 2026.07.08 · 원래 유형 Gmail', meta: '크기 68MB · 받은편지함에서 이동', badge: '복구 가능' },
-  { id: 'trash-event', title: '이벤트 안내 메일', subtitle: '이동 2026.07.06 · 원래 유형 Gmail', meta: '크기 52MB · 광고함에서 이동', badge: '복구 가능' },
+  { id: 'trash-coupon', title: 'store@promo.com', subtitle: '[광고] 여름 프로모션 쿠폰', meta: '받은편지함 · 68MB', badge: '복구 가능' },
+  { id: 'trash-event', title: 'event@market.com', subtitle: '이번 주 특가 안내', meta: '프로모션 · 52MB', badge: '복구 가능' },
+];
+
+const storageMailPagingMockItems: StorageMailItem[] = Array.from({ length: 28 }, (_, index) => {
+  const number = index + 1;
+  const size = 18 + (index % 8) * 7;
+  return {
+    id: `storage-mail-paging-${number}`,
+    title: `mock-sender-${number}@mail.com`,
+    subtitle: `페이징 확인용 메일 ${number}`,
+    meta: `받은날짜 2021.${`${(index % 12) + 1}`.padStart(2, '0')}.${`${(index % 27) + 1}`.padStart(2, '0')} · 받은편지함 · ${size}MB`,
+  };
+});
+
+const driveTrashFolderOptions = [
+  { name: `${driveRootPath} › 삭제된 학기 자료`, meta: '파일 2개 · 하위 폴더 1개 · 1.1GB' },
+  { name: `${driveRootPath} › 삭제된 학기 자료 › 이전 발표본`, meta: '파일 2개 · 910MB' },
+  { name: `${driveRootPath} › 임시 다운로드`, meta: '파일 1개 · 360MB' },
+];
+
+const driveTrashFiles: AuraDriveFile[] = [
+  { id: 'trash-drive-root-large', folderPath: driveRootPath, type: 'ZIP', title: 'old_export_bundle.zip', sizeMB: 740, modifiedAt: '2020.05.20', reason: '휴지통 파일' },
+  { id: 'trash-drive-root-note', folderPath: driveRootPath, type: 'PDF', title: '삭제된_회의록.pdf', sizeMB: 88, modifiedAt: '2021.01.11', reason: '휴지통 파일' },
+  { id: 'trash-drive-old-plan', folderPath: `${driveRootPath} › 삭제된 학기 자료`, type: 'PDF', title: '운영체제_강의자료_백업.pdf', sizeMB: 620, modifiedAt: '2022.03.12', reason: '휴지통 파일' },
+  { id: 'trash-drive-final-video', folderPath: `${driveRootPath} › 삭제된 학기 자료`, type: 'ZIP', title: '기말발표_녹화본.zip', sizeMB: 480, modifiedAt: '2021.12.18', reason: '휴지통 파일' },
+  { id: 'trash-drive-slide-draft', folderPath: `${driveRootPath} › 삭제된 학기 자료 › 이전 발표본`, type: 'PDF', title: '발표자료_초안.pdf', sizeMB: 510, modifiedAt: '2021.11.02', reason: '휴지통 파일' },
+  { id: 'trash-drive-slide-ref', folderPath: `${driveRootPath} › 삭제된 학기 자료 › 이전 발표본`, type: 'PDF', title: '참고자료_모음.pdf', sizeMB: 400, modifiedAt: '2021.10.28', reason: '휴지통 파일' },
+  { id: 'trash-drive-download-cache', folderPath: `${driveRootPath} › 임시 다운로드`, type: 'ZIP', title: 'download_cache.zip', sizeMB: 360, modifiedAt: '2020.08.06', reason: '휴지통 파일' },
 ];
 
 const emptyScanSummary: ScanSummary = {
   mailItems: [],
   driveItems: [],
   largeItems: [],
+  protectedItems: [],
   storageMailItems: [],
   storageDriveItems: [],
   storageTrashItems: [],
@@ -359,6 +467,18 @@ function formatDataSize(sizeMB: number) {
   return `${Math.round(sizeMB)}MB`;
 }
 
+function formatScanDateOnly(dateLabel: string) {
+  return dateLabel.split(/\s+/)[0] || dateLabel;
+}
+
+function formatMonthDuration(months: number) {
+  const years = Math.floor(months / 12);
+  const restMonths = months % 12;
+  if (years <= 0) return `${restMonths}개월`;
+  if (restMonths <= 0) return `${years}년`;
+  return `${years}년 ${restMonths}개월`;
+}
+
 function sizeLabelToMB(label: string) {
   const value = Number.parseFloat(label.replace(/[^0-9.]/g, '')) || 0;
   return label.includes('GB') ? value * 1024 : value;
@@ -369,6 +489,28 @@ function extractStorageSizeMB(textValue: string) {
   if (!match) return 0;
   const value = Number.parseFloat(match[1]) || 0;
   return match[2].toUpperCase() === 'GB' ? value * 1024 : value;
+}
+
+function getStorageSizeLabel(textValue: string) {
+  const sizeMB = extractStorageSizeMB(textValue);
+  return sizeMB > 0 ? formatDataSize(sizeMB) : '';
+}
+
+function splitStorageMeta(textValue: string) {
+  return textValue.split(/\s*(?:·|쨌)\s*/).map((part) => part.trim()).filter(Boolean);
+}
+
+function getTrashDriveFolderPath(meta: string) {
+  const parts = splitStorageMeta(meta);
+  const path = parts.find((part) => part.includes('Drive ›') || part === '내 Drive');
+  if (path) return path;
+  const folderOnly = meta.replace(/\s*(?:·|쨌)\s*(?:폴더|\?대뜑)$/, '').trim();
+  return folderOnly || '내 Drive';
+}
+
+function formatFolderMeta(meta: string) {
+  const match = meta.match(/(\d+(?:\.\d+)?\s*(?:GB|MB))/i);
+  return match?.[1] ?? meta;
 }
 
 function carbonLabelToGram(label: string) {
@@ -442,6 +584,12 @@ function buildScanResult({
         return !excluded && (includeMailAttachments || !hasAttachment) && (included || mailGhostCandidateIds.has(mail.id));
       })
     : [];
+  const protectedMailCandidates = scanSources.gmail
+    ? auraMailMessages.filter((mail) => {
+        const haystack = `${mail.title} ${mail.from} ${mail.folder} ${mail.reason}`.toLowerCase();
+        return loweredExclude.some((keyword) => haystack.includes(keyword));
+      })
+    : [];
 
   const selectedDriveFiles = scanSources.drive
     ? auraDriveFiles.filter((file) => {
@@ -450,6 +598,13 @@ function buildScanResult({
         const driveHaystack = `${file.title} ${file.folderPath} ${file.reason} ${file.type}`.toLowerCase();
         const protectedFile = loweredExclude.some((keyword) => driveHaystack.includes(keyword));
         return typeAllowed && inFolder && !protectedFile;
+      })
+    : [];
+  const protectedDriveFiles = scanSources.drive
+    ? auraDriveFiles.filter((file) => {
+        const inFolder = scanSources.folder ? selectedDriveFileIds.includes(file.id) : true;
+        const driveHaystack = `${file.title} ${file.folderPath} ${file.reason} ${file.type}`.toLowerCase();
+        return inFolder && loweredExclude.some((keyword) => driveHaystack.includes(keyword));
       })
     : [];
 
@@ -493,6 +648,30 @@ function buildScanResult({
     previewLabel: file.type === 'PDF' ? 'PDF PREVIEW' : file.type === 'JPG' ? 'IMAGE PREVIEW' : 'FILE PREVIEW',
     detailSubtitle: `${formatDataSize(file.sizeMB)} · ${file.type} · ${file.folderPath}`,
   }));
+  const protectedItems = [
+    ...protectedMailCandidates.map((mail) => ({
+      id: mail.id,
+      title: mail.title,
+      desc: `${mail.from} · ${mail.folder} · ${formatDataSize(mail.sizeMB)} · 제외 키워드 보호`,
+      sizeMB: mail.sizeMB,
+      dateLabel: mail.receivedAt,
+      sortText: mail.from,
+      source: 'mail' as const,
+      previewLabel: '보호된 메일',
+      detailSubtitle: `${mail.from} → me@gmail.com`,
+    })),
+    ...protectedDriveFiles.map((file) => ({
+      id: file.id,
+      title: file.title,
+      desc: `${formatDataSize(file.sizeMB)} · ${file.folderPath} · 제외 키워드 보호`,
+      sizeMB: file.sizeMB,
+      dateLabel: file.modifiedAt,
+      sortText: file.title,
+      source: 'drive' as const,
+      previewLabel: '보호된 Drive 항목',
+      detailSubtitle: `${formatDataSize(file.sizeMB)} · ${file.type} · ${file.folderPath}`,
+    })),
+  ];
 
   const folderLabel = scanSources.folder
     ? selectedDriveFolders.length
@@ -506,12 +685,18 @@ function buildScanResult({
     mailItems,
     driveItems,
     largeItems,
-    storageMailItems: mailCandidates.map((mail) => ({
-      id: `storage-${mail.id}`,
-      title: mail.from,
-      subtitle: mail.title,
-      meta: `받은날짜 ${mail.receivedAt} · ${mail.folder} · ${formatDataSize(mail.sizeMB)}`,
-    })),
+    protectedItems,
+    storageMailItems: scanSources.gmail
+      ? [
+          ...mailCandidates.map((mail) => ({
+            id: `storage-${mail.id}`,
+            title: mail.from,
+            subtitle: mail.title,
+            meta: `받은날짜 ${mail.receivedAt} · ${mail.folder} · ${formatDataSize(mail.sizeMB)}`,
+          })),
+          ...storageMailPagingMockItems,
+        ]
+      : [],
     storageDriveItems: [
       ...(scanSources.folder && selectedDriveFolders.length
         ? selectedDriveFolders.map((folder) => ({
@@ -535,17 +720,7 @@ function buildScanResult({
         subtitle: `${file.type} · ${formatDataSize(file.sizeMB)} · 수정 ${file.modifiedAt} · ${file.folderPath}`,
       })),
     ],
-    storageTrashItems: totalSize > 0
-      ? [
-          ...sampleTrashItems,
-          ...selectedDriveFiles.slice(0, 3).map((file) => ({
-            id: `trash-drive-${file.id}`,
-            title: file.title,
-            subtitle: `이동 ${formatMonthLabel(maxScanMonthIndex).replace('년 ', '.').replace('월', '.23')} · 원래 유형 Drive`,
-            meta: `${formatDataSize(file.sizeMB)} · ${file.folderPath}`,
-          })),
-        ]
-      : [],
+    storageTrashItems: totalSize > 0 ? sampleTrashItems : [],
     mailSizeLabel: formatDataSize(mailSize),
     driveSizeLabel: formatDataSize(driveSize),
     largeSizeLabel: formatDataSize(largeSize),
@@ -556,22 +731,35 @@ function buildScanResult({
   };
 }
 
+const defaultStorageSummary = buildScanResult({
+  scanSources: { gmail: true, drive: true, folder: false },
+  selectedDriveFolders: [],
+  selectedDriveFileIds: [],
+  includeSubFolders: true,
+  includeKeywords: [],
+  excludeKeywords: [],
+  selectedFileTypes: { PDF: true, DOCX: true, ZIP: true, JPG: true },
+  includeMailAttachments: true,
+});
+
 export default function App() {
   const [screen, setScreen] = useState<Screen>('initial');
   const [history, setHistory] = useState<Screen[]>([]);
   const [lastTabScreens, setLastTabScreens] = useState<Record<MainTab, Screen>>({
     home: 'home',
     storage: 'storageMail',
+    history: 'analysisHistory',
     settings: 'settings',
   });
   const [tabHistories, setTabHistories] = useState<Record<MainTab, Screen[]>>({
     home: [],
     storage: [],
+    history: [],
     settings: [],
   });
   const [privacyChecked, setPrivacyChecked] = useState(false);
   const [privacyDetailChecked, setPrivacyDetailChecked] = useState(false);
-  const [permissions, setPermissions] = useState({ gmail: false, drive: false, alarm: false });
+  const [permissions, setPermissions] = useState<PermissionState>({ gmail: false, drive: false, alarm: false });
   const [permissionToast, setPermissionToast] = useState('');
   const [toastTarget, setToastTarget] = useState<Screen | null>(null);
   const [includeInput, setIncludeInput] = useState('');
@@ -596,9 +784,12 @@ export default function App() {
   const [selectedDriveFiles, setSelectedDriveFiles] = useState<string[]>([]);
   const [includeSubFolders, setIncludeSubFolders] = useState(true);
   const [periodRange, setPeriodRange] = useState('3년 이상');
+  const [lastOpenedBeforeMonths, setLastOpenedBeforeMonths] = useState(6);
+  const [lastModifiedBeforeMonths, setLastModifiedBeforeMonths] = useState(6);
   const [openedYearRange, setOpenedYearRange] = useState<MonthRange>({ from: toMonthIndex(2023, 1), to: maxScanMonthIndex });
   const [modifiedYearRange, setModifiedYearRange] = useState<MonthRange>({ from: toMonthIndex(2022, 1), to: maxScanMonthIndex });
   const [yearSheetType, setYearSheetType] = useState<'opened' | 'modified' | null>(null);
+  const [periodSheetType, setPeriodSheetType] = useState<'opened' | 'modified' | null>(null);
   const [periodEditOnly, setPeriodEditOnly] = useState(false);
   const [scanSourceEditOnly, setScanSourceEditOnly] = useState(false);
   const [checked, setChecked] = useState<Record<string, boolean>>({});
@@ -621,8 +812,10 @@ export default function App() {
   const keywordChoiceMotion = useRef(new Animated.Value(1)).current;
   const keywordSheetMotion = useRef(new Animated.Value(1)).current;
   const yearSheetMotion = useRef(new Animated.Value(1)).current;
+  const periodSheetMotion = useRef(new Animated.Value(1)).current;
   const filterSheetMotion = useRef(new Animated.Value(1)).current;
   const deleteConfirmMotion = useRef(new Animated.Value(1)).current;
+  const cleanupReclaimedOpacity = useRef(new Animated.Value(1)).current;
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const screenRef = useRef<Screen>('initial');
   const scanSourceLabelRef = useRef('Gmail + Drive');
@@ -634,11 +827,13 @@ export default function App() {
   const [filterSize, setFilterSize] = useState('전체 용량');
   const [sortMode, setSortMode] = useState('날짜순');
   const [selectedScanItem, setSelectedScanItem] = useState<ScanListItem | null>(null);
+  const [selectedStorageDetail, setSelectedStorageDetail] = useState<StorageDetailItem | null>(null);
   const [mailListMode, setMailListMode] = useState<'promo' | 'old'>('promo');
-  const [carbonRecordIncluded, setCarbonRecordIncluded] = useState(true);
+  const [driveListMode, setDriveListMode] = useState<'old' | 'duplicate'>('old');
+  const [analysisHistoryReturnTarget, setAnalysisHistoryReturnTarget] = useState<Screen>('home');
   const [keywordChoiceVisible, setKeywordChoiceVisible] = useState(false);
   const [keywordSheetType, setKeywordSheetType] = useState<'include' | 'exclude' | null>(null);
-  const [settingsToggles, setSettingsToggles] = useState({
+  const [settingsToggles, setSettingsToggles] = useState<SettingsTogglesState>({
     scanComplete: true,
     aiNudge: true,
     marketing: false,
@@ -682,12 +877,12 @@ export default function App() {
   };
 
   const getResolvedBackParent = (target: Screen): Screen => {
-    if (target === 'privacy' || target === 'login') return 'initial';
-    if (target === 'permissions') return 'login';
+    if (target === 'privacy' || target === 'permissions') return 'initial';
     if (target === 'gmailPermission' || target === 'drivePermission' || target === 'notificationPermission') return 'permissions';
     if (target === 'connected') return 'permissions';
     if (target === 'onboardingGhost') return 'connected';
     if (target === 'onboardingCarbon') return 'onboardingGhost';
+    if (target === 'analysisHistory') return analysisHistoryReturnTarget;
 
     const tab = getResolvedTabForScreen(target);
     if (tab) return defaultTabScreens[tab];
@@ -722,6 +917,10 @@ export default function App() {
   };
 
   const navigateTab = (tab: MainTab) => {
+    if (tab === 'history') {
+      setAnalysisHistoryReturnTarget('home');
+    }
+
     const currentTab = getResolvedTabForScreen(screen);
 
     if (currentTab === tab) {
@@ -856,6 +1055,28 @@ export default function App() {
     });
   };
 
+  const openPeriodMonthSheet = (type: 'opened' | 'modified') => {
+    setPeriodSheetType(type);
+    periodSheetMotion.setValue(1);
+    Animated.timing(periodSheetMotion, {
+      toValue: 0,
+      duration: 260,
+      useNativeDriver: true,
+    }).start();
+  };
+
+  const closePeriodMonthSheet = () => {
+    Animated.timing(periodSheetMotion, {
+      toValue: 1,
+      duration: 220,
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (finished) {
+        setPeriodSheetType(null);
+      }
+    });
+  };
+
   const openFilterSheet = () => {
     setFilterSheetVisible(true);
     filterSheetMotion.setValue(1);
@@ -878,9 +1099,34 @@ export default function App() {
     });
   };
 
+  useEffect(() => {
+    const animation = Animated.loop(
+      Animated.sequence([
+        Animated.timing(cleanupReclaimedOpacity, {
+          toValue: 0.28,
+          duration: 620,
+          useNativeDriver: true,
+        }),
+        Animated.timing(cleanupReclaimedOpacity, {
+          toValue: 1,
+          duration: 620,
+          useNativeDriver: true,
+        }),
+      ])
+    );
+
+    animation.start();
+    return () => animation.stop();
+  }, [cleanupReclaimedOpacity]);
+
   const formatYearRange = (range: MonthRange) => `${formatMonthLabel(range.from)}부터 ${formatMonthLabel(range.to)}까지`;
-  const getPeriodLabel = () => `열람 ${formatYearRange(openedYearRange)} · 수정 ${formatYearRange(modifiedYearRange)}`;
-  const getDefaultPeriodLabel = () => `수정 ${formatYearRange(modifiedYearRange)}`;
+  const getPeriodLabel = () => `열람 ${formatMonthDuration(lastOpenedBeforeMonths)} 이상 · 수정 ${formatMonthDuration(lastModifiedBeforeMonths)} 이상`;
+  const getDefaultPeriodLabel = () => `열람 ${formatMonthDuration(lastOpenedBeforeMonths)} · 수정 ${formatMonthDuration(lastModifiedBeforeMonths)}`;
+  const clampMonthCondition = (value: number) => Math.max(1, Math.min(120, value));
+  const updateMonthCondition = (type: 'opened' | 'modified', value: number) => {
+    const setter = type === 'opened' ? setLastOpenedBeforeMonths : setLastModifiedBeforeMonths;
+    setter(clampMonthCondition(value));
+  };
 
   const isScanSetupScreen = (target: Screen) =>
     target === 'scanFlowSource' || target === 'scanFlowFolder' || target === 'scanFlowPeriod';
@@ -935,8 +1181,8 @@ export default function App() {
 
   const resetToFreshStart = () => {
     setHistory([]);
-    setLastTabScreens({ home: 'home', storage: 'storageMail', settings: 'settings' });
-    setTabHistories({ home: [], storage: [], settings: [] });
+    setLastTabScreens({ home: 'home', storage: 'storageMail', history: 'analysisHistory', settings: 'settings' });
+    setTabHistories({ home: [], storage: [], history: [], settings: [] });
     setPrivacyChecked(false);
     setPrivacyDetailChecked(false);
     setPermissions({ gmail: false, drive: false, alarm: false });
@@ -956,6 +1202,8 @@ export default function App() {
     setSelectedDriveFolders([]);
     setSelectedDriveFiles([]);
     setIncludeSubFolders(true);
+    setLastOpenedBeforeMonths(36);
+    setLastModifiedBeforeMonths(24);
     setOpenedYearRange({ from: toMonthIndex(2023, 1), to: maxScanMonthIndex });
     setModifiedYearRange({ from: toMonthIndex(2022, 1), to: maxScanMonthIndex });
     setPeriodEditOnly(false);
@@ -1027,6 +1275,97 @@ export default function App() {
     showToast('Gmail 또는 Google Drive의 접근 권한을 허용해주세요');
   };
 
+  const requestPushPermission = async () => {
+    if (Platform.OS === 'android') {
+      const androidVersion = Number(Platform.Version);
+      const notificationPermission = PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS;
+
+      if (androidVersion < 33 || !notificationPermission) {
+        setPermissions((items) => ({ ...items, alarm: true }));
+        setSettingsToggles((items) => ({ ...items, scanComplete: true, aiNudge: true }));
+        return true;
+      }
+
+      const acceptedAppPrompt = await new Promise<boolean>((resolve) => {
+        Alert.alert(
+          'AURA 푸시 알림',
+          '스캔 완료와 정리 권장 알림을 받을 수 있도록 알림 권한을 허용해주세요.',
+          [
+            {
+              text: '허용 안 함',
+              style: 'cancel',
+              onPress: () => resolve(false),
+            },
+            {
+              text: '허용',
+              onPress: () => resolve(true),
+            },
+          ],
+          { cancelable: false }
+        );
+      });
+
+      if (!acceptedAppPrompt) {
+        setPermissions((items) => ({ ...items, alarm: false }));
+        setSettingsToggles((items) => ({ ...items, scanComplete: false, aiNudge: false }));
+        showToast('푸시 알림 권한이 허용되지 않았어요');
+        return false;
+      }
+
+      const result = await PermissionsAndroid.request(notificationPermission);
+      const allowed = result === PermissionsAndroid.RESULTS.GRANTED;
+
+      setPermissions((items) => ({ ...items, alarm: allowed }));
+      setSettingsToggles((items) => ({ ...items, scanComplete: allowed, aiNudge: allowed }));
+      if (!allowed) {
+        showToast('푸시 알림 권한이 허용되지 않았어요');
+      }
+      return allowed;
+    }
+
+    const maybeNotification = (globalThis as unknown as {
+      Notification?: {
+        permission: string;
+        requestPermission?: () => Promise<string>;
+      };
+    }).Notification;
+
+    if (maybeNotification?.requestPermission) {
+      const result = await maybeNotification.requestPermission();
+      const allowed = result === 'granted';
+
+      setPermissions((items) => ({ ...items, alarm: allowed }));
+      setSettingsToggles((items) => ({ ...items, scanComplete: allowed, aiNudge: allowed }));
+      if (!allowed) {
+        showToast('푸시 알림 권한이 허용되지 않았어요');
+      }
+      return allowed;
+    }
+
+    setPermissions((items) => ({ ...items, alarm: true }));
+    setSettingsToggles((items) => ({ ...items, scanComplete: true, aiNudge: true }));
+    return true;
+  };
+
+  const togglePushPermissionConsent = () => {
+    if (permissions.alarm) {
+      setPermissions((items) => ({ ...items, alarm: false }));
+      setSettingsToggles((items) => ({ ...items, scanComplete: false, aiNudge: false }));
+      return;
+    }
+
+    void requestPushPermission();
+  };
+
+  const completeLoginPermissionSetup = () => {
+    setPermissions((items) => ({ ...items, gmail: true, drive: true }));
+    if (!permissions.alarm) {
+      setSettingsToggles((items) => ({ ...items, scanComplete: false, aiNudge: false }));
+    }
+    setScanSources({ gmail: true, drive: false, folder: false });
+    go('connected');
+  };
+
   const openCompletedScanResult = () => {
     if (toastTimer.current) {
       clearTimeout(toastTimer.current);
@@ -1051,7 +1390,7 @@ export default function App() {
 
     if (maybeNotification.permission === 'granted') {
       const notification = new maybeNotification('AURA 스캔 완료', {
-        body: '정리 후보와 예상 탄소 절감량이 준비됐어요.',
+        body: '정리 후보와 확보 가능 용량이 준비됐어요.',
       }) as { onclick?: () => void };
       notification.onclick = openCompletedScanResult;
       return;
@@ -1061,7 +1400,7 @@ export default function App() {
       maybeNotification.requestPermission().then((permission) => {
         if (permission === 'granted') {
           const notification = new maybeNotification('AURA 스캔 완료', {
-            body: '정리 후보와 예상 탄소 절감량이 준비됐어요.',
+            body: '정리 후보와 확보 가능 용량이 준비됐어요.',
           }) as { onclick?: () => void };
           notification.onclick = openCompletedScanResult;
         }
@@ -1207,7 +1546,7 @@ export default function App() {
     });
   };
 
-  const completePrivacyAndBack = () => {
+  const acceptPrivacyConsentAndBack = () => {
     markPrivacyConsent();
     replace('initial');
   };
@@ -1231,6 +1570,11 @@ export default function App() {
 
       if (yearSheetType) {
         closeYearSheet();
+        return true;
+      }
+
+      if (periodSheetType) {
+        closePeriodMonthSheet();
         return true;
       }
 
@@ -1259,6 +1603,7 @@ export default function App() {
     history,
     keywordChoiceVisible,
     keywordSheetType,
+    periodSheetType,
     privacyDetailChecked,
     screen,
     withdrawSheetVisible,
@@ -1343,9 +1688,9 @@ export default function App() {
       return;
     }
 
-    const gmailTimer = setTimeout(() => setConnectedStep(1), 430);
-    const driveTimer = setTimeout(() => setConnectedStep(2), 900);
-    const buttonTimer = setTimeout(() => setConnectedStep(3), 1400);
+    const gmailTimer = setTimeout(() => setConnectedStep(1), 120);
+    const driveTimer = setTimeout(() => setConnectedStep(2), 220);
+    const buttonTimer = setTimeout(() => setConnectedStep(3), 320);
 
     return () => {
       clearTimeout(gmailTimer);
@@ -1420,13 +1765,12 @@ export default function App() {
   }, []);
 
   const toggleCheck = (key: string) => {
-    const defaultSelected = /^(mail|drive|large|storageMail|storageDrive|storageTrash|storageDriveTrash):/.test(key);
+    const defaultSelected = isDefaultSelectionForKey(key);
     setChecked((items) => ({ ...items, [key]: !(items[key] ?? defaultSelected) }));
   };
 
   const setAll = (prefix: string, keys: string[]) => {
-    const defaultSelected = /^(mail|drive|large|storageMail|storageDrive|storageTrash|storageDriveTrash)$/.test(prefix);
-    const allChecked = keys.every((key) => checked[`${prefix}:${key}`] ?? defaultSelected);
+    const allChecked = keys.every((key) => checked[`${prefix}:${key}`] ?? isDefaultSelectionForKey(`${prefix}:${key}`));
     setChecked((items) => {
       const next = { ...items };
       keys.forEach((key) => {
@@ -1551,6 +1895,14 @@ export default function App() {
   };
 
   const toggleDriveFolder = (folder: string) => {
+    const isSelectedByParent = selectedDriveFolders.includes(folder) &&
+      getDriveAncestorFolders(folder).some((ancestor) => selectedDriveFolders.includes(ancestor));
+
+    if (isSelectedByParent) {
+      showToast('먼저 상위 폴더를 해제해주세요');
+      return;
+    }
+
     setSelectedDriveFolders((items) => {
       const folderGroup = getDriveFolderSelectionGroup(folder);
       const fileGroup = getDriveFileSelectionGroup(folder).map((file) => file.id);
@@ -1592,38 +1944,49 @@ export default function App() {
     const driveParentFolder = getDriveParentPath(driveCurrentFolder);
     const isDriveSearching = Boolean(driveFolderSearch.trim());
     const activeScanResult = lastScan?.result ?? scanResultRef.current;
-    const promoMailItems = activeScanResult.mailItems.filter((item) => item.desc.includes('광고') || item.desc.includes('프로모션'));
+    const promoMailItems = activeScanResult.mailItems.filter((item) => item.desc?.includes('광고') || item.desc?.includes('프로모션'));
     const oldMailItems = activeScanResult.mailItems.filter((item) => !promoMailItems.some((mail) => mail.id === item.id));
     const largeDriveIds = new Set(activeScanResult.largeItems.map((item) => item.id));
-    const driveRegularItems = activeScanResult.driveItems.filter((item) => !largeDriveIds.has(item.id));
+    const duplicateDriveItems = activeScanResult.driveItems.filter((item) => similarDuplicateDriveIds.has(item.id) || item.desc?.includes('중복'));
+    const duplicateDriveIds = new Set(duplicateDriveItems.map((item) => item.id));
+    const oldDriveItems = activeScanResult.driveItems.filter((item) => !largeDriveIds.has(item.id) && !duplicateDriveIds.has(item.id));
+    const largeOnlyDriveItems = activeScanResult.largeItems.filter((item) => !duplicateDriveIds.has(item.id));
+    const driveRegularItems = driveListMode === 'duplicate' ? duplicateDriveItems : oldDriveItems;
     const filteredPromoMailItems = applyResultFilterSort(promoMailItems, filterDate, filterSize, sortMode);
     const filteredOldMailItems = applyResultFilterSort(oldMailItems, filterDate, filterSize, sortMode);
     const filteredDriveItems = applyResultFilterSort(driveRegularItems, filterDate, filterSize, sortMode);
-    const filteredLargeItems = applyResultFilterSort(activeScanResult.largeItems, filterDate, filterSize, sortMode);
+    const filteredLargeItems = applyResultFilterSort(largeOnlyDriveItems, filterDate, filterSize, sortMode);
     const activeMailListItems = mailListMode === 'promo' ? filteredPromoMailItems : filteredOldMailItems;
     const activeMailListTitle = mailListMode === 'promo' ? '광고·프로모션 메일' : '오래된 메일';
+    const activeDriveListTitle = driveListMode === 'duplicate' ? '중복 파일' : '오래된 파일';
     const promoMailCount = promoMailItems.length;
     const oldMailCount = oldMailItems.length;
-    const driveCandidateCount = driveRegularItems.length || activeScanResult.driveItems.length;
-    const selectedMailItems = activeScanResult.mailItems.filter((item) => checked[`mail:${item.id}`] ?? true);
-    const selectedDriveItems = activeScanResult.driveItems.filter((item) => checked[`drive:${item.id}`] ?? true);
-    const selectedPromoMailCount = promoMailItems.filter((item) => checked[`mail:${item.id}`] ?? true).length;
-    const selectedOldMailCount = oldMailItems.filter((item) => checked[`mail:${item.id}`] ?? true).length;
-    const selectedLargeDriveCount = activeScanResult.largeItems.filter((item) => checked[`drive:${item.id}`] ?? true).length;
-    const selectedRegularDriveCount = driveRegularItems.filter((item) => checked[`drive:${item.id}`] ?? true).length;
+    const driveCandidateCount = oldDriveItems.length + duplicateDriveItems.length;
+    const duplicateDeselectedCount = duplicateDriveItems.filter((item) => !(checked[`drive:${item.id}`] ?? isDefaultCandidateSelected('drive', item.id))).length;
+    const selectedMailItems = activeScanResult.mailItems.filter((item) => checked[`mail:${item.id}`] ?? isDefaultCandidateSelected('mail', item.id));
+    const selectedDriveItems = activeScanResult.driveItems.filter((item) => checked[`drive:${item.id}`] ?? isDefaultCandidateSelected('drive', item.id));
+    const selectedPromoMailCount = promoMailItems.filter((item) => checked[`mail:${item.id}`] ?? isDefaultCandidateSelected('mail', item.id)).length;
+    const selectedOldMailCount = oldMailItems.filter((item) => checked[`mail:${item.id}`] ?? isDefaultCandidateSelected('mail', item.id)).length;
+    const selectedLargeDriveCount = largeOnlyDriveItems.filter((item) => checked[`drive:${item.id}`] ?? isDefaultCandidateSelected('drive', item.id)).length;
+    const selectedRegularDriveCount = driveRegularItems.filter((item) => checked[`drive:${item.id}`] ?? isDefaultCandidateSelected('drive', item.id)).length;
     const selectedMailCleanupCount = selectedMailItems.length;
     const selectedDriveCleanupCount = selectedDriveItems.length;
     const selectedCandidateCount = selectedMailItems.length + selectedDriveItems.length;
     const selectedTotalSizeMB = sumScanItemSize(selectedMailItems) + sumScanItemSize(selectedDriveItems);
     const selectedTotalSizeLabel = formatDataSize(selectedTotalSizeMB);
     const remainingAfterCleanup = activeScanResult.totalSizeLabel === '0MB' ? '2.6GB' : '4.7GB';
+    const homeRemainingDriveLabel = '2.6GB';
+    const homeDriveTotalGB = 15;
+    const homeDriveRemainingGB = 2.6;
+    const homeDriveUsagePercent = Math.round(((homeDriveTotalGB - homeDriveRemainingGB) / homeDriveTotalGB) * 100);
+    const cleanupDriveTotalGB = 15;
+    const cleanupRemainingGB = sizeLabelToMB(remainingAfterCleanup) / 1024;
+    const cleanupReclaimedGB = selectedTotalSizeMB / 1024;
+    const cleanupCurrentUsedGB = Math.max(0, cleanupDriveTotalGB - cleanupRemainingGB - cleanupReclaimedGB);
+    const cleanupCurrentUsedPercent = Math.min(100, Math.max(0, (cleanupCurrentUsedGB / cleanupDriveTotalGB) * 100));
+    const cleanupReclaimedPercent = Math.min(100 - cleanupCurrentUsedPercent, Math.max(0, (cleanupReclaimedGB / cleanupDriveTotalGB) * 100));
     const excludedCandidateCount = Math.max(0, activeScanResult.candidateCount - selectedCandidateCount);
     const checkedCleanupSizeLabel = selectedTotalSizeLabel;
-    const checkedCarbonValue = Math.max(0, (selectedTotalSizeMB / 1024) * 0.19);
-    const checkedCarbonLabel = `${checkedCarbonValue.toFixed(checkedCarbonValue >= 1 ? 1 : 1)}g CO₂`;
-    const includedCarbonLabel = carbonRecordIncluded ? checkedCarbonLabel : '0.0g CO₂';
-    const includedCarbonDisplay = includedCarbonLabel.replace('CO₂', 'CO₂e');
-
     const homeScanStatusTitle =
       homeScanNotice === 'completed' ? '스캔이 완료됐어요' : homeScanNotice === 'cancelled' ? '스캔이 중단됐어요' : '스캔 진행 중';
     const homeScanStatusDesc =
@@ -1639,18 +2002,7 @@ export default function App() {
           <ScreenShell noNav>
             <View style={styles.heroSpacer} />
             <Logo large />
-            <Text style={styles.heroTitle}>메일과 파일을 가볍게{'\n'}탄소까지 줄이는 AURA</Text>
-            <PrimaryButton
-              title="구글 계정으로 계속"
-              onPress={() => {
-                if (!privacyChecked) {
-                  showToast('개인정보 수집 및 분석 동의가 필요합니다');
-                  return;
-                }
-                go('login');
-              }}
-              inline
-            />
+            <Text style={styles.heroTitle}>AURA로 개인 클라우드 관리{'\n'}시작해 보세요</Text>
             <Pressable style={styles.initialConsentLink} onPress={() => go('privacy')}>
               <View style={styles.initialConsentLinkTextBox}>
                 <View style={styles.initialConsentTitleRow}>
@@ -1660,13 +2012,23 @@ export default function App() {
                 <View style={styles.initialConsentLinkLine} />
               </View>
             </Pressable>
-            <Text style={styles.helperText}>동의 내용을 확인한 뒤 로그인할 수 있어요.</Text>
+            <PrimaryButton
+              title="구글 계정으로 계속"
+              onPress={() => {
+                if (!privacyChecked) {
+                  showToast('개인정보 수집 및 분석 동의가 필요합니다');
+                  return;
+                }
+                go('permissions');
+              }}
+              inline
+            />
           </ScreenShell>
         );
 
       case 'privacy':
         return (
-          <ScreenShell title="개인정보 수집·이용 동의" subtitle="현재 동의 내용과 이용 범위를 확인합니다" noNav>
+          <ScreenShell title="개인정보 수집·이용 동의" noNav>
             <Card style={styles.privacyCombinedCard}>
               <View style={styles.privacyBlock}>
                 <SectionTitle>수집 및 이용 항목</SectionTitle>
@@ -1674,71 +2036,30 @@ export default function App() {
               </View>
               <View style={styles.privacyBlock}>
                 <SectionTitle>이용 목적</SectionTitle>
-                <PrivacyBody>· 맞춤형 유령 데이터 탐지{'\n'}· 중복 파일 비교와 정리 추천{'\n'}· 탄소 절감량 계산 및 통계</PrivacyBody>
+                <PrivacyBody>· 맞춤형 유령 데이터 탐지{'\n'}· 중복 파일 비교와 정리 추천{'\n'}· 정리 용량 계산 및 통계</PrivacyBody>
               </View>
               <View style={styles.privacyBlock}>
                 <SectionTitle>보유 기간</SectionTitle>
                 <PrivacyBody>서비스 탈퇴 또는 Google 연결 해제 시까지</PrivacyBody>
               </View>
             </Card>
-            <Pressable style={[styles.consentRow, styles.privacyAgreeRow]} onPress={togglePrivacyConsent}>
-              <CheckBox checked={privacyDetailChecked} onPress={togglePrivacyConsent} />
+            <Pressable style={[styles.consentRow, styles.privacyAgreeRow]} onPress={acceptPrivacyConsentAndBack}>
+              <CheckBox checked={privacyDetailChecked} onPress={acceptPrivacyConsentAndBack} />
               <Text style={styles.consentText}>필수 수집 및 분석에 동의합니다</Text>
             </Pressable>
-            <PrimaryButton
-              title="동의하고 초기화면으로"
-              onPress={completePrivacyAndBack}
-            />
-          </ScreenShell>
-        );
-
-      case 'login':
-        return (
-          <ScreenShell title="Google 로그인" subtitle="AURA에 사용할 계정을 선택하세요" noNav>
-            <Logo medium />
-            <InfoRow title="user@gmail.com" desc="Gmail · Drive 연결 사용" />
-            <InfoRow title="다른 계정 사용" desc="새 Google 계정으로 로그인" />
-            <PrimaryButton title="선택한 계정으로 계속" onPress={() => go('permissions')} />
           </ScreenShell>
         );
 
       case 'permissions':
         return (
-          <ScreenShell title="서비스 권한 연결" subtitle="분석에 필요한 범위를 선택하세요" noNav>
-            <PermissionRow
-              title="Gmail 접근"
-              desc="제목 · 날짜 · 첨부 용량"
-              checked={permissions.gmail}
-              onPress={() => go('gmailPermission')}
-            />
-            <PermissionRow
-              title="Google Drive 접근"
-              desc="파일명 · 크기 · 수정일 · 해시"
-              checked={permissions.drive}
-              onPress={() => go('drivePermission')}
-            />
-            <PermissionRow
-              title="알림 권한"
-              desc="스캔 완료 및 스캔 권장"
-              checked={permissions.alarm}
-              onPress={() => go('notificationPermission')}
-            />
-            <View style={styles.flexGrow} />
-            <PrimaryButton
-              title="선택 권한 연결하기"
-              onPress={() => {
-                if (!permissions.gmail && !permissions.drive) {
-                  showPermissionToast();
-                  return;
-                }
-                if (!permissions.alarm) {
-                  setSettingsToggles((s) => ({ ...s, scanComplete: false, aiNudge: false }));
-                }
-                setScanSources({ gmail: permissions.gmail, drive: permissions.drive, folder: false });
-                go('connected');
-              }}
-            />
-            <Text style={styles.helperText}>메일과 파일의 원문 내용은 AI에게 전달되지 않아요.</Text>
+          <ScreenShell title="푸시 알림 설정" noNav>
+            <PushNotificationPermissionContent />
+            <Pressable style={[styles.consentRow, styles.privacyAgreeRow]} onPress={togglePushPermissionConsent}>
+              <CheckBox checked={permissions.alarm} onPress={togglePushPermissionConsent} />
+              <Text style={styles.consentText}>푸시 알림에 동의합니다</Text>
+            </Pressable>
+            <View style={styles.pushPermissionButtonSpacer} />
+            <PrimaryButton title="계속하기" onPress={completeLoginPermissionSetup} />
           </ScreenShell>
         );
 
@@ -1750,7 +2071,7 @@ export default function App() {
             screen={screen}
             back={back}
             setPermissions={setPermissions}
-            setSettingsToggles={setSettingsToggles}
+            requestPushPermission={requestPushPermission}
           />
         );
 
@@ -1771,8 +2092,8 @@ export default function App() {
             ) : (
               <View style={styles.centerTitleSpace} />
             )}
-            <ConnectedInfoRow title="Gmail" desc="읽기 범위 연결" status={permissions.gmail ? '연결됨' : '연결안됨'} visible={connectedStep >= 1} />
-            <ConnectedInfoRow title="Drive" desc="파일 스캔 범위 연결" status={permissions.drive ? '연결됨' : '연결안됨'} visible={connectedStep >= 2} />
+            <ConnectedInfoRow service="gmail" title="Gmail" status={permissions.gmail ? '연결됨' : '연결안됨'} visible={connectedStep >= 1} />
+            <ConnectedInfoRow service="drive" title="Drive" status={permissions.drive ? '연결됨' : '연결안됨'} visible={connectedStep >= 2} />
             {connectedStep >= 3 ? (
               <RevealIn style={styles.connectedButtonReveal} duration={skipConnectedAnimation ? 0 : 560} distance={skipConnectedAnimation ? 0 : 12}>
                 <PrimaryButton title="AURA 둘러보기" onPress={() => go('onboardingGhost')} inline />
@@ -1785,49 +2106,51 @@ export default function App() {
 
       case 'onboardingGhost':
         return (
-          <ScreenShell title="온보딩 · 유령 데이터" noNav>
+          <ScreenShell title="유령 데이터 탐지" noNav>
             <GhostScanAnimation skip={onboardingGhostDone} onDone={() => setOnboardingGhostDone(true)} />
-            <Text style={styles.centerBody}>오래된 메일과 방치된 파일을 찾아{'\n'}정리 후보로 제안해요.</Text>
-            {onboardingGhostDone ? (
-              <RevealIn style={styles.onboardingButtonReveal} duration={560} distance={12}>
-                <PrimaryButton title="다음" onPress={() => go('onboardingCarbon')} inline />
-              </RevealIn>
-            ) : (
-              <View style={styles.onboardingButtonPlaceholder} />
-            )}
+            <View style={styles.onboardingDescriptionRow}>
+              <Text style={styles.onboardingDescriptionIcon}>👻</Text>
+              <Text style={[styles.centerBody, styles.onboardingDescriptionText]}>스캔이 끝나면 메일과 Drive 정리 후보를{'\n'}분류별로 보여줘요.</Text>
+            </View>
+            <View style={styles.onboardingButtonReveal}>
+              <PrimaryButton title="다음" onPress={() => go('onboardingCarbon')} inline />
+            </View>
           </ScreenShell>
         );
 
       case 'onboardingCarbon':
         return (
-          <ScreenShell title="온보딩 · 탄소 절감" noNav>
+          <ScreenShell title="스캔 이력 관리" noNav>
             <CarbonSaveAnimation skip={onboardingCarbonDone} onDone={() => setOnboardingCarbonDone(true)} />
-            <Text style={styles.centerBody}>정리한 용량을 CO₂ 절감량으로 바꿔 보여줘요.</Text>
-            {onboardingCarbonDone ? (
-              <RevealIn style={styles.auraFeelReveal} duration={620} distance={14}>
-                <Text style={styles.auraFeelText}>이제 AURA를 느껴볼까요!</Text>
-              </RevealIn>
-            ) : (
-              <View style={styles.auraFeelPlaceholder} />
-            )}
-            {onboardingCarbonDone ? (
-              <RevealIn style={styles.onboardingButtonReveal} duration={560} distance={12}>
-                <PrimaryButton title="홈으로 시작" onPress={() => replace('home')} inline />
-              </RevealIn>
-            ) : (
-              <View style={styles.onboardingButtonPlaceholder} />
-            )}
+            <View style={styles.onboardingDescriptionRow}>
+              <Text style={styles.onboardingDescriptionIcon}>📈</Text>
+              <Text style={[styles.centerBody, styles.onboardingDescriptionText]}>정리한 클라우드 용량을 월별 그래프로 확인해요.</Text>
+            </View>
+            <View style={styles.auraFeelReveal}>
+              <Text style={styles.auraFeelText}>이제 AURA를 경험해보세요!</Text>
+            </View>
+            <View style={styles.onboardingButtonReveal}>
+              <PrimaryButton title="AURA 시작하기" onPress={() => replace('home')} inline />
+            </View>
           </ScreenShell>
         );
 
       case 'home':
         return (
-          <ScreenShell compactTop>
-            <LogoRow />
-            <View style={styles.homeRule} />
+          <ScreenShell title="홈" titleIcon="home" hideBack tightBottom>
             <Card tint style={styles.capacityCard}>
-              <Text style={styles.cardLabel}>남은 용량</Text>
-              <Text style={styles.bigNumber}>2.6GB</Text>
+              <View style={styles.capacityCardRow}>
+                <View style={styles.infoMain}>
+                  <Text style={styles.cardLabel}>남은 용량</Text>
+                  <Text style={styles.bigNumber}>{homeRemainingDriveLabel}</Text>
+                </View>
+                <View style={styles.capacityUsageBox}>
+                  <Text style={styles.capacityUsageText}>{homeDriveUsagePercent}% 사용</Text>
+                  <View style={styles.capacityUsageTrack}>
+                    <View style={[styles.capacityUsageFill, { width: `${homeDriveUsagePercent}%` }]} />
+                  </View>
+                </View>
+              </View>
             </Card>
             <Pressable onPress={() => go('recentDetail')}>
               <Card tint style={styles.homeSummaryCard}>
@@ -1841,21 +2164,29 @@ export default function App() {
                   </View>
                 </View>
                 <Text style={styles.meta}>
-                  {lastScan ? `마지막 스캔 ${lastScan.dateLabel} · ${lastScan.sourceLabel}` : '마지막 스캔 없음'}
+                  {lastScan ? `마지막 스캔 ${formatScanDateOnly(lastScan.dateLabel)} · ${lastScan.sourceLabel}` : '마지막 스캔 없음'}
                 </Text>
                 <View style={styles.divider} />
                 {lastScan ? (
                   <>
-                    <View style={styles.rowBetween}>
-                      <Text style={styles.cardLabel}>예상 탄소 절감량</Text>
-                      <Text style={styles.resultText}>약 {checkedCarbonLabel}</Text>
-                    </View>
-                    <Text style={styles.meta}>후보 {selectedCandidateCount}개 · 예상 확보 {selectedTotalSizeLabel}</Text>
+                <View style={styles.rowBetween}>
+                  <Text style={styles.homeSummaryCapacityLabel} numberOfLines={1}>확보 용량</Text>
+                  <Text style={styles.homeSummaryValue}>{selectedTotalSizeLabel}</Text>
+                </View>
+                    <Pressable
+                      style={styles.homeTrashButton}
+                      onPress={(event) => {
+                        event.stopPropagation();
+                        replace('storageTrash');
+                      }}
+                    >
+                      <Text style={styles.homeTrashButtonText}>휴지통으로 이동</Text>
+                    </Pressable>
+                    <Text style={styles.homeTrashGuide}>휴지통을 비워 용량을 확보하세요</Text>
                   </>
                 ) : (
                   <View style={styles.homeEmptySummary}>
                     <Text style={styles.homeEmptyTitle}>아직 분석 기록이 없어요</Text>
-                    <Text style={styles.homeEmptyDesc}>스캔하면 정리 후보와 예상 탄소 절감량이 표시돼요.</Text>
                   </View>
                 )}
               </Card>
@@ -1900,7 +2231,6 @@ export default function App() {
             ) : null}
             <View style={styles.homeActionSpacer} />
             <OutlineButton title="키워드·파일 조건 설정하기" onPress={() => go('keywordFile')} />
-            <Text style={styles.helperText}>조건 없어도 AI가 자동으로 분석해요.</Text>
             <PrimaryButton
               title={homeScanNotice === 'completed' ? '결과 보기' : homeScanNotice === 'running' ? '스캔중' : '스캔하기'}
               onPress={handleHomeScanPress}
@@ -1911,45 +2241,42 @@ export default function App() {
 
       case 'recentDetail':
         return lastScan ? (
-          <ScreenShell title="최근 분석 상세" subtitle="마지막으로 완료된 스캔 결과입니다">
+          <ScreenShell title="최근 분석 상세">
             <View style={styles.recentHeroCard}>
-              <Text style={styles.infoTitle}>최근 분석 요약</Text>
-              <Text style={styles.recentHeroDate}>{lastScan.dateLabel}</Text>
-              <Text style={styles.infoDesc}>{lastScan.sourceLabel} · {lastScan.conditionLabel}</Text>
+              <View style={styles.recentHeroHeaderRow}>
+                <View style={styles.infoMain}>
+                  <Text style={styles.infoTitle}>최근 분석 요약</Text>
+                  <Text style={styles.recentHeroDate}>{formatScanDateOnly(lastScan.dateLabel)}</Text>
+                </View>
+                <Text style={styles.recentHeroSizeValue}>{selectedTotalSizeLabel}</Text>
+              </View>
+              <Text style={styles.infoDesc}>{lastScan.sourceLabel}</Text>
               <View style={styles.thinDivider} />
               <View style={styles.rowBetween}>
                 <Text style={styles.cardLabel}>정리 후보</Text>
                 <Text style={styles.rowRight}>{selectedCandidateCount}개</Text>
               </View>
-              <View style={styles.rowBetween}>
-                <Text style={styles.cardLabel}>예상 확보</Text>
-                <Text style={styles.rowRight}>{selectedTotalSizeLabel}</Text>
-              </View>
-              <View style={styles.rowBetween}>
-                <Text style={styles.cardLabel}>예상 탄소 절감</Text>
-                <Text style={styles.rowRight}>약 {checkedCarbonLabel}</Text>
-              </View>
             </View>
             <SectionTitle>분류별 결과</SectionTitle>
             <RecentResultRow
               title="광고·프로모션 메일"
-              desc="광고 키워드가 포함된 메일"
               value={`${promoMailCount}개\n${formatDataSize(sumScanItemSize(promoMailItems))}`}
             />
             <RecentResultRow
               title="오래된 메일"
-              desc="오랫동안 열지 않은 메일"
               value={`${oldMailCount}개\n${formatDataSize(sumScanItemSize(oldMailItems))}`}
             />
             <RecentResultRow
-              title="중복 및 오래된 Drive 파일"
-              desc="대용량 항목과 겹치지 않는 Drive 후보"
-              value={`${driveCandidateCount}개\n${formatDataSize(sumScanItemSize(driveRegularItems))}`}
+              title="오래된 파일"
+              value={`${oldDriveItems.length}개\n${formatDataSize(sumScanItemSize(oldDriveItems))}`}
+            />
+            <RecentResultRow
+              title="중복 파일"
+              value={`${duplicateDriveItems.length}개\n${formatDataSize(sumScanItemSize(duplicateDriveItems))}`}
             />
             <RecentResultRow
               title="대용량 파일"
-              desc="600MB 이상 또는 중복 백업 파일"
-              value={`${activeScanResult.largeItems.length}개\n${activeScanResult.largeSizeLabel}`}
+              value={`${largeOnlyDriveItems.length}개\n${formatDataSize(sumScanItemSize(largeOnlyDriveItems))}`}
             />
           </ScreenShell>
         ) : (
@@ -1964,22 +2291,9 @@ export default function App() {
 
       case 'keywordFile':
         return (
-          <ScreenShell title="메일 키워드" subtitle="메일 키워드와 Drive 파일 유형을 설정합니다">
-            <InfoRow title="메일 포함 키워드" desc={includeKeywords.join(', ')} onPress={() => openKeywordSheet('include')} />
-            <InfoRow title="메일 제외 키워드" desc={excludeKeywords.join(', ')} onPress={() => openKeywordSheet('exclude')} />
-            <Pressable style={styles.attachmentOptionCard} onPress={() => setIncludeMailAttachments((value) => !value)}>
-              <View style={styles.infoMain}>
-                <Text style={styles.infoTitle}>메일 첨부파일 포함</Text>
-                <Text style={styles.infoDesc}>메일에 포함된 대용량 첨부파일도 함께 분석</Text>
-              </View>
-              <CheckBox checked={includeMailAttachments} onPress={() => setIncludeMailAttachments((value) => !value)} compact />
-            </Pressable>
-            <SectionTitle>Drive 파일 유형</SectionTitle>
-            <View style={styles.chipWrap}>
-              {['PDF', 'DOCX', 'ZIP', 'JPG'].map((item) => (
-                <Chip key={item} label={item} selected={Boolean(selectedFileTypes[item])} onPress={() => toggleFileType(item)} />
-              ))}
-            </View>
+          <ScreenShell title="삭제 대상 키워드 설정">
+            <InfoRow title="삭제 대상 포함 키워드" desc={includeKeywords.join(', ')} onPress={() => openKeywordSheet('include')} />
+            <InfoRow title="삭제 대상 제외 키워드" desc={excludeKeywords.join(', ')} onPress={() => openKeywordSheet('exclude')} />
             <PrimaryButton title="조건 적용" onPress={back} />
           </ScreenShell>
         );
@@ -2000,10 +2314,9 @@ export default function App() {
 
       case 'scanFlowSource':
         return (
-          <ScreenShell title="스캔 소스 선택" subtitle="분석할 저장소를 선택하세요">
+          <ScreenShell title="스캔 소스 선택">
             <ScanSourceCard
               title="Gmail"
-              desc="메일과 첨부파일만 분석"
               checked={scanSources.gmail}
               onPress={() => {
                 if (!permissions.gmail) {
@@ -2015,31 +2328,23 @@ export default function App() {
             />
             <ScanSourceCard
               title="Drive"
-              desc="파일과 중복 해시만 분석"
-              checked={scanSources.folder}
+              checked={scanSources.folder && Boolean(selectedDriveFolders.length || selectedDriveFiles.length)}
               detail="폴더 선택"
               onPress={() => {
                 if (!permissions.drive) {
                   showToast('연결이 허용되지 않았어요');
                   return;
                 }
-                if (scanSources.folder) {
-                  setScanSources((items) => ({ ...items, drive: false, folder: false }));
-                  setSelectedDriveFolders([]);
-                  return;
-                }
-                setScanSources((items) => ({ ...items, drive: true, folder: true }));
+                go('scanFlowFolder');
               }}
               onDetailPress={() => {
                 if (!permissions.drive) {
                   showToast('연결이 허용되지 않았어요');
                   return;
                 }
-                setScanSources((items) => ({ ...items, drive: true, folder: true }));
                 go('scanFlowFolder');
               }}
             />
-            <Text style={styles.helperText}>선택한 필터는 설정 › 기본 스캔 조건에서 변경할 수 있어요.</Text>
             <PrimaryButton
               title={scanSourceEditOnly ? '조건 적용하기' : '다음'}
               onPress={() => {
@@ -2058,17 +2363,7 @@ export default function App() {
 
       case 'scanFlowFolder':
         return (
-          <ScreenShell title="Drive 폴더 선택" subtitle="선택한 폴더만 빠르게 분석">
-            <View style={styles.folderSearchBox}>
-              <Text style={styles.searchIcon}>⌕</Text>
-              <TextInput
-                value={driveFolderSearch}
-                onChangeText={setDriveFolderSearch}
-                placeholder="폴더 이름 검색"
-                placeholderTextColor="#6B8194"
-                style={styles.folderSearchInput}
-              />
-            </View>
+          <ScreenShell title="Drive 폴더 선택" tightBottom>
             <Pressable style={styles.folderSelectAllCard} onPress={toggleAllDriveFolders}>
               <CheckBox checked={allDriveFoldersSelected} onPress={toggleAllDriveFolders} compact />
               <View style={styles.infoMain}>
@@ -2080,60 +2375,79 @@ export default function App() {
                 </Text>
               </View>
             </Pressable>
-            {!isDriveSearching && driveCurrentFolder !== driveRootPath ? (
-              <Pressable
-                style={styles.folderBreadcrumbCard}
-                onPress={() => setDriveCurrentFolder(driveParentFolder ?? driveRootPath)}
+            <View style={styles.folderListBox}>
+              <View style={styles.folderBreadcrumbCard}>
+                <View style={styles.folderBreadcrumbClickableRow}>
+                  {splitDrivePath(driveCurrentFolder).map((part, index, parts) => {
+                    const path = parts.slice(0, index + 1).join(' › ');
+                    return (
+                      <React.Fragment key={path}>
+                        <Pressable onPress={() => setDriveCurrentFolder(path)} hitSlop={8}>
+                          <Text style={styles.folderBreadcrumbTitle}>{part}</Text>
+                        </Pressable>
+                        {index < parts.length - 1 ? <Text style={styles.folderBreadcrumbDivider}>›</Text> : null}
+                      </React.Fragment>
+                    );
+                  })}
+                </View>
+              </View>
+              <View style={styles.folderBreadcrumbRule} />
+              <ScrollView
+                style={styles.folderListScroll}
+                contentContainerStyle={styles.folderListContent}
+                nestedScrollEnabled
+                showsVerticalScrollIndicator={visibleDriveFolders.length + visibleDriveFilePreviews.length > 5}
               >
-                <Text style={styles.folderBreadcrumbTitle}>‹ 상위 폴더로</Text>
-                <Text style={styles.folderBreadcrumbText}>{driveCurrentFolder}</Text>
-              </Pressable>
-            ) : null}
-            {visibleDriveFolders.length ? (
-              visibleDriveFolders.map((folder) => (
-                <FolderRow
-                  key={folder.name}
-                  title={isDriveSearching ? folder.name : getDriveFolderName(folder.name)}
-                  desc={isDriveSearching ? folder.meta : `${folder.meta} · ${folder.name}`}
-                  selected={selectedDriveFolders.includes(folder.name)}
-                  canOpen={hasDriveFolderContents(folder.name)}
-                  onPress={() => toggleDriveFolder(folder.name)}
-                  onOpen={() => {
-                    setDriveFolderSearch('');
-                    setDriveCurrentFolder(folder.name);
-                  }}
-                />
-              ))
-            ) : null}
-            {visibleDriveFilePreviews.map((file) => (
-              <DriveFolderFileRow
-                key={file.id}
-                file={file}
-                selected={selectedDriveFiles.includes(file.id)}
-                onPress={() => toggleDriveFile(file.id)}
-              />
-            ))}
-            {!visibleDriveFolders.length && !visibleDriveFilePreviews.length ? (
-              <EmptyState
-                title={driveFolderSearch.trim() ? '폴더 없음' : '비어있는 폴더'}
-                desc={driveFolderSearch.trim() ? '검색 결과에 해당하는 폴더가 없어요.' : '현재 폴더 안에 하위 폴더나 문서가 없어요.'}
-              />
-            ) : null}
-            <PrimaryButton title="폴더 분석하기" onPress={() => (scanSourceEditOnly ? replace('scanFlowSource') : back())} />
+                {visibleDriveFolders.length ? (
+                  visibleDriveFolders.map((folder) => (
+                    <FolderRow
+                      key={folder.name}
+                      title={isDriveSearching ? folder.name : getDriveFolderName(folder.name)}
+                      desc={formatFolderMeta(folder.meta)}
+                      selected={selectedDriveFolders.includes(folder.name)}
+                      canOpen={hasDriveFolderContents(folder.name)}
+                      onPress={() => toggleDriveFolder(folder.name)}
+                      onOpen={() => {
+                        setDriveFolderSearch('');
+                        setDriveCurrentFolder(folder.name);
+                      }}
+                    />
+                  ))
+                ) : null}
+                {visibleDriveFilePreviews.length ? (
+                  visibleDriveFilePreviews.map((file) => (
+                    <DriveFolderFileRow
+                      key={file.id}
+                      file={file}
+                      selected={selectedDriveFiles.includes(file.id)}
+                    />
+                  ))
+                ) : null}
+                {!visibleDriveFolders.length && !visibleDriveFilePreviews.length ? (
+                  <EmptyState
+                    title={driveFolderSearch.trim() ? '폴더 없음' : '비어있는 폴더'}
+                    desc={driveFolderSearch.trim() ? '검색 결과에 해당하는 폴더가 없어요.' : '현재 폴더 안에 하위 폴더나 문서가 없어요.'}
+                  />
+                ) : null}
+              </ScrollView>
+            </View>
+            <PrimaryButton title="폴더 선택 완료" onPress={() => (scanSourceEditOnly ? replace('scanFlowSource') : back())} />
           </ScreenShell>
         );
 
       case 'scanFlowPeriod':
         return (
-          <ScreenShell title="기간 조건" subtitle="마지막 사용 시점을 설정하세요">
-            <View style={styles.periodHeroCard}>
-              <Text style={styles.infoTitle}>기간 범위</Text>
-              <Text style={styles.infoDesc}>마지막으로 연 날짜와 마지막 수정일을 따로 설정할 수 있어요.</Text>
-            </View>
-            <SectionTitle>기간 조건</SectionTitle>
-            <InfoRow title="마지막으로 연 날짜" desc={formatYearRange(openedYearRange)} right="설정  ›" onPress={() => openYearSheet('opened')} />
-            <InfoRow title="마지막 수정일" desc={formatYearRange(modifiedYearRange)} right="설정  ›" onPress={() => openYearSheet('modified')} />
-            <CheckLine label="최근 30일 내 사용 데이터는 보관" checked={checked['period:recent']} onPress={() => toggleCheck('period:recent')} />
+          <ScreenShell title="기간 조건">
+            <MonthConditionRow
+              title="마지막으로 연 날짜"
+              months={lastOpenedBeforeMonths}
+              onPress={() => openPeriodMonthSheet('opened')}
+            />
+            <MonthConditionRow
+              title="마지막 수정일"
+              months={lastModifiedBeforeMonths}
+              onPress={() => openPeriodMonthSheet('modified')}
+            />
             <PrimaryButton
               title={periodEditOnly ? '기간 조건 저장' : '기간 조건 저장 후 스캔하기'}
               onPress={
@@ -2151,10 +2465,10 @@ export default function App() {
 
       case 'scanSource':
         return (
-          <ScreenShell title="스캔 소스 선택" subtitle="분석할 데이터를 선택하세요">
-            <InfoRow title="Gmail" desc="메일함 메타데이터 분석" />
-            <InfoRow title="Drive" desc="파일명·크기·수정일 분석" />
-            <InfoRow title="특정 Drive 폴더" desc="선택 폴더만 빠르게 분석" onPress={() => go('driveFolder')} />
+          <ScreenShell title="스캔 소스 선택">
+            <InfoRow title="Gmail" />
+            <InfoRow title="Drive" />
+            <InfoRow title="특정 Drive 폴더" onPress={() => go('driveFolder')} />
             <PrimaryButton title="다음" onPress={() => go('period')} />
           </ScreenShell>
         );
@@ -2163,18 +2477,25 @@ export default function App() {
         return (
           <ScreenShell title="Drive 폴더 선택">
             {['AURA 작업물', '개인 자료', '학교 과제', '디자인 자료'].map((item) => (
-              <InfoRow key={item} title={item} desc="Google Drive 폴더" />
+              <InfoRow key={item} title={item} />
             ))}
-            <PrimaryButton title="선택한 폴더 분석하기" onPress={() => go('period')} />
+            <PrimaryButton title="폴더 선택 완료" onPress={() => go('period')} />
           </ScreenShell>
         );
 
       case 'period':
         return (
           <ScreenShell title="기간 조건">
-            <InfoRow title="마지막으로 연 날짜" desc="3년 이상" />
-            <InfoRow title="수정일" desc="2년 이상" />
-            <CheckLine label="최근 사용한 항목 제외" checked={checked['period:recent']} onPress={() => toggleCheck('period:recent')} />
+            <MonthConditionRow
+              title="마지막으로 연 날짜"
+              months={lastOpenedBeforeMonths}
+              onPress={() => openPeriodMonthSheet('opened')}
+            />
+            <MonthConditionRow
+              title="마지막 수정일"
+              months={lastModifiedBeforeMonths}
+              onPress={() => openPeriodMonthSheet('modified')}
+            />
             <PrimaryButton title="기간 조건 적용 & 스캔하기" onPress={startScan} />
           </ScreenShell>
         );
@@ -2194,12 +2515,9 @@ export default function App() {
                 <Text style={styles.meta}>{lastScan ? `마지막 스캔 ${lastScan.dateLabel}` : '마지막 스캔 없음'}</Text>
               </Card>
             </View>
-            <View style={styles.scanSidePanel}>
+            <View style={styles.scanSidePanel} {...scanSidePanelResponder.panHandlers}>
               <DeviceStatusBar compact />
               <View style={styles.scanPanelHeader}>
-                <Pressable style={styles.scanCloseButton} onPress={() => replace('home')}>
-                  <Text style={styles.modalClose}>×</Text>
-                </Pressable>
                 <View style={styles.infoMain}>
                   <Text style={styles.title}>스캔 진행 중</Text>
                   <Text style={styles.scanPanelSubtitle}>홈으로 돌아가도 분석은 계속됩니다</Text>
@@ -2209,13 +2527,11 @@ export default function App() {
                 <View style={styles.rowBetween}>
                   <View style={styles.infoMain}>
                     <Text style={styles.infoTitleLarge}>AURA가 분석 중이에요</Text>
-                    <Text style={styles.infoDesc}>분석 범위: {scanSourceLabelRef.current}</Text>
-                    <Text style={styles.scanConditionLine}>조건: {getPeriodLabel()}</Text>
+                    <Text style={styles.infoDesc}>{scanProgress < 50 ? '메일 및 드라이브 데이터 수집중' : '수집 데이터 AI 분석중'}</Text>
                   </View>
                   <Text style={styles.scanPercent}>{scanProgress}%</Text>
                 </View>
                 <ProgressCircle progress={scanProgress} compact />
-                <Text style={styles.centerBody}>메일과 파일의 기본 정보만 확인하며 정리 후보를 찾고 있어요.</Text>
               </View>
               <View style={styles.progressTrack}>
                 <View style={[styles.progressFill, { width: `${scanProgress}%` }]} />
@@ -2230,7 +2546,7 @@ export default function App() {
 
       case 'candidateSummary':
         return (
-          <ScreenShell title="분석 결과 요약" subtitle="기본적으로 모든 후보가 선택돼 있어요">
+          <ScreenShell title="분석 결과 요약" disableScroll>
             <View style={styles.resultMetricGrid}>
               <ResultMetricCard label="정리 후보" value={`${selectedCandidateCount}개`} />
               <ResultMetricCard label="예상 확보" value={selectedTotalSizeLabel} />
@@ -2252,17 +2568,32 @@ export default function App() {
               }}
             />
             <ResultCategoryCard
-              title="중복 및 오래된 Drive 파일"
-              desc={`${driveCandidateCount}개 · ${formatDataSize(sumScanItemSize(driveRegularItems))}`}
-              onPress={() => go('driveList')}
+              title="오래된 파일"
+              desc={`${oldDriveItems.length}개 · ${formatDataSize(sumScanItemSize(oldDriveItems))}`}
+              onPress={() => {
+                setDriveListMode('old');
+                go('driveList');
+              }}
+            />
+            <ResultCategoryCard
+              title="중복 파일"
+              desc={`${duplicateDriveItems.length}개 · ${formatDataSize(sumScanItemSize(duplicateDriveItems))}`}
+              warning={duplicateDeselectedCount ? `미선택 ${duplicateDeselectedCount}개` : undefined}
+              onPress={() => {
+                setDriveListMode('duplicate');
+                go('driveList');
+              }}
             />
             <ResultCategoryCard
               title="대용량 파일"
-              desc={`${activeScanResult.largeItems.length}개 · ${activeScanResult.largeSizeLabel}`}
+              desc={`${largeOnlyDriveItems.length}개 · ${formatDataSize(sumScanItemSize(largeOnlyDriveItems))}`}
               onPress={() => go('largeList')}
             />
-            <Text style={styles.resultGuideText}>삭제하지 않을 항목이 있는지 확인하세요.</Text>
-            <PrimaryButton title="다음" onPress={() => go('selectedReview')} />
+            <Pressable onPress={() => activeScanResult.protectedItems.length ? go('protectedList') : showToast('제외 키워드로 보호된 항목이 없어요')}>
+              <Text style={styles.resultGuideText}>제외 키워드로 보호된 대상을 확인하세요</Text>
+            </Pressable>
+            <PrimaryButton title="다음" onPress={() => go('selectedReview')} inline />
+            <View style={styles.resultBottomSpacer} />
           </ScreenShell>
         );
 
@@ -2287,7 +2618,7 @@ export default function App() {
       case 'driveList':
         return (
           <ListScreen
-            title="Drive 결과 목록"
+            title={activeDriveListTitle}
             prefix="drive"
             items={filteredDriveItems}
             goNext={back}
@@ -2295,6 +2626,7 @@ export default function App() {
             toggle={toggleCheck}
             setAll={setAll}
             openFilter={openFilterSheet}
+            notice={driveListMode === 'duplicate' ? '중복 의심 파일의 경우 확인 후 직접 선택해주세요' : undefined}
             onOpenItem={(item) => {
               setSelectedScanItem(item);
               go('fileDetail');
@@ -2320,11 +2652,21 @@ export default function App() {
           />
         );
 
+      case 'protectedList':
+        return (
+          <ProtectedListScreen
+            items={activeScanResult.protectedItems}
+            onOpenItem={(item) => {
+              setSelectedScanItem(item);
+              go(item.source === 'mail' ? 'mailDetail' : 'fileDetail');
+            }}
+          />
+        );
+
       case 'mailDetail':
         return (
           <ScanItemDetailScreen
             title="메일 상세"
-            subtitle="선정 이유와 메타데이터"
             item={selectedScanItem ?? activeScanResult.mailItems[0]}
             kind="mail"
           />
@@ -2334,7 +2676,6 @@ export default function App() {
         return (
           <ScanItemDetailScreen
             title="파일 상세"
-            subtitle="미리보기 · 메타데이터 · 선정 이유"
             item={selectedScanItem ?? activeScanResult.driveItems[0] ?? activeScanResult.largeItems[0]}
             kind="drive"
           />
@@ -2342,7 +2683,7 @@ export default function App() {
 
       case 'selectedReview':
         return (
-          <ScreenShell title="선택 항목 검토" subtitle="삭제 제외 항목은 체크를 해제하세요">
+          <ScreenShell title="선택 항목 검토" disableScroll>
             <View style={styles.reviewMetricGrid}>
               <ResultMetricCard label="선택 항목" value={`${selectedCandidateCount}개`} />
               <ResultMetricCard label="예상 확보" value={checkedCleanupSizeLabel} />
@@ -2365,13 +2706,14 @@ export default function App() {
               <Text style={styles.reviewWarningText}>보호할 항목이 있다면 이전 목록에서 체크를 해제하세요.</Text>
             )}
             <PrimaryButton title="휴지통으로 이동" onPress={() => go('deleteConfirm')} />
+            <OutlineButton title="요약 화면으로 돌아가기" onPress={() => replace('candidateSummary')} />
           </ScreenShell>
         );
 
       case 'deleteConfirm':
         return (
           <View style={styles.modalScreenRoot}>
-            <ScreenShell title="선택 항목 검토" subtitle="삭제 제외 항목은 체크를 해제하세요">
+            <ScreenShell title="선택 항목 검토">
               <View style={styles.reviewMetricGrid}>
                 <ResultMetricCard label="선택 항목" value={`${selectedCandidateCount}개`} />
                 <ResultMetricCard label="예상 확보" value={checkedCleanupSizeLabel} />
@@ -2403,14 +2745,9 @@ export default function App() {
               ]}
             >
               <Pressable style={StyleSheet.absoluteFill} onPress={back} />
-              <BottomSheetPanel motion={deleteConfirmMotion} outputRange={[0, 360]} style={styles.deleteApprovalPanel} onClose={back}>
+              <BottomSheetPanel motion={deleteConfirmMotion} outputRange={[0, 260]} style={styles.deleteApprovalPanel} onClose={back}>
                 <Text style={styles.deleteApprovalTitle}>휴지통 이동을 승인하시겠어요?</Text>
                 <Text style={styles.deleteApprovalDesc}>선택한 {selectedCandidateCount}개 항목 · {checkedCleanupSizeLabel}를 휴지통으로 이동합니다.</Text>
-                <View style={styles.deleteApprovalInfoBox}>
-                  <Text style={styles.deleteApprovalInfoTitle}>최종 승인 안내</Text>
-                  <Text style={styles.deleteApprovalInfoText}>사용자가 최종 승인한 항목만 휴지통으로 이동합니다.</Text>
-                  <Text style={styles.deleteApprovalInfoText}>휴지통 이동 후에도 실수한 항목은 복구할 수 있어요.</Text>
-                </View>
                 <View style={styles.twoButtons}>
                   <OutlineButton title="취소" onPress={back} half />
                   <PrimaryButton
@@ -2426,55 +2763,82 @@ export default function App() {
 
       case 'deleteProcessing':
         return (
-          <ScreenShell title="삭제 진행" subtitle="앱을 닫아도 작업은 계속됩니다">
+          <ScreenShell title="삭제 진행" disableScroll>
             <ProgressCircle progress={deleteProgress} />
             <DeleteStatusRow
               title="Gmail"
-              desc={`${deleteProgress >= 45 ? activeScanResult.mailItems.length : Math.floor(activeScanResult.mailItems.length * deleteProgress / 45)} / ${activeScanResult.mailItems.length}개 완료`}
               status={deleteProgress >= 45 ? '완료' : '진행'}
+              done={deleteProgress >= 45}
             />
             <DeleteStatusRow
               title="Google Drive"
-              desc={`${Math.min(activeScanResult.driveItems.length, Math.floor(activeScanResult.driveItems.length * Math.max(0, deleteProgress - 35) / 65))} / ${activeScanResult.driveItems.length}개 처리 중`}
               status={deleteProgress >= 100 ? '완료' : '진행'}
+              done={deleteProgress >= 100}
             />
             <Text style={styles.progressLabel}>전체 삭제 진행</Text>
             <View style={styles.progressTrack}>
               <View style={[styles.progressFill, { width: `${deleteProgress}%` }]} />
             </View>
-            <Text style={styles.progressRightText}>{deleteProgress}%</Text>
-            <Text style={styles.centerBody}>현재 남은 용량 {remainingAfterCleanup}</Text>
+            <Text style={styles.remainingCapacityText}>현재 남은 용량 {remainingAfterCleanup}</Text>
           </ScreenShell>
         );
 
       case 'cleanupComplete':
         return (
-          <ScreenShell title="정리 완료" subtitle="삭제 항목은 휴지통에서 복원할 수 있어요" hideBack>
-            <View style={styles.cleanupCheckCircle}>
-              <Text style={styles.cleanupCheckText}>✓</Text>
-            </View>
+          <ScreenShell title="정리 완료" hideBack tightBottom disableScroll>
             <Text style={styles.cleanupTitle}>정리가 완료됐어요!</Text>
-            <View style={styles.resultMetricGrid}>
-              <CleanupMetricCard label="정리 항목" value={`${selectedCandidateCount}개`} />
-              <CleanupMetricCard label="확보 용량" value={checkedCleanupSizeLabel} />
-              <CleanupMetricCard label="남은 용량" value={remainingAfterCleanup} />
-              <CleanupMetricCard label="탄소 절감" value={checkedCarbonLabel.replace('CO₂', '')} />
-            </View>
-            <Pressable style={styles.carbonStandardCard} onPress={() => go('carbonBasis')}>
-              <View style={styles.infoMain}>
-                <Text style={styles.infoTitle}>탄소 환산 기준</Text>
-                <Text style={styles.infoDesc}>5GB 정리 → 약 1.2g CO₂/월 절감</Text>
+            <Card tint style={styles.cleanupCountCard}>
+              <Text style={styles.cardLabel}>정리 항목</Text>
+              <View style={styles.cleanupCountInnerRow}>
+                <View style={styles.cleanupCountInnerCard}>
+                  <Text style={styles.cleanupCountLabel}>메일</Text>
+                  <Text style={styles.cleanupCountValue}>{selectedMailCleanupCount}개</Text>
+                </View>
+                <View style={styles.cleanupCountInnerCard}>
+                  <Text style={styles.cleanupCountLabel}>Drive</Text>
+                  <Text style={styles.cleanupCountValue}>{selectedDriveCleanupCount}개</Text>
+                </View>
               </View>
-              <Text style={styles.chevron}>›</Text>
-            </Pressable>
-            <PrimaryButton title="탄소 절감 결과 보기" onPress={() => go('analysisHistory')} />
-            <OutlineButton title="홈 화면 돌아가기" onPress={() => replace('home')} />
+            </Card>
+            <Card tint style={styles.cleanupCapacityCard}>
+              <View style={styles.cleanupCapacityMetricRow}>
+                <Text style={styles.cardLabel}>확보 용량</Text>
+                <Text style={styles.cleanupCapacityValue}>{checkedCleanupSizeLabel}</Text>
+              </View>
+              <View style={styles.cleanupCapacityMetricRow}>
+                <Text style={styles.cardLabel}>남은 용량</Text>
+                <Text style={styles.cleanupCapacityValue}>{remainingAfterCleanup}</Text>
+              </View>
+              <View style={styles.cleanupDriveBarTrack}>
+                <View style={[styles.cleanupDriveCurrentBar, { width: `${cleanupCurrentUsedPercent}%` }]} />
+                <Animated.View
+                  style={[
+                    styles.cleanupDriveReclaimedBar,
+                    {
+                      left: `${cleanupCurrentUsedPercent}%`,
+                      width: `${cleanupReclaimedPercent}%`,
+                      opacity: cleanupReclaimedOpacity,
+                    },
+                  ]}
+                />
+              </View>
+              <Text style={styles.cleanupDriveTotalLabel}>{cleanupDriveTotalGB}GB</Text>
+            </Card>
+            <View style={styles.cleanupButtonSpacer} />
+            <View style={styles.twoButtons}>
+              <OutlineButton title="스캔 이력 보기" half onPress={() => {
+                setAnalysisHistoryReturnTarget('cleanupComplete');
+                go('analysisHistory');
+              }} />
+              <OutlineButton title="휴지통으로 이동" half onPress={() => replace('storageTrash')} />
+            </View>
+            <PrimaryButton title="홈 화면 돌아가기" onPress={() => replace('home')} />
           </ScreenShell>
         );
 
       case 'carbonBasis':
         return (
-          <ScreenShell title="탄소 환산 기준" subtitle="정리한 데이터의 예상 환경 효과를 계산합니다">
+          <ScreenShell title="탄소 환산 기준">
             <View style={styles.carbonBasisHeaderRow}>
               <SectionTitle>현재 적용 기준</SectionTitle>
               <Pressable style={styles.helpCircleButton} onPress={() => setCarbonHelpVisible(true)}>
@@ -2531,21 +2895,27 @@ export default function App() {
             setStorageTrashMovedKeys={setStorageTrashMovedKeys}
             setStorageDeletedKeys={setStorageDeletedKeys}
             setStorageDriveMoveTargets={setStorageDriveMoveTargets}
+            openStorageDetail={(item) => {
+              setSelectedStorageDetail(item);
+              go('storageDetail');
+            }}
           />
+        );
+
+      case 'storageDetail':
+        return (
+          <StorageDetailScreen item={selectedStorageDetail} />
         );
 
       case 'settings':
         return (
-          <ScreenShell title="프로필 및 설정" subtitle="계정 · 알림 · 스캔 · 개인정보" hideBack tightBottom>
+          <ScreenShell title="설정" titleIcon="settings" hideBack tightBottom>
             <Pressable style={styles.settingsProfileCard} onPress={() => go('account')}>
               <View style={styles.infoMain}>
                 <Text style={styles.infoTitleLarge}>user@gmail.com</Text>
                 <Text style={styles.profileConnectionText}>
                   Gmail {permissions.gmail ? '연결됨' : '연결안됨'} / Drive {permissions.drive ? '연결됨' : '연결안됨'}
                 </Text>
-              </View>
-              <View style={styles.smallPill}>
-                <Text style={styles.smallPillText}>계정</Text>
               </View>
               <Text style={styles.chevron}>›</Text>
             </Pressable>
@@ -2554,7 +2924,6 @@ export default function App() {
             <View style={styles.groupCard}>
               <ToggleRow
                 title="스캔 완료 알림"
-                desc="백그라운드 분석이 끝나면 알려드려요"
                 value={settingsToggles.scanComplete}
                 onPress={() => {
                   setSettingsToggles((s) => ({ ...s, scanComplete: !s.scanComplete }));
@@ -2564,7 +2933,6 @@ export default function App() {
               <View style={styles.thinDivider} />
               <ToggleRow
                 title="스캔 권장 알림"
-                desc="주 1회 스캔을 잊지 않게 알려드려요"
                 value={settingsToggles.aiNudge}
                 onPress={() => {
                   setSettingsToggles((s) => ({ ...s, aiNudge: !s.aiNudge }));
@@ -2574,57 +2942,47 @@ export default function App() {
             </View>
 
             <SectionTitle>스캔 설정</SectionTitle>
-            <InfoRow title="기본 스캔 조건" desc="최근 사용한 기간·키워드 조건 적용" onPress={() => go('defaultScan')} />
+            <InfoRow title="기본 스캔 조건" onPress={() => go('defaultScan')} />
 
             <SectionTitle>공지사항</SectionTitle>
-            <InfoRow title="공지사항" desc="최신 공지를 확인해보세요" onPress={() => go('notice')} />
+            <InfoRow title="공지사항" onPress={() => go('notice')} />
 
             <SectionTitle>개인정보 및 앱</SectionTitle>
-            <InfoRow title="개인정보 및 데이터" desc="동의 내용 · 분석 기록 · 연결 해제" onPress={() => go('privacyData')} />
+            <InfoRow title="개인정보 및 데이터" onPress={() => go('privacyData')} />
             <Text style={styles.versionText}>AURA 버전 1.0.0</Text>
           </ScreenShell>
         );
 
       case 'account':
         return (
-          <ScreenShell title="계정 및 연결" subtitle="Google 계정과 서비스 권한을 관리합니다">
+          <ScreenShell title="계정 및 연결">
             <View style={styles.accountHeroCard}>
               <View style={styles.avatarCircle}>
                 <Text style={styles.avatarText}>U</Text>
               </View>
               <View style={styles.infoMain}>
+                <Text style={styles.profileConnectionText}>AURA 사용자</Text>
                 <Text style={styles.infoTitleLarge}>user@gmail.com</Text>
-                <Text style={styles.infoDesc}>Google 계정으로 로그인됨</Text>
-                <View style={styles.outlineMiniPill}>
-                  <Text style={styles.outlineMiniPillText}>계정 확인</Text>
-                </View>
               </View>
             </View>
 
             <SectionTitle>연결된 서비스</SectionTitle>
             <View style={styles.groupCard}>
-              <ServiceLinkRow letter="M" title="Gmail" connected={permissions.gmail} onPress={() => go('gmailPermission')} />
+              <ServiceLinkRow service="gmail" title="Gmail" connected={permissions.gmail} onPress={() => go('gmailPermission')} />
               <View style={styles.thinDivider} />
-              <ServiceLinkRow letter="D" title="Google Drive" connected={permissions.drive} onPress={() => go('drivePermission')} />
-            </View>
-
-            <View style={styles.scopeCard}>
-              <Text style={styles.scopeTitle}>현재 허용된 범위</Text>
-              <Text style={styles.scopeDesc}>읽기 · 메타데이터 조회 · 선택 항목 삭제</Text>
+              <ServiceLinkRow service="drive" title="Google Drive" connected={permissions.drive} onPress={() => go('drivePermission')} />
             </View>
 
             <OutlineButton title="Google 권한 다시 확인" onPress={() => showToast('아직 준비 중인 기능입니다')} />
             <OutlineButton title="이 계정 연결 해제" onPress={() => showToast('계정 연결 해제는 발표용 화면에서는 실행하지 않아요')} />
-            <Text style={styles.helperText}>연결 해제 시 스캔과 삭제 기능이 중단됩니다</Text>
           </ScreenShell>
         );
 
       case 'defaultScan':
         return (
-          <ScreenShell title="기본 스캔 조건" subtitle="새 스캔을 시작할 때 적용할 기본값">
+          <ScreenShell title="기본 스캔 조건">
             <ToggleRow
               title="최근 사용 조건 자동 적용"
-              desc="마지막 스캔 조건을 다음 스캔에 사용"
               value={settingsToggles.autoScan}
               onPress={() => setSettingsToggles((s) => ({ ...s, autoScan: !s.autoScan }))}
               tint
@@ -2644,45 +3002,22 @@ export default function App() {
 
             <Pressable style={styles.keywordConditionCard} onPress={openKeywordChoiceSheet}>
               <View style={styles.rowBetween}>
-                <Text style={styles.infoTitle}>메일 포함·제외 키워드</Text>
+                <Text style={styles.infoTitle}>삭제 대상 포함·제외 키워드</Text>
                 <Text style={styles.chevron}>›</Text>
               </View>
-              <Text style={styles.infoDesc}>포함 키워드와 제외 키워드를 다시 설정할 수 있어요</Text>
-              <Text style={styles.infoTitle}>Drive 파일 유형</Text>
-              <View style={styles.chipWrap}>
-                {['PDF', 'DOCX', 'ZIP', 'JPG'].map((kind) => (
-                  <Chip key={kind} label={kind} selected={Boolean(selectedFileTypes[kind])} onPress={() => toggleFileType(kind)} />
-                ))}
-              </View>
-              <Pressable style={[styles.attachmentInlineCard, styles.attachmentInlineCardLarge]} onPress={() => setIncludeMailAttachments((value) => !value)}>
-                <View style={styles.infoMain}>
-                  <Text style={styles.infoTitle}>메일 첨부파일 포함</Text>
-                  <Text style={styles.infoDesc}>메일에 포함된 대용량 첨부파일도 함께 분석</Text>
-                </View>
-                <CheckBox checked={includeMailAttachments} onPress={() => setIncludeMailAttachments((value) => !value)} compact />
-              </Pressable>
             </Pressable>
-
-            <ToggleRow
-              title="중복 파일 검사"
-              desc="SHA-256이 같은 파일을 함께 탐지"
-              value={settingsToggles.marketing}
-              onPress={() => setSettingsToggles((s) => ({ ...s, marketing: !s.marketing }))}
-              tint
-            />
             <PrimaryButton title="기본 조건 저장" onPress={back} />
           </ScreenShell>
         );
 
       case 'privacyData':
         return (
-          <ScreenShell title="개인정보 및 데이터" subtitle="동의 내용과 AURA 내부 데이터를 관리합니다">
+          <ScreenShell title="개인정보 및 데이터" tightBottom>
             <SectionTitle>동의 및 보관</SectionTitle>
             <View style={styles.groupCard}>
               <View style={styles.settingPlainRow}>
                 <View style={styles.infoMain}>
                   <Text style={styles.infoTitle}>개인정보 수집·이용 동의</Text>
-                  <Text style={styles.infoDesc}>수집 항목과 이용 목적 확인</Text>
                 </View>
                 <View style={styles.smallPill}>
                   <Text style={styles.smallPillText}>{privacyChecked ? '동의 완료' : '확인 필요'}</Text>
@@ -2692,53 +3027,46 @@ export default function App() {
               <View style={styles.settingPlainRow}>
                 <View style={styles.infoMain}>
                   <Text style={styles.infoTitle}>데이터 보관 기간</Text>
-                  <Text style={styles.infoDesc}>서비스 탈퇴 또는 Google 연결 해제 시까지</Text>
                 </View>
+                <Text style={styles.rowRight}>서비스 탈퇴 시까지</Text>
               </View>
             </View>
 
             <SectionTitle>분석 데이터</SectionTitle>
             <View style={styles.groupCard}>
-              <Pressable style={styles.settingPlainRow} onPress={() => go('analysisHistory')}>
+              <Pressable style={styles.settingPlainRow} onPress={() => {
+                setAnalysisHistoryReturnTarget('privacyData');
+                go('analysisHistory');
+              }}>
                 <View style={styles.infoMain}>
                   <Text style={styles.infoTitle}>분석 기록 관리</Text>
-                  <Text style={styles.infoDesc}>{lastScan ? '최근 분석 1건 · 마지막 ' + lastScan.dateLabel : '최근 분석 없음'}</Text>
                 </View>
                 <Text style={styles.chevron}>›</Text>
               </Pressable>
-              <View style={styles.thinDivider} />
-              <ToggleRow
-                title="맞춤 추천 데이터 사용"
-                desc="정리 패턴을 스캔 권장 알림에 활용"
-                value={settingsToggles.marketing}
-                onPress={() => setSettingsToggles((s) => ({ ...s, marketing: !s.marketing }))}
-                plain
-              />
             </View>
 
-            <View style={styles.settingsBottomSpacer} />
-            <OutlineButton title="AURA 서비스 탈퇴" onPress={openWithdrawSheet} />
-            <Text style={styles.helperText}>탈퇴 시 분석 기록과 추천 데이터가 삭제됩니다</Text>
+            <Pressable style={styles.privacyWithdrawButton} onPress={openWithdrawSheet}>
+              <Text style={styles.privacyWithdrawText}>AURA 서비스 탈퇴</Text>
+            </Pressable>
           </ScreenShell>
         );
 
       case 'analysisHistory':
         return (
-          <ScreenShell title="탄소 절감 기록" subtitle="정리 활동으로 만든 예상 환경 효과">
+          <ScreenShell title="스캔 이력" titleIcon="history" hideBack tightBottom disableScroll>
             {lastScan ? (
               <>
                 <View style={styles.carbonTotalCard}>
                   <View>
-                    <Text style={styles.infoDesc}>전체 누적 예상 절감량</Text>
-                    <Text style={styles.carbonTotalValue}>{includedCarbonDisplay}</Text>
+                    <Text style={styles.infoDesc}>전체 누적 삭제 용량</Text>
+                    <Text style={styles.carbonTotalValue}>{checkedCleanupSizeLabel}</Text>
                   </View>
                   <View style={styles.monthCarbonPill}>
-                    <Text style={styles.monthCarbonText}>이번 달 +{includedCarbonLabel.replace(' CO₂', '')}</Text>
+                    <Text style={styles.monthCarbonText}>이번 달 +{checkedCleanupSizeLabel}</Text>
                   </View>
                 </View>
-                <SectionTitle>월별 누적 변화</SectionTitle>
-                <CarbonStatsGraph carbonLabel={includedCarbonLabel} />
-                <Text style={styles.statsGuideText}>각 월까지 누적된 예상 절감량을 표시합니다.</Text>
+                <SectionTitle>스캔별 확보 용량 변화</SectionTitle>
+                <CarbonStatsGraph sizeLabel={checkedCleanupSizeLabel} />
                 <View style={styles.rowBetween}>
                   <SectionTitle>최근 정리 기록</SectionTitle>
                   <Pressable onPress={() => go('analysisHistoryAll')} hitSlop={8}>
@@ -2746,19 +3074,15 @@ export default function App() {
                   </Pressable>
                 </View>
                 {selectedCandidateCount ? (
-                  <Pressable style={styles.recentCleanupCard} onPress={() => setCarbonRecordIncluded((value) => !value)}>
+                  <View style={styles.recentCleanupCard}>
                     <View style={styles.recentCleanupTopRow}>
-                      <CheckBox checked={carbonRecordIncluded} onPress={() => setCarbonRecordIncluded((value) => !value)} compact />
                       <View style={styles.infoMain}>
-                        <View style={styles.rowBetween}>
-                          <Text style={styles.infoTitle}>{lastScan.dateLabel}</Text>
-                          <Text style={styles.rowRight}>{checkedCarbonLabel}</Text>
-                        </View>
-                        <Text style={styles.infoDesc}>{lastScan.sourceLabel} · 체크된 항목 {selectedCandidateCount}개</Text>
+                        <Text style={styles.infoTitle}>{lastScan.dateLabel}</Text>
+                        <Text style={styles.infoDesc}>Gmail {selectedMailCleanupCount}개 · Drive {selectedDriveCleanupCount}개</Text>
                       </View>
+                      <Text style={styles.recentCleanupSizeValue}>{checkedCleanupSizeLabel}</Text>
                     </View>
-                    <Text style={styles.infoDesc}>Gmail {selectedMailCleanupCount}개 · Drive {selectedDriveCleanupCount}개 · {checkedCleanupSizeLabel} 정리</Text>
-                  </Pressable>
+                  </View>
                 ) : (
                   <EmptyState title="선택된 정리 항목이 없어요" desc="결과 목록에서 체크된 항목이 최근 정리 기록에 반영돼요." />
                 )}
@@ -2771,22 +3095,18 @@ export default function App() {
 
       case 'analysisHistoryAll':
         return (
-          <ScreenShell title="정리 기록 전체보기" subtitle="탄소 절감 기록에 포함할 항목 선택">
+          <ScreenShell title="정리 기록 전체보기">
             {lastScan ? (
               <>
-                <Text style={styles.infoDesc}>탄소 절감 기록에 포함할 정리 기록을 선택하세요.</Text>
-                <Pressable style={styles.recentCleanupCard} onPress={() => setCarbonRecordIncluded((value) => !value)}>
+                <View style={styles.recentCleanupCard}>
                   <View style={styles.recentCleanupTopRow}>
-                    <CheckBox checked={carbonRecordIncluded} onPress={() => setCarbonRecordIncluded((value) => !value)} compact />
                     <View style={styles.infoMain}>
-                      <View style={styles.rowBetween}>
-                        <Text style={styles.infoTitle}>{lastScan.dateLabel}</Text>
-                        <Text style={styles.rowRight}>{checkedCarbonLabel}</Text>
-                      </View>
-                      <Text style={styles.infoDesc}>{lastScan.sourceLabel} · {selectedCandidateCount}개 · {checkedCleanupSizeLabel} 정리</Text>
+                      <Text style={styles.infoTitle}>{lastScan.dateLabel}</Text>
+                      <Text style={styles.infoDesc}>{lastScan.sourceLabel} · {selectedCandidateCount}개 정리</Text>
                     </View>
+                    <Text style={styles.recentCleanupSizeValue}>{checkedCleanupSizeLabel}</Text>
                   </View>
-                </Pressable>
+                </View>
               </>
             ) : (
               <EmptyState title="아직 정리 기록이 없어요" desc="정리를 완료하면 전체 기록을 볼 수 있어요." />
@@ -2796,7 +3116,7 @@ export default function App() {
 
       case 'serviceWithdraw':
         return (
-          <ScreenShell title="AURA 서비스 탈퇴" subtitle="탈퇴 전 삭제되는 데이터를 확인합니다">
+          <ScreenShell title="AURA 서비스 탈퇴">
             <View style={styles.withdrawModalCard}>
               <View style={styles.modalHandle} />
               <View style={styles.rowBetween}>
@@ -2836,13 +3156,69 @@ export default function App() {
 
       case 'notice':
         return (
-          <ScreenShell title="공지사항" subtitle="AURA 최신 공지를 확인해보세요">
+          <ScreenShell title="공지사항">
             <InfoRow title="AURA 1.0.0 안내" desc="학술제 발표용 프로토타입 화면이 업데이트됐어요." hideChevron />
             <InfoRow title="Google 권한 안내" desc="원문 내용은 AI에게 전달되지 않도록 설계했어요." hideChevron />
           </ScreenShell>
         );
     }
   };
+
+  const handleHorizontalSwipe = (direction: 'left' | 'right') => {
+    if (keywordChoiceVisible || keywordSheetType || yearSheetType || periodSheetType || filterSheetVisible || withdrawSheetVisible || carbonHelpVisible) return;
+
+    if (screen === 'scanProgress') {
+      if (direction === 'right') replace('home');
+      return;
+    }
+
+    if (screen === 'candidateSummary' || screen === 'selectedReview') {
+      return;
+    }
+
+    const loginIndex = loginFlowScreens.indexOf(screen);
+    if (loginIndex >= 0) {
+      const nextIndex = direction === 'left' ? loginIndex + 1 : loginIndex - 1;
+      const next = loginFlowScreens[nextIndex];
+      if (!next) return;
+      if (screen === 'initial' && direction === 'left' && !privacyChecked) {
+        showToast('개인정보 수집 및 분석 동의가 필요합니다');
+        return;
+      }
+      go(next);
+      return;
+    }
+
+    const currentTab = getResolvedTabForScreen(screen);
+    if (!currentTab) return;
+
+    if (screen !== defaultTabScreens[currentTab]) {
+      if (direction === 'right') back();
+      return;
+    }
+
+    const tabIndex = mainTabOrder.indexOf(currentTab);
+    const nextTab = mainTabOrder[direction === 'left' ? tabIndex + 1 : tabIndex - 1];
+    if (nextTab) navigateTab(nextTab);
+  };
+
+  const scanSidePanelResponder = PanResponder.create({
+    onMoveShouldSetPanResponder: (_, gesture) => gesture.dx > 18 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.25,
+    onMoveShouldSetPanResponderCapture: (_, gesture) => gesture.dx > 18 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.25,
+    onPanResponderRelease: (_, gesture) => {
+      if (gesture.dx > 70 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.25) {
+        replace('home');
+      }
+    },
+  });
+
+  const screenSwipeResponder = PanResponder.create({
+    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dx) > 46 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4,
+    onPanResponderRelease: (_, gesture) => {
+      if (Math.abs(gesture.dx) < 70 || Math.abs(gesture.dx) < Math.abs(gesture.dy) * 1.4) return;
+      handleHorizontalSwipe(gesture.dx < 0 ? 'left' : 'right');
+    },
+  });
 
   return (
     <SafeAreaProvider>
@@ -2860,6 +3236,7 @@ export default function App() {
           <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" translucent={false} />
           <View style={styles.phone}>
           <Animated.View
+            {...screenSwipeResponder.panHandlers}
             style={[
               styles.screenTransition,
               {
@@ -2894,19 +3271,16 @@ export default function App() {
             >
               <Pressable style={StyleSheet.absoluteFill} onPress={() => closeKeywordChoiceSheet()} />
               <BottomSheetPanel motion={keywordChoiceMotion} outputRange={[0, 220]} style={styles.keywordChoiceSheet} onClose={closeKeywordChoiceSheet}>
-                <Text style={styles.modalTitle}>메일 키워드 설정</Text>
-                <Text style={styles.infoDesc}>설정할 키워드 조건을 선택하세요.</Text>
+                <Text style={styles.modalTitle}>삭제 대상 키워드 설정</Text>
                 <Pressable style={styles.keywordChoiceRow} onPress={() => closeKeywordChoiceSheet('include')}>
                   <View style={styles.infoMain}>
                     <Text style={styles.infoTitle}>포함 키워드 설정</Text>
-                    <Text style={styles.infoDesc}>해당 단어가 들어간 메일을 정리 후보로 찾기</Text>
                   </View>
                   <Text style={styles.chevron}>›</Text>
                 </Pressable>
                 <Pressable style={styles.keywordChoiceRow} onPress={() => closeKeywordChoiceSheet('exclude')}>
                   <View style={styles.infoMain}>
                     <Text style={styles.infoTitle}>제외 키워드 설정</Text>
-                    <Text style={styles.infoDesc}>중요한 메일은 정리 후보에서 제외하기</Text>
                   </View>
                   <Text style={styles.chevron}>›</Text>
                 </Pressable>
@@ -2938,6 +3312,15 @@ export default function App() {
               range={yearSheetType === 'opened' ? openedYearRange : modifiedYearRange}
               setRange={yearSheetType === 'opened' ? setOpenedYearRange : setModifiedYearRange}
               onClose={closeYearSheet}
+            />
+          ) : null}
+          {periodSheetType ? (
+            <PeriodMonthSheet
+              type={periodSheetType}
+              motion={periodSheetMotion}
+              months={periodSheetType === 'opened' ? lastOpenedBeforeMonths : lastModifiedBeforeMonths}
+              onChange={(value) => updateMonthCondition(periodSheetType, value)}
+              onClose={closePeriodMonthSheet}
             />
           ) : null}
           {filterSheetVisible ? (
@@ -3009,7 +3392,7 @@ export default function App() {
             <Animated.View
               style={[
                 styles.toastOverlay,
-                (keywordChoiceVisible || keywordSheetType || yearSheetType || filterSheetVisible || withdrawSheetVisible) && styles.toastOverlayAboveSheet,
+                (keywordChoiceVisible || keywordSheetType || yearSheetType || periodSheetType || filterSheetVisible || withdrawSheetVisible) && styles.toastOverlayAboveSheet,
                 {
                   opacity: toastOpacity,
                   transform: [
@@ -3061,6 +3444,8 @@ function ScreenShell({
   closeIcon,
   hideBack,
   tightBottom,
+  titleIcon,
+  disableScroll,
 }: {
   title?: string;
   subtitle?: string;
@@ -3071,6 +3456,8 @@ function ScreenShell({
   closeIcon?: boolean;
   hideBack?: boolean;
   tightBottom?: boolean;
+  titleIcon?: MainTab;
+  disableScroll?: boolean;
 }) {
   const navigation = useContext(NavigationContext);
   const handleBack = hideBack ? undefined : onBack ?? navigation?.back;
@@ -3089,23 +3476,49 @@ function ScreenShell({
               <View style={styles.backButton} />
             )}
             <View style={styles.headerText}>
-              <Text style={styles.title}>{title}</Text>
+              <View style={styles.headerTitleContent}>
+                {titleIcon ? (
+                  <View style={styles.headerTitleIcon}>
+                    <NavIcon type={titleIcon} active />
+                  </View>
+                ) : null}
+                <Text style={styles.title} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.65}>{title}</Text>
+              </View>
               {subtitle ? <Text style={styles.subtitle}>{subtitle}</Text> : null}
             </View>
           </View>
-          {hideBack ? <View style={styles.headerInsetRule} /> : null}
+          <View style={styles.headerInsetRule} />
         </View>
       ) : (
         <DeviceStatusBar />
       )}
-      <ScrollView
-        style={styles.content}
-        contentContainerStyle={[styles.contentInner, compactTop && styles.contentInnerCompact, tightBottom && styles.contentInnerTightBottom]}
-        showsVerticalScrollIndicator={false}
-        keyboardShouldPersistTaps="handled"
-      >
-        {children}
-      </ScrollView>
+      {disableScroll ? (
+        <View
+          style={[
+            styles.content,
+            styles.contentInner,
+            compactTop && styles.contentInnerCompact,
+            tightBottom && styles.contentInnerTightBottom,
+          ]}
+        >
+          {children}
+        </View>
+      ) : (
+        <ScrollView
+          style={styles.content}
+          contentContainerStyle={[
+            styles.contentInner,
+            compactTop && styles.contentInnerCompact,
+            tightBottom && styles.contentInnerTightBottom,
+          ]}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+          bounces={false}
+          overScrollMode="never"
+        >
+          {children}
+        </ScrollView>
+      )}
       {!noNav ? <BottomNav /> : null}
     </View>
   );
@@ -3124,6 +3537,7 @@ function BottomNav() {
     <View style={styles.bottomNav}>
       <NavButton label="홈" type="home" active={currentTab === 'home'} onPress={() => navigation?.navigateTab('home')} />
       <NavButton label="정리함" type="storage" active={currentTab === 'storage'} onPress={() => navigation?.navigateTab('storage')} />
+      <NavButton label="스캔 이력" type="history" active={currentTab === 'history'} onPress={() => navigation?.navigateTab('history')} />
       <NavButton label="설정" type="settings" active={currentTab === 'settings'} onPress={() => navigation?.navigateTab('settings')} />
     </View>
   );
@@ -3136,7 +3550,7 @@ function NavButton({
   onPress,
 }: {
   label: string;
-  type: 'home' | 'storage' | 'settings';
+  type: 'home' | 'storage' | 'history' | 'settings';
   active?: boolean;
   onPress: () => void;
 }) {
@@ -3148,7 +3562,7 @@ function NavButton({
   );
 }
 
-function NavIcon({ type, active }: { type: 'home' | 'storage' | 'settings'; active: boolean }) {
+function NavIcon({ type, active }: { type: 'home' | 'storage' | 'history' | 'settings'; active: boolean }) {
   if (type === 'home') {
     return (
       <View style={styles.navIconFrame}>
@@ -3166,6 +3580,21 @@ function NavIcon({ type, active }: { type: 'home' | 'storage' | 'settings'; acti
             <View style={styles.navLockerVent} />
             <View style={styles.navLockerHandle} />
           </View>
+        </View>
+      </View>
+    );
+  }
+
+  if (type === 'history') {
+    return (
+      <View style={styles.navIconFrame}>
+        <View style={styles.navHistoryChart}>
+          <View style={[styles.navHistoryAxis, active && styles.navHistoryActiveFill]} />
+          <View style={[styles.navHistorySegment, styles.navHistorySegmentOne, active && styles.navHistoryActiveFill]} />
+          <View style={[styles.navHistorySegment, styles.navHistorySegmentTwo, active && styles.navHistoryActiveFill]} />
+          <View style={[styles.navHistoryDot, styles.navHistoryDotOne, active && styles.navHistoryActiveFill]} />
+          <View style={[styles.navHistoryDot, styles.navHistoryDotTwo, active && styles.navHistoryActiveFill]} />
+          <View style={[styles.navHistoryDot, styles.navHistoryDotThree, active && styles.navHistoryActiveFill]} />
         </View>
       </View>
     );
@@ -3215,23 +3644,30 @@ function BottomSheetPanel({
   style,
   onClose,
   children,
+  dragScope = 'panel',
 }: {
   motion: Animated.Value;
   outputRange: [number, number];
   style: object;
   onClose: () => void;
   children: React.ReactNode;
+  dragScope?: 'handle' | 'panel';
 }) {
   const dragY = useRef(new Animated.Value(0)).current;
+  const canStartDrag = (_: unknown, gesture: { dx: number; dy: number }) =>
+    Math.abs(gesture.dy) > 6 &&
+    Math.abs(gesture.dy) > Math.abs(gesture.dx) * 1.2 &&
+    (dragScope === 'handle' || gesture.dy > 0);
   const panResponder = useRef(
     PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 3,
+      onStartShouldSetPanResponder: () => dragScope === 'handle',
+      onMoveShouldSetPanResponder: canStartDrag,
+      onMoveShouldSetPanResponderCapture: canStartDrag,
       onPanResponderMove: (_, gesture) => {
         dragY.setValue(Math.max(0, gesture.dy));
       },
       onPanResponderRelease: (_, gesture) => {
-        if (gesture.dy > 58 || gesture.vy > 0.85) {
+        if (gesture.dy > 72 || (gesture.dy > 28 && gesture.vy > 0.95)) {
           onClose();
           return;
         }
@@ -3239,7 +3675,7 @@ function BottomSheetPanel({
           toValue: 0,
           speed: 18,
           bounciness: 5,
-          useNativeDriver: false,
+          useNativeDriver: true,
         }).start();
       },
       onPanResponderTerminate: () => {
@@ -3247,7 +3683,7 @@ function BottomSheetPanel({
           toValue: 0,
           speed: 18,
           bounciness: 5,
-          useNativeDriver: false,
+          useNativeDriver: true,
         }).start();
       },
     })
@@ -3258,10 +3694,12 @@ function BottomSheetPanel({
     outputRange,
   });
   const translateY = Animated.add(baseTranslateY, dragY);
+  const panelPanHandlers = dragScope === 'panel' ? panResponder.panHandlers : {};
+  const handlePanHandlers = dragScope === 'handle' ? panResponder.panHandlers : {};
 
   return (
-    <Animated.View style={[style, { transform: [{ translateY }] }]}>
-      <Pressable style={styles.modalHandleHitArea} onPress={onClose} {...panResponder.panHandlers}>
+    <Animated.View style={[style, { transform: [{ translateY }] }]} {...panelPanHandlers}>
+      <Pressable style={styles.modalHandleHitArea} onPress={onClose} {...handlePanHandlers}>
         <View style={styles.modalHandle} />
       </Pressable>
       {children}
@@ -3277,7 +3715,7 @@ function InfoRow({
   hideChevron,
 }: {
   title: string;
-  desc: string;
+  desc?: string;
   right?: string;
   onPress?: () => void;
   hideChevron?: boolean;
@@ -3286,7 +3724,7 @@ function InfoRow({
     <View style={styles.infoRow}>
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
-        <Text style={styles.infoDesc}>{desc}</Text>
+        {desc ? <Text style={styles.infoDesc}>{desc}</Text> : null}
       </View>
       {hideChevron ? null : right ? <Text style={styles.rowRight}>{right}</Text> : <Text style={styles.chevron}>›</Text>}
     </View>
@@ -3304,7 +3742,7 @@ function ScanSourceCard({
   onDetailPress,
 }: {
   title: string;
-  desc: string;
+  desc?: string;
   checked: boolean;
   detail?: string;
   onPress: () => void;
@@ -3315,7 +3753,7 @@ function ScanSourceCard({
       <CheckBox checked={checked} onPress={onPress} compact />
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
-        <Text style={styles.infoDesc}>{desc}</Text>
+        {desc ? <Text style={styles.infoDesc}>{desc}</Text> : null}
       </View>
       {detail ? (
         <Pressable onPress={onDetailPress ?? onPress} hitSlop={10}>
@@ -3335,7 +3773,7 @@ function FolderRow({
   onOpen,
 }: {
   title: string;
-  desc: string;
+  desc?: string;
   selected: boolean;
   canOpen?: boolean;
   onPress: () => void;
@@ -3343,35 +3781,34 @@ function FolderRow({
 }) {
   return (
     <Pressable style={[styles.folderRow, selected && styles.folderRowSelected]} onPress={onPress}>
-      <View style={styles.folderIcon}>
-        <Text style={styles.folderIconText}>D</Text>
-      </View>
+      <CheckBox checked={selected} onPress={onPress} compact />
+      <Text style={styles.folderRowEmoji}>📁</Text>
       <View style={styles.infoMain}>
-        <Text style={styles.infoTitle}>{title}</Text>
-        <Text style={styles.infoDesc}>{desc}</Text>
+        <View style={styles.folderTitleLine}>
+          <Text style={styles.folderTitleText} numberOfLines={1}>{title}</Text>
+          {desc ? <Text style={styles.folderSizeText}>{desc}</Text> : null}
+        </View>
       </View>
       {canOpen ? (
         <Pressable style={styles.folderNavigateButton} onPress={onOpen ?? onPress} hitSlop={8}>
           <Text style={styles.folderNavigateText}>›</Text>
         </Pressable>
       ) : null}
-      <CheckBox checked={selected} onPress={onPress} compact />
     </Pressable>
   );
 }
 
-function DriveFolderFileRow({ file, selected, onPress }: { file: AuraDriveFile; selected: boolean; onPress: () => void }) {
+function DriveFolderFileRow({ file, selected }: { file: AuraDriveFile; selected: boolean }) {
   return (
-    <Pressable style={[styles.folderFileRow, selected && styles.folderRowSelected]} onPress={onPress}>
-      <CheckBox checked={selected} onPress={onPress} compact />
+    <View style={[styles.folderFileRow, selected && styles.folderRowSelected]}>
       <View style={styles.fileTypeIcon}>
         <Text style={styles.fileTypeText}>{file.type}</Text>
       </View>
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{file.title}</Text>
-        <Text style={styles.infoDesc}>{file.type} · {formatDataSize(file.sizeMB)} · 수정 {file.modifiedAt}</Text>
       </View>
-    </Pressable>
+      <Text style={styles.folderSizeText}>{formatDataSize(file.sizeMB)}</Text>
+    </View>
   );
 }
 
@@ -3413,38 +3850,130 @@ function KeywordBottomSheet({
       ]}
     >
       <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
-      <BottomSheetPanel motion={motion} outputRange={[0, 360]} style={styles.keywordSheet} onClose={onClose}>
-        <View style={styles.rowBetween}>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.sheetKeyboardAvoider}>
+        <BottomSheetPanel motion={motion} outputRange={[0, 360]} style={styles.keywordSheet} onClose={onClose}>
           <Text style={styles.modalTitle}>{isInclude ? '포함 키워드 설정' : '제외 키워드 설정'}</Text>
-          <Pressable onPress={onClose} hitSlop={10}>
-            <Text style={styles.modalClose}>×</Text>
-          </Pressable>
-        </View>
-        <Text style={styles.infoDesc}>
-          {isInclude ? '해당 키워드가 있는 메일을 정리 후보에 포함합니다' : '해당 키워드가 있는 메일은 정리 후보에서 보호합니다'}
-        </Text>
-        <View style={styles.inputRow}>
-          <TextInput value={input} onChangeText={setInput} placeholder="키워드 입력" placeholderTextColor="#6B8194" style={styles.input} />
-          <Pressable style={styles.addButton} onPress={onAddInput}>
-            <Text style={styles.addButtonText}>추가</Text>
-          </Pressable>
-        </View>
-        <SectionTitle>현재 키워드</SectionTitle>
-        <View style={styles.chipWrap}>
-          {keywords.map((keyword) => (
-            <Chip key={keyword} label={keyword} removable onRemove={() => onRemove(keyword)} />
-          ))}
-        </View>
-        <SectionTitle>추천 키워드</SectionTitle>
-        <View style={styles.chipWrap}>
-          {recommended.map((keyword) => (
-            <Pressable key={keyword} style={styles.recommendChip} onPress={() => onAddRecommended(keyword)}>
-              <Text style={styles.recommendChipText}>+ {keyword}</Text>
+          <Text style={[styles.infoDesc, styles.keywordSheetDesc]}>
+            {isInclude ? '해당 키워드가 있는 메일을 정리 후보에 포함합니다' : '해당 키워드가 있는 메일은 정리 후보에서 보호합니다'}
+          </Text>
+          <View style={styles.inputRow}>
+            <TextInput value={input} onChangeText={setInput} placeholder="키워드 입력" placeholderTextColor="#6B8194" style={styles.input} />
+            <Pressable style={styles.addButton} onPress={onAddInput}>
+              <Text style={styles.addButtonText}>추가</Text>
             </Pressable>
-          ))}
-        </View>
-        <PrimaryButton title={isInclude ? '포함 키워드 적용' : '제외 키워드 적용'} onPress={onClose} inline />
-      </BottomSheetPanel>
+          </View>
+          <SectionTitle>현재 키워드</SectionTitle>
+          <View style={styles.chipWrap}>
+            {keywords.map((keyword) => (
+              <Chip key={keyword} label={keyword} removable onRemove={() => onRemove(keyword)} />
+            ))}
+          </View>
+          <SectionTitle>추천 키워드</SectionTitle>
+          <View style={styles.chipWrap}>
+            {recommended.map((keyword) => (
+              <Pressable key={keyword} style={styles.recommendChip} onPress={() => onAddRecommended(keyword)}>
+                <Text style={styles.recommendChipText}>+ {keyword}</Text>
+              </Pressable>
+            ))}
+          </View>
+          <PrimaryButton title={isInclude ? '포함 키워드 적용' : '제외 키워드 적용'} onPress={onClose} inline />
+        </BottomSheetPanel>
+      </KeyboardAvoidingView>
+    </Animated.View>
+  );
+}
+
+function PeriodMonthSheet({
+  type,
+  motion,
+  months,
+  onChange,
+  onClose,
+}: {
+  type: 'opened' | 'modified';
+  motion: Animated.Value;
+  months: number;
+  onChange: (value: number) => void;
+  onClose: () => void;
+}) {
+  const [draftMonths, setDraftMonths] = useState(months);
+  const [yearText, setYearText] = useState(`${Math.floor(months / 12)}`);
+  const [monthText, setMonthText] = useState(`${months % 12}`);
+  const title = type === 'opened' ? '마지막으로 연 날짜' : '마지막 수정일';
+  const onlyNumber = (value: string) => value.replace(/[^0-9]/g, '');
+  const clampMonths = (value: number) => Math.max(1, Math.min(120, value));
+  const syncDraft = (value: number) => {
+    const nextValue = clampMonths(value);
+    setDraftMonths(nextValue);
+    setYearText(`${Math.floor(nextValue / 12)}`);
+    setMonthText(`${nextValue % 12}`);
+  };
+  const commitTypedValue = () => {
+    const years = Number.parseInt(yearText, 10) || 0;
+    const restMonths = Number.parseInt(monthText, 10) || 0;
+    syncDraft(years * 12 + Math.min(11, restMonths));
+  };
+  const applyValue = () => {
+    const years = Number.parseInt(yearText, 10) || 0;
+    const restMonths = Number.parseInt(monthText, 10) || 0;
+    const nextValue = clampMonths(years * 12 + Math.min(11, restMonths));
+    onChange(nextValue);
+    onClose();
+  };
+
+  useEffect(() => {
+    syncDraft(months);
+  }, [months]);
+
+  return (
+    <Animated.View
+      style={[
+        styles.sheetOverlay,
+        {
+          opacity: motion.interpolate({
+            inputRange: [0, 1],
+            outputRange: [1, 0],
+          }),
+        },
+      ]}
+    >
+      <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.sheetKeyboardAvoider}>
+        <BottomSheetPanel motion={motion} outputRange={[0, 340]} style={styles.periodMonthSheet} onClose={onClose}>
+          <Text style={styles.modalTitle}>{title}</Text>
+          <View style={styles.periodMonthControl}>
+            <Pressable style={styles.monthStepButton} onPress={() => syncDraft(draftMonths - 1)}>
+              <Text style={styles.monthStepText}>-</Text>
+            </Pressable>
+            <View style={styles.periodMonthInputGroup}>
+              <TextInput
+                style={styles.periodMonthInput}
+                value={yearText}
+                onChangeText={(value) => setYearText(onlyNumber(value).slice(0, 2))}
+                onBlur={commitTypedValue}
+                keyboardType="number-pad"
+                maxLength={2}
+                selectTextOnFocus
+              />
+              <Text style={styles.periodUnit}>년</Text>
+              <TextInput
+                style={styles.periodMonthInput}
+                value={monthText}
+                onChangeText={(value) => setMonthText(onlyNumber(value).slice(0, 2))}
+                onBlur={commitTypedValue}
+                keyboardType="number-pad"
+                maxLength={2}
+                selectTextOnFocus
+              />
+              <Text style={styles.periodUnit}>개월</Text>
+            </View>
+            <Pressable style={styles.monthStepButton} onPress={() => syncDraft(draftMonths + 1)}>
+              <Text style={styles.monthStepText}>+</Text>
+            </Pressable>
+          </View>
+          <PrimaryButton title="기간 조건 적용" onPress={applyValue} inline />
+        </BottomSheetPanel>
+      </KeyboardAvoidingView>
     </Animated.View>
   );
 }
@@ -3510,12 +4039,7 @@ function YearRangeSheet({
     >
       <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
       <BottomSheetPanel motion={motion} outputRange={[0, 360]} style={styles.keywordSheet} onClose={onClose}>
-        <View style={styles.rowBetween}>
-          <Text style={styles.modalTitle}>{isOpened ? '마지막으로 연 날짜' : '마지막 수정일'}</Text>
-          <Pressable onPress={onClose} hitSlop={10}>
-            <Text style={styles.modalClose}>×</Text>
-          </Pressable>
-        </View>
+        <Text style={styles.modalTitle}>{isOpened ? '마지막으로 연 날짜' : '마지막 수정일'}</Text>
         <Text style={styles.infoDesc}>직접 입력하거나 아래 바를 월 단위로 드래그해서 설정하세요.</Text>
         <View style={styles.yearRangeSummary}>
           <Text style={styles.yearRangeLabel}>선택 범위</Text>
@@ -3610,12 +4134,7 @@ function FilterSortSheet({
     >
       <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
       <BottomSheetPanel motion={motion} outputRange={[0, 420]} style={styles.filterSheet} onClose={onClose}>
-        <View style={styles.rowBetween}>
-          <Text style={styles.modalTitle}>필터 및 정렬</Text>
-          <Pressable onPress={onClose} hitSlop={10}>
-            <Text style={styles.modalClose}>×</Text>
-          </Pressable>
-        </View>
+        <Text style={styles.modalTitle}>필터 및 정렬</Text>
         <Text style={styles.infoDesc}>날짜와 용량 조건을 적용하고 목록 순서를 바꿀 수 있어요.</Text>
         <Text style={styles.filterSectionTitle}>날짜 필터</Text>
         <View style={styles.chipWrap}>
@@ -3717,26 +4236,94 @@ function YearRangeSlider({ range, setRange }: { range: MonthRange; setRange: Rea
   );
 }
 
+function MonthConditionRow({
+  title,
+  months,
+  onPress,
+}: {
+  title: string;
+  months: number;
+  onPress: () => void;
+}) {
+  const periodText = `${formatMonthDuration(months)} 이상`;
+  return (
+    <Pressable style={styles.monthConditionRow} onPress={onPress}>
+      <View style={styles.infoMain}>
+        <Text style={styles.infoTitle}>{title}</Text>
+        <Text style={styles.infoDesc}>{periodText}</Text>
+      </View>
+      <Text style={styles.chevron}>›</Text>
+    </Pressable>
+  );
+}
+
 function PermissionRow({
   title,
   desc,
   checked,
   onPress,
+  onDetailPress,
 }: {
   title: string;
-  desc: string;
+  desc?: string;
   checked: boolean;
   onPress: () => void;
+  onDetailPress?: () => void;
 }) {
   return (
     <Pressable style={styles.permissionRow} onPress={onPress}>
       <CheckBox checked={checked} onPress={onPress} />
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
-        <Text style={styles.infoDesc}>{desc}</Text>
+        {desc ? <Text style={styles.infoDesc}>{desc}</Text> : null}
       </View>
-      <Text style={styles.chevron}>›</Text>
+      {onDetailPress ? (
+        <Pressable
+          style={styles.permissionDetailButton}
+          onPress={(event) => {
+            event.stopPropagation?.();
+            onDetailPress();
+          }}
+        >
+          <Text style={styles.chevron}>›</Text>
+        </Pressable>
+      ) : null}
     </Pressable>
+  );
+}
+
+function PushNotificationPermissionContent() {
+  const sections = [
+    {
+      title: 'AURA가 보내는 알림',
+      items: ['백그라운드 스캔 완료 안내', '정리 후보가 준비되었을 때의 알림'],
+    },
+    {
+      title: '알림에서 제외되는 내용',
+      items: ['메일과 파일의 원문 내용은 AI에게 전달되지 않아요.', '광고성 알림은 보내지 않아요.', '알림 설정은 언제든 변경할 수 있어요.'],
+    },
+  ];
+
+  return (
+    <Card style={[styles.permissionReasonCard, styles.pushPermissionReasonCard]}>
+      <SectionTitle>권한을 요청하는 이유</SectionTitle>
+      <Text style={styles.permissionReasonDescription}>
+        AURA는 사용자가 앱을 닫아도 정리 진행 상태를{'\n'}놓치지 않도록 알림을 보냅니다.
+      </Text>
+      {sections.map((section) => (
+        <View key={section.title} style={styles.permissionReasonSection}>
+          <Text style={styles.permissionReasonTitle}>{section.title}</Text>
+          {section.items.map((item) => (
+            <Text key={item} style={styles.permissionReasonText}>• {item}</Text>
+          ))}
+        </View>
+      ))}
+      <View style={styles.permissionReasonNote}>
+        <Text style={styles.permissionReasonNoteText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82}>
+          알림 없이도 앱에서 분석 결과를 확인할 수 있어요.
+        </Text>
+      </View>
+    </Card>
   );
 }
 
@@ -3744,14 +4331,12 @@ function PermissionDetail({
   screen,
   back,
   setPermissions,
-  setSettingsToggles,
+  requestPushPermission,
 }: {
-  screen: 'gmailPermission' | 'drivePermission' | 'notificationPermission';
+  screen: PermissionScreen;
   back: () => void;
-  setPermissions: React.Dispatch<React.SetStateAction<{ gmail: boolean; drive: boolean; alarm: boolean }>>;
-  setSettingsToggles: React.Dispatch<
-    React.SetStateAction<{ scanComplete: boolean; aiNudge: boolean; marketing: boolean; autoScan: boolean }>
-  >;
+  setPermissions: React.Dispatch<React.SetStateAction<PermissionState>>;
+  requestPushPermission: () => Promise<boolean>;
 }) {
   const info = {
     gmailPermission: {
@@ -3809,8 +4394,8 @@ function PermissionDetail({
       key: 'drive' as const,
     },
     notificationPermission: {
-      title: '알림 권한',
-      subtitle: '필요한 순간에만 알림을 보냅니다',
+      title: '푸시 알림',
+      subtitle: undefined,
       features: [
         ['스캔 완료 알림', '백그라운드 분석이 끝났을 때'],
         ['스캔 권장 알림', '맞춤 정리 행동을 주 1회 제안'],
@@ -3832,45 +4417,41 @@ function PermissionDetail({
       ],
       reasonNote: '알림 없이도 앱에서 분석 결과를 확인할 수 있어요.',
       guide: '설정에서 언제든 권한을 변경할 수 있어요',
-      button: '알림 허용',
+      button: '푸시 알림 허용',
       key: 'alarm' as const,
     },
   }[screen];
 
   return (
     <ScreenShell title={info.title} subtitle={info.subtitle} noNav onBack={back}>
-      <Card style={styles.permissionReasonCard}>
-        <SectionTitle>{info.reasonTitle}</SectionTitle>
-        <Text style={styles.permissionReasonDescription}>{info.reasonDescription}</Text>
-        {info.reasonSections.map((section) => (
-          <View key={section.title} style={styles.permissionReasonSection}>
-            <Text style={styles.permissionReasonTitle}>{section.title}</Text>
-            {section.items.map((item) => (
-              <Text key={item} style={styles.permissionReasonText}>• {item}</Text>
-            ))}
+      {screen === 'notificationPermission' ? (
+        <PushNotificationPermissionContent />
+      ) : (
+        <Card style={styles.permissionReasonCard}>
+          <SectionTitle>{info.reasonTitle}</SectionTitle>
+          <Text style={styles.permissionReasonDescription}>{info.reasonDescription}</Text>
+          {info.reasonSections.map((section) => (
+            <View key={section.title} style={styles.permissionReasonSection}>
+              <Text style={styles.permissionReasonTitle}>{section.title}</Text>
+              {section.items.map((item) => (
+                <Text key={item} style={styles.permissionReasonText}>• {item}</Text>
+              ))}
+            </View>
+          ))}
+          <View style={styles.permissionReasonNote}>
+            <Text style={styles.permissionReasonNoteText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82}>{info.reasonNote}</Text>
           </View>
-        ))}
-        <View style={styles.permissionReasonNote}>
-          <Text style={styles.permissionReasonNoteText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82}>{info.reasonNote}</Text>
-        </View>
-      </Card>
+        </Card>
+      )}
       <PrimaryButton
         title={info.button}
         onPress={() => {
+          if (info.key === 'alarm') {
+            void requestPushPermission().then(() => back());
+            return;
+          }
+
           setPermissions((items) => ({ ...items, [info.key]: true }));
-          if (info.key === 'alarm') {
-            setSettingsToggles((items) => ({ ...items, scanComplete: true, aiNudge: true }));
-          }
-          back();
-        }}
-      />
-      <OutlineButton
-        title="지금은 허용하지 않기"
-        onPress={() => {
-          setPermissions((items) => ({ ...items, [info.key]: false }));
-          if (info.key === 'alarm') {
-            setSettingsToggles((items) => ({ ...items, scanComplete: false, aiNudge: false }));
-          }
           back();
         }}
       />
@@ -3939,13 +4520,14 @@ function ResultMetricCard({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ResultCategoryCard({ title, desc, onPress }: { title: string; desc: string; onPress: () => void }) {
+function ResultCategoryCard({ title, desc, warning, onPress }: { title: string; desc: string; warning?: string; onPress: () => void }) {
   return (
     <Pressable style={styles.resultCategoryCard} onPress={onPress}>
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
-        <Text style={styles.infoDesc}>{desc}</Text>
+        {warning ? <Text style={styles.resultWarningText}>{warning}</Text> : null}
       </View>
+      <Text style={styles.resultCategoryMeta}>{desc}</Text>
       <Text style={styles.chevron}>›</Text>
     </Pressable>
   );
@@ -3986,7 +4568,7 @@ function ScanItemDetailScreen({
   kind,
 }: {
   title: string;
-  subtitle: string;
+  subtitle?: string;
   item?: ScanListItem;
   kind: 'mail' | 'drive';
 }) {
@@ -4008,24 +4590,32 @@ function ScanItemDetailScreen({
       <View style={styles.itemPreviewBox}>
         <Text style={styles.itemPreviewText}>{item.previewLabel ?? (kind === 'mail' ? '메일 본문 미리보기' : 'FILE PREVIEW')}</Text>
       </View>
-      <View style={styles.detailInfoBox}>
-        <Text style={styles.detailInfoTitle}>선정 이유</Text>
-        <Text style={styles.detailInfoText}>{item.desc}</Text>
-        <View style={styles.thinDivider} />
-        <Text style={styles.detailInfoTitle}>분석 메타데이터</Text>
-        <Text style={styles.detailInfoText}>용량 {formatDataSize(item.sizeMB)} · 기준 날짜 {item.dateLabel}</Text>
-      </View>
+      {kind === 'mail' ? (
+        <View style={styles.detailInfoBox}>
+          <Text style={styles.detailInfoTitle}>선정 이유</Text>
+          <Text style={styles.detailInfoText}>{item.desc}</Text>
+          <View style={styles.thinDivider} />
+          <Text style={styles.detailInfoTitle}>분석 메타데이터</Text>
+          <Text style={styles.detailInfoText}>용량 {formatDataSize(item.sizeMB)} · 기준 날짜 {item.dateLabel}</Text>
+        </View>
+      ) : (
+        <View style={styles.detailInfoBox}>
+          <Text style={styles.detailInfoTitle}>파일 메타데이터</Text>
+          <Text style={styles.detailInfoText}>용량 {formatDataSize(item.sizeMB)} · 기준 날짜 {item.dateLabel}</Text>
+        </View>
+      )}
     </ScreenShell>
   );
 }
 
-function DeleteStatusRow({ title, desc, status }: { title: string; desc: string; status: string }) {
+function DeleteStatusRow({ title, desc, status, done }: { title: string; desc?: string; status: string; done?: boolean }) {
   return (
     <View style={styles.deleteStatusRow}>
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
-        <Text style={styles.infoDesc}>{desc}</Text>
+        {desc ? <Text style={styles.infoDesc}>{desc}</Text> : null}
       </View>
+      <View style={[styles.statusLight, done ? styles.statusLightGreen : styles.statusLightYellow]} />
       <Text style={styles.deleteStatusText}>{status}</Text>
     </View>
   );
@@ -4065,28 +4655,28 @@ function CarbonHelpPopup({ onClose }: { onClose: () => void }) {
   );
 }
 
-function RecentResultRow({ title, desc, value }: { title: string; desc: string; value: string }) {
+function RecentResultRow({ title, desc, value }: { title: string; desc?: string; value: string }) {
   return (
     <View style={styles.recentResultRow}>
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
-        <Text style={styles.infoDesc}>{desc}</Text>
+        {desc ? <Text style={styles.infoDesc}>{desc}</Text> : null}
       </View>
       <Text style={styles.recentResultValue}>{value}</Text>
     </View>
   );
 }
 
-function CarbonStatsGraph({ carbonLabel }: { carbonLabel: string }) {
-  const current = carbonLabelToGram(carbonLabel);
-  const max = Math.max(3, current);
+function CarbonStatsGraph({ sizeLabel }: { sizeLabel: string }) {
+  const current = sizeLabelToMB(sizeLabel) / 1024;
+  const max = Math.max(5, current);
   const currentMonth = `${nowForScanRange.getMonth() + 1}월`;
   const rawPoints = current > 0 ? [{ month: currentMonth, value: current }] : [];
   const chartWidth = 226;
   const chartHeight = 116;
   const points = rawPoints.map((point, index) => ({
     ...point,
-    label: `${point.value.toFixed(1)}g`,
+    label: `${point.value.toFixed(1)}GB`,
     x: rawPoints.length === 1 ? chartWidth / 2 : index * (chartWidth / (rawPoints.length - 1)),
     y: chartHeight - (point.value / max) * 96 - 10,
   }));
@@ -4110,12 +4700,12 @@ function CarbonStatsGraph({ carbonLabel }: { carbonLabel: string }) {
   return (
     <View style={styles.statsGraphCard}>
       <View style={styles.rowBetween}>
-        <Text style={styles.infoTitle}>월별 누적 변화</Text>
-        <Text style={styles.infoDesc}>CO₂e</Text>
+        <Text style={styles.infoTitle}>스캔별 확보 용량</Text>
+        <Text style={styles.infoDesc}>GB</Text>
       </View>
       <View style={styles.graphArea}>
         <View style={styles.graphYAxis}>
-          {['3g', '2g', '1g', '0'].map((tick) => (
+          {['5GB', '3GB', '1GB', '0'].map((tick) => (
             <Text key={tick} style={styles.graphAxisText}>{tick}</Text>
           ))}
         </View>
@@ -4185,6 +4775,7 @@ function StorageScreen({
   setStorageTrashMovedKeys,
   setStorageDeletedKeys,
   setStorageDriveMoveTargets,
+  openStorageDetail,
 }: {
   mode: 'storageMail' | 'storageDrive' | 'storageTrash' | 'storageDriveTrash';
   scan: ScanRecord | null;
@@ -4206,14 +4797,17 @@ function StorageScreen({
   setStorageTrashMovedKeys: React.Dispatch<React.SetStateAction<string[]>>;
   setStorageDeletedKeys: React.Dispatch<React.SetStateAction<string[]>>;
   setStorageDriveMoveTargets: React.Dispatch<React.SetStateAction<StorageDriveMoveTargets>>;
+  openStorageDetail: (item: StorageDetailItem) => void;
 }) {
   const isDrive = mode === 'storageDrive' || mode === 'storageDriveTrash';
   const isTrash = mode === 'storageTrash' || mode === 'storageDriveTrash';
-  const [movingDriveItem, setMovingDriveItem] = useState<StorageDriveItem | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
   const [deleteSheetMode, setDeleteSheetMode] = useState<'trash' | 'permanent' | null>(null);
   const [deleteConfirmChecked, setDeleteConfirmChecked] = useState(false);
+  const [storagePage, setStoragePage] = useState(0);
+  const [storageDriveTrashFolder, setStorageDriveTrashFolder] = useState(driveRootPath);
   const prefix = mode === 'storageDriveTrash' ? 'storageDriveTrash' : isTrash ? 'storageTrash' : isDrive ? 'storageDrive' : 'storageMail';
-  const summary = scan?.result ?? emptyScanSummary;
+  const summary = scan?.result ?? defaultStorageSummary;
   const mailItems = summary.storageMailItems;
   const allStorageDriveItems = getAllStorageDriveItems();
   const applyDriveMove = (item: StorageDriveItem): StorageDriveItem => {
@@ -4227,15 +4821,16 @@ function StorageScreen({
       subtitle: item.type === 'F' ? `${fullPath} · 폴더` : `${meta} · ${targetFolder}`,
     };
   };
-  const currentStorageDriveItems = allStorageDriveItems
-    .map(applyDriveMove)
+  const storageDriveUniverse = allStorageDriveItems.map(applyDriveMove);
+  const currentStorageDriveItems = storageDriveUniverse
     .filter((item) => {
       if (item.type === 'F') return getDriveParentPath(item.fullPath ?? '') === storageDriveFolder;
       return item.fullPath === storageDriveFolder;
     });
   const driveItems = isDrive && !isTrash ? currentStorageDriveItems : summary.storageDriveItems;
-  const storageDriveBreadcrumbs = splitDrivePath(storageDriveFolder).map((part, index, parts) => ({
-    label: part,
+  const activeDriveFolder = mode === 'storageDriveTrash' ? storageDriveTrashFolder : storageDriveFolder;
+  const storageDriveBreadcrumbs = splitDrivePath(activeDriveFolder).map((part, index, parts) => ({
+    label: mode === 'storageDriveTrash' && index === 0 ? '휴지통' : part,
     path: parts.slice(0, index + 1).join(' › '),
   }));
   const movedTrashItems: StorageMailItem[] = storageTrashMovedKeys
@@ -4248,7 +4843,7 @@ function StorageScreen({
         return {
           id: `trash-mail-moved-${item.id}`,
           title: item.title,
-          subtitle: '이동됨 · 원래 유형 Gmail',
+          subtitle: item.subtitle,
           meta: item.meta,
           badge: '복구 가능',
         };
@@ -4259,7 +4854,7 @@ function StorageScreen({
         return {
           id: `trash-drive-moved-${item.id}`,
           title: item.title,
-          subtitle: '이동됨 · 원래 유형 Drive',
+          subtitle: item.title,
           meta: item.subtitle,
           badge: '복구 가능',
         };
@@ -4280,33 +4875,128 @@ function StorageScreen({
   const visibleMailItems = mailItems.filter((item) => !isHiddenFromCurrentList(item.id));
   const visibleDriveItems = driveItems.filter((item) => !isHiddenFromCurrentList(item.id));
   const serviceConnected = mode === 'storageDriveTrash' ? permissions.drive : isTrash ? permissions.gmail : isDrive ? permissions.drive : permissions.gmail;
-  const activeItems = isTrash ? trashItems : isDrive ? visibleDriveItems : visibleMailItems;
+  const mappedSummaryDriveTrashItems: StorageDriveItem[] = mode === 'storageDriveTrash'
+    ? trashItems.map((item) => {
+        const metaParts = splitStorageMeta(item.meta);
+        const isFolder =
+          item.id.startsWith('trash-drive-folder-') ||
+          item.id.startsWith('trash-drive-moved-storage-folder-') ||
+          metaParts.some((part) => part === '폴더' || part === '?대뜑');
+        return {
+          id: item.id,
+          type: isFolder ? 'F' : metaParts[0] || 'DOC',
+          title: item.title,
+          subtitle: item.meta,
+          fullPath: getTrashDriveFolderPath(item.meta),
+        };
+      })
+    : [];
+  const movedDriveTrashItems = storageDriveTrashFolder === driveRootPath ? mappedSummaryDriveTrashItems : [];
+  const driveTrashUniverse = [...getAllStorageDriveTrashItems(), ...mappedSummaryDriveTrashItems]
+    .filter((item) => !isHiddenFromCurrentList(item.id));
+  const driveTrashItems: StorageDriveItem[] = mode === 'storageDriveTrash'
+    ? [...getStorageDriveTrashItemsForFolder(storageDriveTrashFolder), ...movedDriveTrashItems]
+        .filter((item) => !isHiddenFromCurrentList(item.id))
+    : [];
+  const activeItems = mode === 'storageDriveTrash' ? driveTrashItems : isTrash ? trashItems : isDrive ? visibleDriveItems : visibleMailItems;
+  const mailPagedSourceItems = !isDrive ? (isTrash ? trashItems : visibleMailItems) : [];
+  const storagePageSize = 20;
+  const totalStoragePages = Math.max(1, Math.ceil(mailPagedSourceItems.length / storagePageSize));
+  const safeStoragePage = Math.min(storagePage, totalStoragePages - 1);
+  const storagePageStart = mailPagedSourceItems.length ? safeStoragePage * storagePageSize : 0;
+  const storagePageEnd = Math.min(mailPagedSourceItems.length, storagePageStart + storagePageSize);
+  const pagedMailItems = mailPagedSourceItems.slice(storagePageStart, storagePageEnd);
+  const canGoPrevStoragePage = safeStoragePage > 0;
+  const canGoNextStoragePage = safeStoragePage < totalStoragePages - 1;
   const ids = activeItems.map((item) => item.id);
-  const allChecked = ids.every((id) => checked[`${prefix}:${id}`] ?? true);
-  const selectedItems = activeItems.filter((item) => checked[`${prefix}:${item.id}`] ?? true);
+  const isItemChecked = (id: string) => checked[`${prefix}:${id}`] ?? false;
+  const getStorageDriveSelectionIds = (item: StorageDriveItem) => {
+    if (item.type !== 'F' || !item.fullPath) return [item.id];
+    return storageDriveUniverse
+      .filter((candidate) => candidate.id === item.id || Boolean(candidate.fullPath && (candidate.fullPath === item.fullPath || candidate.fullPath.startsWith(`${item.fullPath} ›`))))
+      .map((candidate) => candidate.id);
+  };
+  const isStorageDriveItemChecked = (item: StorageDriveItem) => getStorageDriveSelectionIds(item).every(isItemChecked);
+  const getStorageDriveTrashSelectionIds = (item: StorageDriveItem) => {
+    if (item.type !== 'F' || !item.fullPath) return [item.id];
+    return driveTrashUniverse
+      .filter((candidate) => candidate.id === item.id || Boolean(candidate.fullPath && (candidate.fullPath === item.fullPath || candidate.fullPath.startsWith(`${item.fullPath} ›`))))
+      .map((candidate) => candidate.id);
+  };
+  const isStorageDriveTrashItemChecked = (item: StorageDriveItem) => getStorageDriveTrashSelectionIds(item).every(isItemChecked);
+  const activeSelectionIds = isDrive && !isTrash
+    ? Array.from(new Set((activeItems as StorageDriveItem[]).flatMap(getStorageDriveSelectionIds)))
+    : mode === 'storageDriveTrash'
+      ? Array.from(new Set((activeItems as StorageDriveItem[]).flatMap(getStorageDriveTrashSelectionIds)))
+      : ids;
+  const allChecked = activeSelectionIds.length > 0 && activeSelectionIds.every(isItemChecked);
+  const selectedItems = isDrive && !isTrash
+    ? storageDriveUniverse.filter((item) => !isHiddenFromCurrentList(item.id) && isItemChecked(item.id))
+    : mode === 'storageDriveTrash'
+      ? driveTrashUniverse.filter((item) => !isHiddenFromCurrentList(item.id) && isItemChecked(item.id))
+    : activeItems.filter((item) => isItemChecked(item.id));
+  const selectedActiveItemCount = activeSelectionIds.filter(isItemChecked).length;
   const selectedStorageSize = selectedItems.reduce((sum, item) => {
     const sizeText = 'meta' in item ? `${item.subtitle} ${item.meta}` : item.subtitle;
     return sum + extractStorageSizeMB(sizeText);
   }, 0);
   const selectedStorageSizeLabel = formatDataSize(selectedStorageSize);
-  const openMoveSheet = (item: StorageDriveItem) => {
-    setMovingDriveItem(item);
+
+  useEffect(() => {
+    setStoragePage(0);
+  }, [mode, storageDriveFolder]);
+
+  useEffect(() => {
+    if (storagePage !== safeStoragePage) {
+      setStoragePage(safeStoragePage);
+    }
+  }, [safeStoragePage, storagePage]);
+
+  useEffect(() => {
+    if (!selectionMode && selectedActiveItemCount > 0) {
+      setSelectionMode(true);
+      return;
+    }
+    if (selectionMode && !selectedActiveItemCount) {
+      setSelectionMode(false);
+    }
+  }, [selectionMode, selectedActiveItemCount]);
+
+  const openMailStorageDetail = (item: StorageMailItem) => openStorageDetail({ title: item.subtitle, meta: item.meta, source: 'mail' });
+  const openDriveStorageDetail = (item: StorageDriveItem) => openStorageDetail({ title: item.title, meta: item.subtitle, source: 'drive' });
+  const openDriveStorageItem = (item: StorageDriveItem) => {
+    if (item.type === 'F' && item.fullPath) {
+      setStorageDriveFolder(item.fullPath);
+      return;
+    }
+    openDriveStorageDetail(item);
   };
-  const closeMoveSheet = () => setMovingDriveItem(null);
-  const getMoveTargetFolders = (item: StorageDriveItem) => {
-    const currentPath = item.fullPath ?? '';
-    const currentParent = item.type === 'F' ? getDriveParentPath(currentPath) : currentPath;
-    return Array.from(new Set([driveRootPath, ...driveFolderOptions.map((folder) => folder.name)]))
-      .filter((folder) => folder !== currentParent)
-      .filter((folder) => item.type !== 'F' || (folder !== currentPath && !folder.startsWith(`${currentPath} ›`)));
+  const openDriveTrashItem = (item: StorageDriveItem) => {
+    if (item.type === 'F' && item.fullPath) {
+      setStorageDriveTrashFolder(item.fullPath);
+      return;
+    }
+    openDriveStorageDetail(item);
   };
-  const moveDriveItem = (targetFolder: string) => {
-    if (!movingDriveItem) return;
-    setStorageDriveMoveTargets((items) => {
-      return { ...items, [movingDriveItem.id]: targetFolder };
-    });
-    setMovingDriveItem(null);
-    showToast(`${movingDriveItem.title}을 ${getDriveFolderName(targetFolder)} 폴더로 이동했어요`);
+  const enterSelectionMode = (id: string) => {
+    setSelectionMode(true);
+    toggle(`${prefix}:${id}`);
+  };
+  const toggleStorageDriveItemSelection = (item: StorageDriveItem) => {
+    const selectionIds = getStorageDriveSelectionIds(item);
+    setSelectionMode(true);
+    setAll(prefix, selectionIds);
+  };
+  const toggleStorageDriveTrashItemSelection = (item: StorageDriveItem) => {
+    const selectionIds = getStorageDriveTrashSelectionIds(item);
+    setSelectionMode(true);
+    setAll(prefix, selectionIds);
+  };
+  const toggleAllActiveStorageItems = () => {
+    setAll(prefix, activeSelectionIds);
+    if (allChecked) {
+      setSelectionMode(false);
+    }
   };
   const openDeleteSheet = (modeToOpen: 'trash' | 'permanent') => {
     if (!selectedItems.length) {
@@ -4341,13 +5031,13 @@ function StorageScreen({
 
   return (
     <View style={styles.modalScreenRoot}>
-    <ScreenShell title="정리함" subtitle="저장 데이터를 확인하고 관리합니다" hideBack>
-      <View style={styles.segment}>
-        <Pressable style={[styles.segmentItem, !isDrive && styles.segmentActive]} onPress={goMail}>
-          <Text style={[styles.segmentText, !isDrive && styles.segmentTextActive]}>메일</Text>
+    <ScreenShell title="정리함" titleIcon="storage" hideBack tightBottom disableScroll>
+      <View style={styles.storagePrimaryTabs}>
+        <Pressable style={[styles.storagePrimaryTab, !isDrive && styles.storagePrimaryTabActive]} onPress={goMail}>
+          <Text style={[styles.storagePrimaryTabText, !isDrive && styles.storagePrimaryTabTextActive]}>메일</Text>
         </Pressable>
-        <Pressable style={[styles.segmentItem, isDrive && styles.segmentActive]} onPress={goDrive}>
-          <Text style={[styles.segmentText, isDrive && styles.segmentTextActive]}>Drive</Text>
+        <Pressable style={[styles.storagePrimaryTab, isDrive && styles.storagePrimaryTabActive]} onPress={goDrive}>
+          <Text style={[styles.storagePrimaryTabText, isDrive && styles.storagePrimaryTabTextActive]}>Drive</Text>
         </Pressable>
       </View>
       <View style={styles.segment}>
@@ -4360,97 +5050,163 @@ function StorageScreen({
       </View>
       {!serviceConnected ? (
         <PermissionRevokedCard onPress={onReconnect} />
-      ) : scan ? (
+      ) : (
         <>
           <View style={styles.storageSummaryBar}>
             <Text style={styles.storageSummaryText}>
-              {isTrash ? `휴지통 ${trashItems.length}개` : isDrive ? `Drive ${visibleDriveItems.length}개` : `메일 ${visibleMailItems.length}개`}
+              {mode === 'storageDriveTrash' ? `Drive 휴지통 ${driveTrashItems.length}개` : isTrash ? `휴지통 ${trashItems.length}개` : isDrive ? `Drive ${visibleDriveItems.length}개` : `메일 ${visibleMailItems.length}개`}
             </Text>
             <Pressable onPress={openFilter} hitSlop={8}>
               <Text style={styles.storageFilterText}>필터/정렬</Text>
             </Pressable>
           </View>
-          {isDrive && !isTrash ? (
-            <View style={styles.storagePathCard}>
-              <View style={styles.storageBreadcrumbRow}>
-                {storageDriveBreadcrumbs.map((crumb, index) => (
-                  <React.Fragment key={crumb.path}>
-                    <Pressable onPress={() => setStorageDriveFolder(crumb.path)} hitSlop={8}>
-                      <Text style={[styles.storageBreadcrumbText, index === storageDriveBreadcrumbs.length - 1 && styles.storageBreadcrumbCurrent]}>
-                        {crumb.label}
-                      </Text>
-                    </Pressable>
-                    {index < storageDriveBreadcrumbs.length - 1 ? <Text style={styles.storageBreadcrumbDivider}>›</Text> : null}
-                  </React.Fragment>
-                ))}
-              </View>
-            </View>
-          ) : null}
           {!activeItems.length ? (
             <EmptyState
               title={isTrash ? '휴지통이 비어있어요' : isDrive ? '현재 폴더가 비어있어요' : '메일이 없어요'}
               desc={isDrive && !isTrash ? '이 위치 아래에 표시할 폴더나 파일이 없어요.' : '현재 표시할 항목이 없어요.'}
             />
-          ) : !isDrive && !isTrash ? (
-            <GmailStoragePanel
-              items={visibleMailItems}
-              checked={checked}
-              prefix={prefix}
-              toggle={toggle}
-            />
-          ) : isTrash
-            ? trashItems.map((item) => (
-                <StorageMailCard
-                  key={item.id}
-                  prefix={prefix}
-                  item={item}
-                  checked={checked[`${prefix}:${item.id}`] ?? true}
-                  toggle={toggle}
-                />
-              ))
-            : isDrive
-              ? visibleDriveItems.map((item) => (
-                  <StorageDriveCard
-                    key={item.id}
-                    prefix={prefix}
-                    item={item}
-                    checked={checked[`${prefix}:${item.id}`] ?? true}
-                    toggle={toggle}
-                    onMoveStart={() => openMoveSheet(item)}
-                    onOpenFolder={item.type === 'F' && item.fullPath ? () => setStorageDriveFolder(item.fullPath as string) : undefined}
-                  />
-              ))
-              : visibleMailItems.map((item) => (
-                  <StorageMailCard
-                    key={item.id}
-                    prefix={prefix}
-                    item={item}
-                    checked={checked[`${prefix}:${item.id}`] ?? true}
-                    toggle={toggle}
-                  />
-                ))}
+          ) : (
+              <View style={styles.storageListBox}>
+                {isDrive ? (
+                  <View style={styles.storagePathCard}>
+                    <View style={styles.storageBreadcrumbRow}>
+                      {storageDriveBreadcrumbs.map((crumb, index) => (
+                        <React.Fragment key={crumb.path}>
+                          <Pressable
+                            onPress={() => {
+                              if (mode === 'storageDriveTrash') {
+                                setStorageDriveTrashFolder(crumb.path);
+                                return;
+                              }
+                              setStorageDriveFolder(crumb.path);
+                            }}
+                            hitSlop={8}
+                          >
+                            <Text style={[styles.storageBreadcrumbText, index === storageDriveBreadcrumbs.length - 1 && styles.storageBreadcrumbCurrent]}>
+                              {crumb.label}
+                            </Text>
+                          </Pressable>
+                          {index < storageDriveBreadcrumbs.length - 1 ? <Text style={styles.storageBreadcrumbDivider}>›</Text> : null}
+                        </React.Fragment>
+                      ))}
+                    </View>
+                  </View>
+                ) : null}
+                {!isDrive ? (
+                  <View style={[styles.storagePathCard, styles.storagePagerCard]}>
+                    <Text style={styles.storagePagerText}>
+                      {mailPagedSourceItems.length}개 중 {storagePageStart + 1}~{storagePageEnd}개
+                    </Text>
+                    <View style={styles.storagePagerButtons}>
+                      <Pressable
+                        style={[styles.storagePagerButton, !canGoPrevStoragePage && styles.storagePagerButtonDisabled]}
+                        onPress={() => {
+                          if (canGoPrevStoragePage) setStoragePage((page) => Math.max(0, page - 1));
+                        }}
+                      >
+                        <Text style={[styles.storagePagerGlyph, !canGoPrevStoragePage && styles.storagePagerGlyphDisabled]}>‹</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.storagePagerButton, !canGoNextStoragePage && styles.storagePagerButtonDisabled]}
+                        onPress={() => {
+                          if (canGoNextStoragePage) setStoragePage((page) => Math.min(totalStoragePages - 1, page + 1));
+                        }}
+                      >
+                        <Text style={[styles.storagePagerGlyph, !canGoNextStoragePage && styles.storagePagerGlyphDisabled]}>›</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ) : null}
+                {activeItems.length && selectionMode ? (
+                  <Pressable style={styles.storageSelectAllRowInBox} onPress={toggleAllActiveStorageItems}>
+                    <CheckBox checked={allChecked} onPress={toggleAllActiveStorageItems} compact />
+                    <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택'}</Text>
+                  </Pressable>
+                ) : null}
+                <ScrollView
+                  style={styles.storageListScroll}
+                  contentContainerStyle={styles.storageListContent}
+                  nestedScrollEnabled
+                  showsVerticalScrollIndicator={(isDrive ? activeItems.length : pagedMailItems.length) > 5}
+                >
+                  {mode === 'storageDriveTrash'
+                    ? driveTrashItems.map((item) => (
+                        <StorageDriveCard
+                          key={item.id}
+                          prefix={prefix}
+                          item={item}
+                          checked={isStorageDriveTrashItemChecked(item)}
+                          toggle={toggle}
+                          selectionMode={selectionMode}
+                          onOpen={() => openDriveTrashItem(item)}
+                          onLongSelect={() => toggleStorageDriveTrashItemSelection(item)}
+                          onSelect={() => toggleStorageDriveTrashItemSelection(item)}
+                          descriptionOverride={getTrashDriveFolderPath(item.subtitle)}
+                          rightSizeLabel={getStorageSizeLabel(item.subtitle)}
+                          rightSizeDanger={extractStorageSizeMB(item.subtitle) >= 500}
+                          compact
+                        />
+                      ))
+                    : isTrash
+                    ? pagedMailItems.map((item) => (
+                        <StorageMailCard
+                          key={item.id}
+                          prefix={prefix}
+                          item={item}
+                          checked={isItemChecked(item.id)}
+                          toggle={toggle}
+                          selectionMode={selectionMode}
+                          onOpen={openMailStorageDetail}
+                          onLongSelect={enterSelectionMode}
+                          compact
+                          trashMode="mail"
+                        />
+                      ))
+                    : isDrive
+                      ? visibleDriveItems.map((item) => (
+                        <StorageDriveCard
+                          key={item.id}
+                          prefix={prefix}
+                          item={item}
+                          checked={isStorageDriveItemChecked(item)}
+                          toggle={toggle}
+                          selectionMode={selectionMode}
+                          onOpen={() => openDriveStorageItem(item)}
+                          onLongSelect={() => toggleStorageDriveItemSelection(item)}
+                          onSelect={() => toggleStorageDriveItemSelection(item)}
+                          compact
+                        />
+                      ))
+                      : pagedMailItems.map((item) => (
+                        <StorageMailCard
+                          key={item.id}
+                          prefix={prefix}
+                          item={item}
+                          checked={isItemChecked(item.id)}
+                          toggle={toggle}
+                          selectionMode={selectionMode}
+                          onOpen={openMailStorageDetail}
+                          onLongSelect={enterSelectionMode}
+                          compact
+                        />
+                      ))}
+                </ScrollView>
+              </View>
+            )}
           {activeItems.length ? (
             <>
-              <Pressable style={styles.storageSelectAllRow} onPress={() => setAll(prefix, ids)}>
-                <CheckBox checked={allChecked} onPress={() => setAll(prefix, ids)} compact />
-                <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택하기'}</Text>
-              </Pressable>
               {isDrive && !isTrash ? (
                 <OutlineButton title="삭제하기" onPress={() => openDeleteSheet('trash')} />
               ) : (
-                <View style={styles.twoButtons}>
-                  <OutlineButton title={isTrash ? '복구하기' : '삭제하기'} onPress={() => (isTrash ? showToast('복구 기능은 발표용 화면에서는 실행하지 않아요') : openDeleteSheet('trash'))} half />
-                  <PrimaryButton title={isTrash ? '삭제하기' : '메일 읽기'} onPress={() => (isTrash ? openDeleteSheet('permanent') : showToast('메일 읽기는 발표용 화면에서는 실행하지 않아요'))} half />
-                </View>
+                <OutlineButton
+                  title="삭제하기"
+                  danger={isTrash}
+                  onPress={() => (isTrash ? openDeleteSheet('permanent') : openDeleteSheet('trash'))}
+                />
               )}
             </>
           ) : null}
         </>
-      ) : (
-        <EmptyState
-          title="저장된 정리 데이터가 없어요"
-          desc="아직 스캔한 기록이 없어 정리함에 표시할 메일이나 파일이 없어요."
-        />
       )}
     </ScreenShell>
     {deleteSheetMode ? (
@@ -4464,14 +5220,6 @@ function StorageScreen({
         onConfirm={confirmStorageDelete}
       />
     ) : null}
-    {movingDriveItem ? (
-      <StorageMoveSheet
-        item={movingDriveItem}
-        folders={getMoveTargetFolders(movingDriveItem)}
-        onCancel={closeMoveSheet}
-        onMove={moveDriveItem}
-      />
-    ) : null}
     </View>
   );
 }
@@ -4482,9 +5230,7 @@ function PermissionRevokedCard({ onPress }: { onPress: () => void }) {
       <View style={styles.permissionRevokedIcon}>
         <Text style={styles.permissionRevokedIconText}>G</Text>
       </View>
-      <Text style={styles.permissionRevokedTitle}>Google 권한이 해제됐어요</Text>
-      <Text style={styles.permissionRevokedDesc}>메일과 Drive 목록 조회를 중단했습니다</Text>
-      <Text style={styles.permissionRevokedDesc}>다시 연결하면 저장소 화면을 계속 사용할 수 있어요</Text>
+      <Text style={styles.permissionRevokedTitle}>메일 또는 드라이브 접근 권한을 설정해주세요</Text>
       <PrimaryButton title="권한 연결 화면으로 이동" onPress={onPress} inline />
     </View>
   );
@@ -4522,22 +5268,12 @@ function StorageDeleteSheet({
     <View style={styles.storageDeleteOverlay}>
       <Pressable style={StyleSheet.absoluteFill} onPress={onCancel} />
       <BottomSheetPanel motion={sheetMotion} outputRange={[0, 360]} style={styles.storageDeleteSheet} onClose={onCancel}>
-        <View style={styles.rowBetween}>
-          <Text style={styles.storageDeleteTitle}>{permanent ? '영구 삭제할까요?' : '휴지통으로 이동할까요?'}</Text>
-          <Pressable onPress={onCancel} hitSlop={10}>
-            <Text style={styles.modalClose}>×</Text>
-          </Pressable>
-        </View>
+        <Text style={styles.storageDeleteTitle}>{permanent ? '영구 삭제할까요?' : '휴지통으로 이동할까요?'}</Text>
         <View style={permanent ? styles.storageDeleteWarningBox : styles.storageDeleteInfoBox}>
           <Text style={styles.storageDeleteWarningTitle}>{permanent ? '이 작업은 되돌릴 수 없습니다' : '휴지통으로 이동됩니다'}</Text>
           <Text style={styles.storageDeleteWarningText}>
             선택한 {count}개 · 총 {sizeLabel}가 {permanent ? '완전히 삭제됩니다' : '휴지통으로 이동됩니다'}
           </Text>
-        </View>
-        <View style={styles.storageDeleteSummaryBox}>
-          <Text style={styles.infoTitle}>삭제 대상 요약</Text>
-          <Text style={styles.infoDesc}>이동 일자 · 원래 유형 · 크기 · 복구 가능 여부 확인</Text>
-          <Text style={styles.infoDesc}>{permanent ? '성공/실패 결과는 삭제 이력에 분리 저장됩니다' : '휴지통에서는 복구하거나 영구 삭제할 수 있어요'}</Text>
         </View>
         <CheckLine
           label={permanent ? '영구 삭제 내용을 확인했습니다' : '휴지통 이동 내용을 확인했습니다'}
@@ -4581,14 +5317,9 @@ function StorageMoveSheet({
     <View style={styles.storageDeleteOverlay}>
       <Pressable style={StyleSheet.absoluteFill} onPress={onCancel} />
       <BottomSheetPanel motion={sheetMotion} outputRange={[0, 420]} style={styles.storageMoveSheet} onClose={onCancel}>
-        <View style={styles.rowBetween}>
-          <View style={styles.infoMain}>
-            <Text style={styles.storageDeleteTitle}>폴더 이동</Text>
-            <Text style={styles.infoDesc}>{item.title}을 이동할 위치를 선택하세요</Text>
-          </View>
-          <Pressable onPress={onCancel} hitSlop={10}>
-            <Text style={styles.modalClose}>×</Text>
-          </Pressable>
+        <View style={styles.infoMain}>
+          <Text style={styles.storageDeleteTitle}>폴더 이동</Text>
+          <Text style={styles.infoDesc}>{item.title}을 이동할 위치를 선택하세요</Text>
         </View>
         <View style={styles.storageMoveCurrentBox}>
           <Text style={styles.infoTitle}>{item.title}</Text>
@@ -4613,81 +5344,63 @@ function StorageMoveSheet({
   );
 }
 
-function GmailStoragePanel({
-  items,
-  checked,
-  prefix,
-  toggle,
-}: {
-  items: StorageMailItem[];
-  checked: Record<string, boolean>;
-  prefix: string;
-  toggle: (key: string) => void;
-}) {
-  return (
-    <View style={styles.gmailPanel}>
-      <View style={styles.gmailTopBar}>
-        <Text style={styles.gmailLogoMark}>M</Text>
-        <View style={styles.gmailSearchBox}>
-          <Text style={styles.searchIcon}>⌕</Text>
-          <Text style={styles.gmailSearchText}>메일 검색</Text>
-        </View>
-      </View>
-      <View style={styles.gmailMailboxRow}>
-        <View style={styles.gmailComposeButton}>
-          <Text style={styles.gmailComposeText}>✎ 편지쓰기</Text>
-        </View>
-        <View style={styles.gmailInboxPill}>
-          <Text style={styles.gmailInboxText}>받은편지함</Text>
-          <Text style={styles.gmailInboxCount}>{items.length}</Text>
-        </View>
-      </View>
-      <View style={styles.gmailActionBar}>
-        <CheckBox checked={items.every((item) => checked[`${prefix}:${item.id}`] ?? true)} onPress={() => {}} compact />
-        <Text style={styles.gmailActionText}>새로고침</Text>
-        <Text style={styles.gmailActionText}>더보기</Text>
-      </View>
-      <View style={styles.gmailList}>
-        {items.map((item) => (
-          <Pressable key={item.id} style={styles.gmailRow} onPress={() => toggle(`${prefix}:${item.id}`)}>
-            <CheckBox checked={checked[`${prefix}:${item.id}`] ?? true} onPress={() => toggle(`${prefix}:${item.id}`)} compact />
-            <Text style={styles.gmailStar}>☆</Text>
-            <View style={styles.gmailSenderWrap}>
-              <Text style={styles.gmailSender} numberOfLines={1}>{item.title}</Text>
-            </View>
-            <View style={styles.gmailSubjectWrap}>
-              <Text style={styles.gmailSubject} numberOfLines={1}>{item.subtitle}</Text>
-              <Text style={styles.gmailMeta} numberOfLines={1}>{item.meta}</Text>
-            </View>
-          </Pressable>
-        ))}
-      </View>
-    </View>
-  );
-}
-
 function StorageMailCard({
   prefix,
   item,
   checked,
   toggle,
+  selectionMode,
+  onOpen,
+  onLongSelect,
+  compact,
+  trashMode,
 }: {
   prefix: string;
   item: { id: string; title: string; subtitle: string; meta: string; badge?: string };
   checked: boolean;
   toggle: (key: string) => void;
+  selectionMode: boolean;
+  onOpen: (item: StorageMailItem) => void;
+  onLongSelect: (id: string) => void;
+  compact?: boolean;
+  trashMode?: 'mail' | 'drive';
 }) {
+  const key = `${prefix}:${item.id}`;
+  const storageSizeMB = extractStorageSizeMB(item.meta);
+  const rightSizeLabel = trashMode ? getStorageSizeLabel(item.meta) : '';
+  const isLargeTrashDriveItem = trashMode === 'drive' && storageSizeMB >= 500;
+  const compactTitle = trashMode === 'drive' ? item.title : item.subtitle;
+  const compactDescription = trashMode === 'drive' ? getTrashDriveFolderPath(item.meta) : item.title;
   return (
-    <Pressable style={styles.storageItemCard} onPress={() => toggle(`${prefix}:${item.id}`)}>
-      <CheckBox checked={checked} onPress={() => toggle(`${prefix}:${item.id}`)} compact />
+    <Pressable
+      style={[styles.storageItemCard, compact && styles.storageItemCardCompact]}
+      onPress={() => {
+        if (selectionMode) {
+          toggle(key);
+          return;
+        }
+        onOpen(item);
+      }}
+      onLongPress={() => onLongSelect(item.id)}
+      delayLongPress={420}
+    >
+      {selectionMode ? <CheckBox checked={checked} onPress={() => toggle(key)} compact /> : null}
       <View style={styles.infoMain}>
-        <View style={styles.storageTitleRow}>
-          <Text style={styles.infoTitle}>{item.title}</Text>
+        <View style={[styles.storageTitleRow, compact && styles.storageTitleRowCompact]}>
+          <Text style={styles.infoTitle} numberOfLines={1}>{compact ? compactTitle : item.subtitle}</Text>
         </View>
-        <Text style={styles.storageSubtitle}>{item.subtitle}</Text>
-        <Text style={styles.infoDesc}>{item.meta}</Text>
+        {compact ? <Text style={styles.storageCompactMeta} numberOfLines={1}>{compactDescription}</Text> : <Text style={styles.infoDesc}>{item.meta}</Text>}
       </View>
-      <Text style={styles.chevron}>›</Text>
+      {rightSizeLabel ? <Text style={[styles.storageRightSize, isLargeTrashDriveItem && styles.storageRightSizeDanger]}>{rightSizeLabel}</Text> : null}
+      <Pressable
+        style={styles.storageChevronButton}
+        onPress={(event) => {
+          event.stopPropagation?.();
+          onOpen(item);
+        }}
+      >
+        <Text style={styles.chevron}>›</Text>
+      </Pressable>
     </Pressable>
   );
 }
@@ -4697,43 +5410,103 @@ function StorageDriveCard({
   item,
   checked,
   toggle,
-  onMoveStart,
-  onOpenFolder,
+  selectionMode,
+  onOpen,
+  onLongSelect,
+  onSelect,
+  compact,
+  descriptionOverride,
+  rightSizeLabel,
+  rightSizeDanger,
 }: {
   prefix: string;
   item: StorageDriveItem;
   checked: boolean;
   toggle: (key: string) => void;
-  onMoveStart: () => void;
-  onOpenFolder?: () => void;
+  selectionMode: boolean;
+  onOpen: () => void;
+  onLongSelect: () => void;
+  onSelect?: () => void;
+  compact?: boolean;
+  descriptionOverride?: string;
+  rightSizeLabel?: string;
+  rightSizeDanger?: boolean;
 }) {
   const isFolder = item.type === 'F';
-  const icon = isFolder ? '▰' : item.type === 'PDF' ? 'PDF' : item.type === 'ZIP' ? 'ZIP' : item.type === 'JPG' ? 'IMG' : 'DOC';
+  const icon = item.type === 'PDF' ? 'PDF' : item.type === 'ZIP' ? 'ZIP' : item.type === 'JPG' ? 'IMG' : 'DOC';
+  const key = `${prefix}:${item.id}`;
+  const handleSelect = () => {
+    if (onSelect) {
+      onSelect();
+      return;
+    }
+    toggle(key);
+  };
   return (
-    <View style={styles.storageItemCard}>
-      <CheckBox checked={checked} onPress={() => toggle(`${prefix}:${item.id}`)} compact />
-      <Pressable
+    <Pressable
+      style={[styles.storageItemCard, compact && styles.storageItemCardCompact]}
+      onPress={() => {
+        if (selectionMode) {
+          handleSelect();
+          return;
+        }
+        onOpen();
+      }}
+      onLongPress={onLongSelect}
+      delayLongPress={420}
+    >
+      {selectionMode ? <CheckBox checked={checked} onPress={handleSelect} compact /> : null}
+      <View
         style={styles.storageDriveItemPressArea}
-        onPress={() => toggle(`${prefix}:${item.id}`)}
-        onLongPress={onMoveStart}
-        delayLongPress={420}
       >
-        <View style={[styles.fileTypeIcon, isFolder && styles.folderTypeIcon]}>
-          <Text style={[styles.fileTypeText, isFolder && styles.folderTypeText]}>{icon}</Text>
-        </View>
+        {isFolder ? (
+          <Text style={styles.storageFolderEmoji}>📁</Text>
+        ) : (
+          <View style={styles.fileTypeIcon}>
+            <Text style={styles.fileTypeText}>{icon}</Text>
+          </View>
+        )}
         <View style={styles.infoMain}>
           <Text style={styles.infoTitle}>{item.title}</Text>
-          <Text style={styles.infoDesc}>{item.subtitle}</Text>
+          {descriptionOverride ? (
+            <Text style={styles.storageCompactMeta} numberOfLines={1}>{descriptionOverride}</Text>
+          ) : compact ? null : (
+            <Text style={styles.infoDesc}>{item.subtitle}</Text>
+          )}
         </View>
-      </Pressable>
-      {isFolder && onOpenFolder ? (
-        <Pressable style={styles.storageFolderOpenButton} onPress={onOpenFolder} hitSlop={10}>
-          <Text style={styles.chevron}>›</Text>
-        </Pressable>
-      ) : (
+      </View>
+      {rightSizeLabel ? <Text style={[styles.storageRightSize, rightSizeDanger && styles.storageRightSizeDanger]}>{rightSizeLabel}</Text> : null}
+      <Pressable
+        style={styles.storageChevronButton}
+        onPress={(event) => {
+          event.stopPropagation?.();
+          onOpen();
+        }}
+      >
         <Text style={styles.chevron}>›</Text>
+      </Pressable>
+    </Pressable>
+  );
+}
+
+function ProtectedListScreen({ items, onOpenItem }: { items: ScanListItem[]; onOpenItem: (item: ScanListItem) => void }) {
+  return (
+    <ScreenShell title="보호된 항목">
+      {items.length ? (
+        items.map((item) => (
+          <Pressable key={`${item.source}:${item.id}`} style={styles.listCard} onPress={() => onOpenItem(item)}>
+            <View style={[styles.statusLight, styles.statusLightGreen]} />
+            <View style={styles.infoMain}>
+              <Text style={styles.infoTitle}>{item.title}</Text>
+              <Text style={styles.infoDesc}>{item.source === 'mail' ? 'Gmail' : 'Drive'} · 제외 키워드 보호</Text>
+            </View>
+            <Text style={styles.chevron}>›</Text>
+          </Pressable>
+        ))
+      ) : (
+        <EmptyState title="보호된 항목이 없어요" desc="제외 키워드와 일치한 항목이 있으면 이곳에 표시돼요." />
       )}
-    </View>
+    </ScreenShell>
   );
 }
 
@@ -4746,6 +5519,7 @@ function ListScreen({
   setAll,
   goNext,
   openFilter,
+  notice,
   onOpenItem,
 }: {
   title: string;
@@ -4756,28 +5530,29 @@ function ListScreen({
   setAll: (prefix: string, keys: string[]) => void;
   goNext: () => void;
   openFilter: () => void;
+  notice?: string;
   onOpenItem?: (item: ScanListItem) => void;
 }) {
-  const allChecked = items.every((item) => checked[`${prefix}:${item.id}`] ?? true);
-  const selectedItems = items.filter((item) => checked[`${prefix}:${item.id}`] ?? true);
+  const allChecked = items.every((item) => checked[`${prefix}:${item.id}`] ?? isDefaultCandidateSelected(prefix, item.id));
+  const selectedItems = items.filter((item) => checked[`${prefix}:${item.id}`] ?? isDefaultCandidateSelected(prefix, item.id));
   const selectedCount = selectedItems.length;
   const selectedSizeLabel = formatDataSize(sumScanItemSize(selectedItems));
 
   return (
-    <ScreenShell title={title} subtitle="삭제하지 않을 항목만 체크 해제">
+    <ScreenShell title={title}>
+      {notice ? <Text style={styles.listNoticeText}>{notice}</Text> : null}
       <Pressable style={styles.selectAllRow} onPress={() => setAll(prefix, items.map((item) => item.id))}>
         <CheckBox checked={allChecked} onPress={() => setAll(prefix, items.map((item) => item.id))} />
-        <Text style={styles.selectAllText}>전체 선택됨</Text>
+        <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택'}</Text>
         <Pressable onPress={openFilter} hitSlop={8}>
           <Text style={styles.filterText}>필터</Text>
         </Pressable>
       </Pressable>
       {items.map((item) => (
         <Pressable key={item.id} style={styles.listCard} onPress={() => (onOpenItem ? onOpenItem(item) : toggle(`${prefix}:${item.id}`))}>
-          <CheckBox checked={checked[`${prefix}:${item.id}`] ?? true} onPress={() => toggle(`${prefix}:${item.id}`)} />
+          <CheckBox checked={checked[`${prefix}:${item.id}`] ?? isDefaultCandidateSelected(prefix, item.id)} onPress={() => toggle(`${prefix}:${item.id}`)} />
           <View style={styles.infoMain}>
             <Text style={styles.infoTitle}>{item.title}</Text>
-            <Text style={styles.infoDesc}>{item.desc}</Text>
           </View>
           <Text style={styles.chevron}>›</Text>
         </Pressable>
@@ -4811,11 +5586,13 @@ function CheckBox({ checked, onPress, compact }: { checked: boolean; onPress: ()
   );
 }
 
-function ServiceLinkRow({ letter, title, connected, onPress }: { letter: string; title: string; connected: boolean; onPress: () => void }) {
+function ServiceLinkRow({ service, title, connected, onPress }: { service: 'gmail' | 'drive'; title: string; connected: boolean; onPress: () => void }) {
+  const iconSource = service === 'gmail' ? gmailIcon : googleDriveIcon;
+
   return (
     <Pressable style={styles.serviceLinkRow} onPress={onPress}>
       <View style={styles.serviceIconBox}>
-        <Text style={styles.serviceIconText}>{letter}</Text>
+        <Image source={iconSource} style={styles.serviceIconImage} resizeMode="contain" />
       </View>
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
@@ -4837,7 +5614,7 @@ function ToggleRow({
   tint,
 }: {
   title: string;
-  desc: string;
+  desc?: string;
   value: boolean;
   onPress: () => void;
   plain?: boolean;
@@ -4866,7 +5643,7 @@ function ToggleRow({
     <Pressable style={[styles.toggleRow, plain && styles.toggleRowPlain, tint && styles.toggleRowTint]} onPress={onPress}>
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
-        <Text style={styles.infoDesc}>{desc}</Text>
+        {desc ? <Text style={styles.infoDesc}>{desc}</Text> : null}
       </View>
       <Animated.View style={[styles.toggle, { backgroundColor: trackColor }]}>
         <Animated.View style={[styles.toggleKnob, { transform: [{ translateX: knobTranslate }] }]} />
@@ -4883,10 +5660,10 @@ function PrimaryButton({ title, onPress, half, inline }: { title: string; onPres
   );
 }
 
-function OutlineButton({ title, onPress, half }: { title: string; onPress: () => void; half?: boolean }) {
+function OutlineButton({ title, onPress, half, danger }: { title: string; onPress: () => void; half?: boolean; danger?: boolean }) {
   return (
-    <Pressable style={[styles.outlineButton, half && styles.halfButton]} onPress={onPress}>
-      <Text style={styles.outlineText}>{title}</Text>
+    <Pressable style={[styles.outlineButton, danger && styles.outlineButtonDanger, half && styles.halfButton]} onPress={onPress}>
+      <Text style={[styles.outlineText, danger && styles.outlineTextDanger]}>{title}</Text>
     </Pressable>
   );
 }
@@ -4961,13 +5738,11 @@ function EmptyState({ title, desc }: { title: string; desc: string }) {
 }
 
 function GhostScanAnimation({ onDone, skip }: { onDone: () => void; skip?: boolean }) {
-  const scan = useRef(new Animated.Value(skip ? 1 : 0)).current;
   const [foundStep, setFoundStep] = useState(skip ? 2 : 0);
   const doneCalled = useRef(false);
 
   useEffect(() => {
     if (skip) {
-      scan.setValue(1);
       setFoundStep(2);
       return;
     }
@@ -4981,12 +5756,6 @@ function GhostScanAnimation({ onDone, skip }: { onDone: () => void; skip?: boole
       }
     }, 1850);
 
-    Animated.timing(scan, {
-      toValue: 1,
-      duration: 1650,
-      useNativeDriver: false,
-    }).start();
-
     return () => {
       clearTimeout(firstTimer);
       clearTimeout(secondTimer);
@@ -4997,35 +5766,25 @@ function GhostScanAnimation({ onDone, skip }: { onDone: () => void; skip?: boole
   return (
     <View style={styles.ghostPreviewCard}>
       <View style={styles.ghostPreviewHeader}>
-        <Text style={styles.ghostPreviewTitle}>AURA Scan</Text>
-        <Text style={styles.ghostPreviewPercent}>{foundStep >= 2 ? '후보 24개' : '분석 중'}</Text>
+        <Text style={styles.ghostPreviewTitle}>분석 결과 요약</Text>
+        <Text style={styles.ghostPreviewPercent}>{foundStep >= 2 ? '완료' : '분석 중'}</Text>
+      </View>
+      <View style={styles.onboardingMetricGrid}>
+        <View style={styles.onboardingMetricCard}>
+          <Text style={styles.onboardingMetricLabel}>정리 후보</Text>
+          <Text style={styles.onboardingMetricValue}>{foundStep >= 2 ? '124개' : '...'}</Text>
+        </View>
+        <View style={styles.onboardingMetricCard}>
+          <Text style={styles.onboardingMetricLabel}>예상 확보</Text>
+          <Text style={styles.onboardingMetricValue}>{foundStep >= 2 ? '2.1GB' : '...'}</Text>
+        </View>
       </View>
       <View style={styles.ghostDataPanel}>
-        <Animated.View
-          style={[
-            styles.ghostScanBeam,
-            {
-              transform: [
-                {
-                  translateY: scan.interpolate({
-                    inputRange: [0, 1],
-                    outputRange: [0, 122],
-                  }),
-                },
-              ],
-            },
-          ]}
-        />
-        <GhostDataRow label="프로모션 메일" meta="4년 전 · 18MB" active={foundStep >= 1} />
-        <GhostDataRow label="중복 이미지" meta="Drive · 320MB" active={foundStep >= 2} />
-        <GhostDataRow label="오래된 첨부파일" meta="3년 전 · 84MB" active={foundStep >= 1} />
-      </View>
-      <View style={styles.ghostCandidateRow}>
-        <Text style={styles.ghostCandidateIcon}>👻</Text>
-        <View style={styles.infoMain}>
-          <Text style={styles.ghostCandidateTitle}>정리 후보 발견</Text>
-          <Text style={styles.ghostCandidateDesc}>메일·파일 메타데이터를 기준으로 선별</Text>
-        </View>
+        <GhostDataRow label="광고·프로모션 메일" meta="42개 · 320MB" active={foundStep >= 1} />
+        <GhostDataRow label="오래된 메일" meta="31개 · 280MB" active={foundStep >= 1} />
+        <GhostDataRow label="중복 파일" meta="18개 · 1.1GB" active={foundStep >= 2} />
+        <GhostDataRow label="대용량 파일" meta="33개 · 400MB" active={foundStep >= 2} />
+        <Text style={styles.ghostProtectedText}>제외 키워드 보호 대상 확인</Text>
       </View>
     </View>
   );
@@ -5039,21 +5798,17 @@ function GhostDataRow({ label, meta, active }: { label: string; meta: string; ac
         <Text style={styles.ghostDataLabel}>{label}</Text>
         <Text style={styles.ghostDataMeta}>{meta}</Text>
       </View>
-      <Text style={[styles.ghostDataStatus, active && styles.ghostDataStatusActive]}>{active ? '후보' : '대기'}</Text>
+      <Text style={[styles.ghostDataStatus, active && styles.ghostDataStatusActive]}>{active ? '›' : '...'}</Text>
     </View>
   );
 }
 
 function CarbonSaveAnimation({ onDone, skip }: { onDone: () => void; skip?: boolean }) {
-  const fill = useRef(new Animated.Value(skip ? 1 : 0)).current;
-  const leaf = useRef(new Animated.Value(0)).current;
   const [step, setStep] = useState(skip ? 2 : 0);
   const doneCalled = useRef(false);
 
   useEffect(() => {
     if (skip) {
-      fill.setValue(1);
-      leaf.setValue(0);
       setStep(2);
       return;
     }
@@ -5067,77 +5822,98 @@ function CarbonSaveAnimation({ onDone, skip }: { onDone: () => void; skip?: bool
       }
     }, 1850);
 
-    Animated.timing(fill, {
-      toValue: 1,
-      duration: 1600,
-      useNativeDriver: false,
-    }).start();
-
-    const leafLoop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(leaf, {
-          toValue: 1,
-          duration: 760,
-          useNativeDriver: false,
-        }),
-        Animated.timing(leaf, {
-          toValue: 0,
-          duration: 760,
-          useNativeDriver: false,
-        }),
-      ])
-    );
-    leafLoop.start();
-
     return () => {
       clearTimeout(firstTimer);
       clearTimeout(secondTimer);
       clearTimeout(doneTimer);
-      leafLoop.stop();
     };
   }, [skip]);
 
   return (
     <View style={styles.carbonPreviewCard}>
       <View style={styles.carbonTopRow}>
-        <Text style={styles.carbonTopLabel}>삭제 용량</Text>
-        <Text style={styles.carbonTopValue}>{step >= 1 ? '2.1GB' : '계산 중'}</Text>
+        <Text style={styles.carbonTopLabel}>스캔 이력</Text>
       </View>
-      <View style={styles.carbonMeterTrack}>
-        <Animated.View
-          style={[
-            styles.carbonMeterFill,
-            {
-              width: fill.interpolate({
-                inputRange: [0, 1],
-                outputRange: ['8%', '78%'],
-              }),
-            },
-          ]}
-        />
+      <View style={styles.historyTotalMiniCard}>
+        <View>
+          <Text style={styles.onboardingMetricLabel}>전체 누적 정리 용량</Text>
+          <Text style={styles.historyTotalMiniValue}>{step >= 1 ? '6.8GB' : '...'}</Text>
+        </View>
+        <View style={styles.historyMiniPill}>
+          <Text style={styles.historyMiniPillText}>최근 스캔 +2.6GB</Text>
+        </View>
       </View>
-      <View style={styles.carbonResultCard}>
-        <Animated.Text
-          style={[
-            styles.carbonLeaf,
-            {
-              transform: [
-                {
-                  translateY: leaf.interpolate({
-                    inputRange: [0, 1],
-                    outputRange: [0, -5],
-                  }),
-                },
-              ],
-            },
-          ]}
-        >
-          🌱
-        </Animated.Text>
-        <Text style={styles.carbonResultNumber}>{step >= 2 ? '약 0.4g CO₂' : 'CO₂ 환산 중'}</Text>
-        <Text style={styles.carbonResultDesc}>정리 용량을 탄소 절감 지표로 변환</Text>
+      <View style={styles.historyGraphMiniCard}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.historyGraphMiniTitle}>스캔별 정리 용량</Text>
+          <Text style={styles.historyMiniUnit}>GB</Text>
+        </View>
+        <HistoryMiniLineChart />
       </View>
     </View>
+  );
+}
+
+function HistoryMiniLineChart() {
+  const chartPoints = [
+    { scan: '1회', label: '3.4GB', x: 58, y: 36, labelY: 19 },
+    { scan: '2회', label: '0.8GB', x: 126, y: 78, labelY: 99 },
+    { scan: '3회', label: '2.6GB', x: 194, y: 52, labelY: 35 },
+  ];
+
+  return (
+    <View style={styles.historyMiniSvgWrap}>
+      <Svg width="100%" height="100%" viewBox="0 0 230 122">
+        <Line x1="30" y1="18" x2="218" y2="18" stroke="#E3ECF1" strokeWidth="1.5" />
+        <Line x1="30" y1="58" x2="218" y2="58" stroke="#E3ECF1" strokeWidth="1.5" />
+        <Line x1="30" y1="98" x2="218" y2="98" stroke="#E3ECF1" strokeWidth="1.5" />
+        <SvgText x="16" y="18" fill="#6B8194" fontSize="10" fontWeight="900" textAnchor="middle">5</SvgText>
+        <SvgText x="16" y="58" fill="#6B8194" fontSize="10" fontWeight="900" textAnchor="middle">3</SvgText>
+        <SvgText x="16" y="98" fill="#6B8194" fontSize="10" fontWeight="900" textAnchor="middle">1</SvgText>
+        <Path
+          d="M58 36 L126 78 L194 52"
+          fill="none"
+          stroke={navy}
+          strokeWidth="4.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        {chartPoints.map((point) => (
+          <React.Fragment key={point.scan}>
+            <SvgText x={point.x} y={point.labelY} fill={navy} fontSize="10.5" fontWeight="900" textAnchor="middle">
+              {point.label}
+            </SvgText>
+            <Circle cx={point.x} cy={point.y} r="5.5" fill={navy} stroke="#FFFFFF" strokeWidth="2" />
+            <SvgText x={point.x} y="117" fill="#49677C" fontSize="10" fontWeight="900" textAnchor="middle">
+              {point.scan}
+            </SvgText>
+          </React.Fragment>
+        ))}
+      </Svg>
+    </View>
+  );
+}
+
+function StorageDetailScreen({ item }: { item: StorageDetailItem | null }) {
+  if (!item) {
+    return (
+      <ScreenShell title="상세 보기">
+        <EmptyState title="상세 정보를 불러올 항목이 없어요" desc="정리함 목록에서 항목을 다시 선택해 주세요." />
+      </ScreenShell>
+    );
+  }
+
+  return (
+    <ScreenShell title="상세 보기">
+      <Text style={styles.detailMainTitle}>{item.title}</Text>
+      <View style={styles.itemPreviewBox}>
+        <Text style={styles.itemPreviewText}>{item.source === 'mail' ? 'Gmail 메타데이터' : 'Drive 메타데이터'}</Text>
+      </View>
+      <View style={styles.detailInfoBox}>
+        <Text style={styles.detailInfoTitle}>메타데이터</Text>
+        <Text style={styles.detailInfoText}>{item.meta}</Text>
+      </View>
+    </ScreenShell>
   );
 }
 
@@ -5150,28 +5926,29 @@ function CenterIcon({ label }: { label: string }) {
 }
 
 function ConnectedInfoRow({
+  service,
   title,
-  desc,
   status,
   visible,
 }: {
+  service: 'gmail' | 'drive';
   title: string;
-  desc: string;
   status: '연결됨' | '연결안됨';
   visible: boolean;
 }) {
   const connectedInstant = useContext(NavigationContext)?.connectedInstant ?? false;
+  const iconSource = service === 'gmail' ? gmailIcon : googleDriveIcon;
 
   return (
     <View style={styles.infoRow}>
+      <Image source={iconSource} style={styles.connectedServiceIcon} resizeMode="contain" />
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
-        <Text style={styles.infoDesc}>{desc}</Text>
       </View>
       <View style={styles.connectedRightSlot}>
         {visible ? (
           <RevealIn duration={connectedInstant ? 0 : 460} distance={connectedInstant ? 0 : 7}>
-            <Text style={[styles.rowRight, status === '연결안됨' && styles.rowRightMuted]}>{status}</Text>
+            <View style={[styles.statusLight, status === '연결됨' ? styles.statusLightGreen : styles.statusLightRed]} />
           </RevealIn>
         ) : null}
       </View>
@@ -5454,15 +6231,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
   },
   header: {
-    height: 76,
-    paddingTop: 2,
+    height: 72,
+    paddingTop: 0,
     paddingHorizontal: 18,
-    borderBottomWidth: 1,
-    borderBottomColor: line,
-    justifyContent: 'flex-start',
+    borderBottomWidth: 0,
+    justifyContent: 'center',
   },
   headerNoBack: {
-    height: 82,
+    height: 72,
     borderBottomWidth: 0,
   },
   statusOnly: {
@@ -5496,19 +6272,18 @@ const styles = StyleSheet.create({
     backgroundColor: text,
   },
   headerTitleRow: {
-    marginTop: 8,
+    height: 38,
     flexDirection: 'row',
-    alignItems: 'flex-start',
+    alignItems: 'center',
     gap: 18,
   },
   headerTitleRowNoBack: {
     marginLeft: 8,
-    marginTop: 8,
   },
   headerInsetRule: {
     height: 1,
     backgroundColor: line,
-    marginTop: 15,
+    marginTop: 8,
   },
   headerTitleRowSingle: {
     alignItems: 'center',
@@ -5528,8 +6303,23 @@ const styles = StyleSheet.create({
   },
   headerText: {
     flex: 1,
+    minWidth: 0,
+  },
+  headerTitleContent: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+  },
+  headerTitleIcon: {
+    width: 27,
+    height: 27,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   title: {
+    flexShrink: 1,
     color: text,
     fontSize: 21,
     lineHeight: 27,
@@ -5560,7 +6350,10 @@ const styles = StyleSheet.create({
     paddingTop: 10,
   },
   contentInnerTightBottom: {
-    paddingBottom: 18,
+    paddingBottom: 32,
+  },
+  resultBottomSpacer: {
+    height: 20,
   },
   heroSpacer: {
     height: 78,
@@ -5637,10 +6430,16 @@ const styles = StyleSheet.create({
     marginTop: 8,
     backgroundColor: '#FFFFFF',
   },
+  outlineButtonDanger: {
+    borderColor: '#D92F36',
+  },
   outlineText: {
     color: navy,
     fontSize: 15,
     fontWeight: '900',
+  },
+  outlineTextDanger: {
+    color: '#D92F36',
   },
   halfButton: {
     flex: 1,
@@ -5818,6 +6617,33 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     paddingHorizontal: 15,
   },
+  capacityCardRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 14,
+  },
+  capacityUsageBox: {
+    width: 116,
+    gap: 8,
+  },
+  capacityUsageText: {
+    color: navy,
+    textAlign: 'right',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  capacityUsageTrack: {
+    height: 9,
+    borderRadius: 9,
+    backgroundColor: '#D8E5EC',
+    overflow: 'hidden',
+  },
+  capacityUsageFill: {
+    height: '100%',
+    borderRadius: 9,
+    backgroundColor: navy,
+  },
   homeActionSpacer: {
     height: 0,
   },
@@ -5826,20 +6652,58 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingVertical: 15,
   },
+  homeSummaryValue: {
+    color: text,
+    textAlign: 'right',
+    fontSize: 25,
+    fontWeight: '900',
+  },
+  homeSummaryCapacityLabel: {
+    minWidth: 110,
+    color: text,
+    fontSize: 18,
+    lineHeight: 24,
+    fontWeight: '900',
+  },
+  homeTrashButton: {
+    height: 42,
+    minWidth: 172,
+    paddingHorizontal: 22,
+    alignSelf: 'center',
+    marginTop: 6,
+    borderRadius: 10,
+    borderWidth: 1.6,
+    borderColor: navy,
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  homeTrashButtonText: {
+    color: navy,
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  homeTrashGuide: {
+    color: '#49677C',
+    textAlign: 'center',
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '800',
+  },
   homeEmptySummary: {
-    minHeight: 78,
+    minHeight: 64,
     borderRadius: 12,
     backgroundColor: 'rgba(255,255,255,0.55)',
     borderWidth: 1,
     borderColor: '#C9DBE5',
     paddingHorizontal: 12,
-    paddingVertical: 12,
+    paddingVertical: 10,
     justifyContent: 'center',
-    gap: 6,
+    gap: 8,
   },
   homeEmptyTitle: {
     color: text,
-    fontSize: 14,
+    fontSize: 17,
     fontWeight: '900',
   },
   homeEmptyDesc: {
@@ -5890,6 +6754,13 @@ const styles = StyleSheet.create({
     gap: 12,
     backgroundColor: '#FFFFFF',
   },
+  permissionDetailButton: {
+    width: 42,
+    height: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: -8,
+  },
   permissionFeatureCard: {
     minHeight: 70,
     borderWidth: 1,
@@ -5936,6 +6807,13 @@ const styles = StyleSheet.create({
     paddingVertical: 20,
     gap: 18,
     minHeight: 390,
+  },
+  pushPermissionReasonCard: {
+    marginTop: 0,
+    paddingHorizontal: 18,
+    paddingVertical: 16,
+    gap: 14,
+    minHeight: 0,
   },
   permissionReasonSection: {
     gap: 9,
@@ -6002,6 +6880,9 @@ const styles = StyleSheet.create({
     flex: 1,
     minHeight: 120,
   },
+  pushPermissionButtonSpacer: {
+    height: 18,
+  },
   centerTitle: {
     color: text,
     textAlign: 'center',
@@ -6058,10 +6939,26 @@ const styles = StyleSheet.create({
     height: 50,
   },
   connectedRightSlot: {
-    width: 64,
+    width: 34,
     minHeight: 18,
     alignItems: 'flex-end',
     justifyContent: 'center',
+  },
+  statusLight: {
+    width: 11,
+    height: 11,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.85)',
+  },
+  statusLightGreen: {
+    backgroundColor: '#2EB872',
+  },
+  statusLightRed: {
+    backgroundColor: '#D94A4A',
+  },
+  statusLightYellow: {
+    backgroundColor: '#F0C342',
   },
   centerBody: {
     color: text,
@@ -6151,6 +7048,26 @@ const styles = StyleSheet.create({
     marginTop: 'auto',
     height: 50,
   },
+  onboardingDescriptionRow: {
+    minHeight: 58,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+    gap: 10,
+    alignSelf: 'stretch',
+    paddingLeft: 42,
+    paddingRight: 24,
+    marginVertical: 18,
+  },
+  onboardingDescriptionIcon: {
+    fontSize: 24,
+    lineHeight: 28,
+  },
+  onboardingDescriptionText: {
+    flexShrink: 1,
+    marginVertical: 0,
+    textAlign: 'left',
+  },
   auraFeelReveal: {
     minHeight: 58,
     alignItems: 'center',
@@ -6177,8 +7094,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: line,
     backgroundColor: '#F4FBF8',
-    padding: 15,
-    gap: 10,
+    padding: 12,
+    gap: 8,
     overflow: 'hidden',
   },
   ghostPreviewHeader: {
@@ -6196,34 +7113,49 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '900',
   },
+  onboardingMetricGrid: {
+    height: 48,
+    flexDirection: 'row',
+    gap: 8,
+  },
+  onboardingMetricCard: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#C9DBE5',
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    justifyContent: 'center',
+    gap: 3,
+  },
+  onboardingMetricLabel: {
+    color: '#315A73',
+    fontSize: 9.5,
+    fontWeight: '900',
+  },
+  onboardingMetricValue: {
+    color: text,
+    fontSize: 15,
+    fontWeight: '900',
+  },
   ghostDataPanel: {
-    height: 136,
+    flex: 1,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: '#C9DBE5',
     backgroundColor: '#FFFFFF',
-    padding: 10,
-    gap: 8,
+    padding: 8,
+    gap: 5,
     overflow: 'hidden',
   },
-  ghostScanBeam: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    top: 8,
-    height: 28,
-    backgroundColor: 'rgba(38, 177, 145, 0.16)',
-    borderTopWidth: 1,
-    borderBottomWidth: 1,
-    borderColor: 'rgba(38, 177, 145, 0.34)',
-  },
   ghostDataRow: {
-    minHeight: 34,
-    borderRadius: 9,
-    paddingHorizontal: 9,
+    minHeight: 24,
+    borderRadius: 7,
+    paddingHorizontal: 8,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 7,
     backgroundColor: '#F7FAFC',
   },
   ghostDataRowActive: {
@@ -6232,9 +7164,9 @@ const styles = StyleSheet.create({
     borderColor: '#B6DCCE',
   },
   ghostDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
     backgroundColor: '#B4C7D4',
   },
   ghostDotActive: {
@@ -6242,21 +7174,30 @@ const styles = StyleSheet.create({
   },
   ghostDataLabel: {
     color: text,
-    fontSize: 12,
+    fontSize: 10.5,
     fontWeight: '900',
   },
   ghostDataMeta: {
     color: '#5D7588',
-    fontSize: 10,
+    fontSize: 9,
     fontWeight: '800',
   },
   ghostDataStatus: {
     color: '#7C93A3',
-    fontSize: 10,
+    fontSize: 17,
+    lineHeight: 18,
     fontWeight: '900',
   },
   ghostDataStatusActive: {
     color: navy,
+  },
+  ghostProtectedText: {
+    alignSelf: 'center',
+    color: navy,
+    fontSize: 9.5,
+    lineHeight: 12,
+    fontWeight: '900',
+    textDecorationLine: 'underline',
   },
   ghostCandidateRow: {
     minHeight: 48,
@@ -6283,13 +7224,13 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   carbonPreviewCard: {
-    height: 228,
+    height: 254,
     borderRadius: 16,
     borderWidth: 1,
     borderColor: line,
     backgroundColor: '#F4FBF8',
-    padding: 18,
-    gap: 16,
+    padding: 12,
+    gap: 8,
     overflow: 'hidden',
   },
   carbonTopRow: {
@@ -6299,13 +7240,160 @@ const styles = StyleSheet.create({
   },
   carbonTopLabel: {
     color: text,
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '900',
   },
-  carbonTopValue: {
-    color: navy,
+  historyTotalMiniCard: {
+    minHeight: 46,
+    borderWidth: 1,
+    borderColor: '#C9DBE5',
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  historyTotalMiniValue: {
+    color: text,
     fontSize: 16,
     fontWeight: '900',
+  },
+  historyMiniPill: {
+    minHeight: 24,
+    borderRadius: 12,
+    backgroundColor: '#DDF4FB',
+    paddingHorizontal: 9,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  historyMiniPillText: {
+    color: navy,
+    fontSize: 9,
+    fontWeight: '900',
+  },
+  historyGraphMiniCard: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#C9DBE5',
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    gap: 8,
+  },
+  historyGraphMiniTitle: {
+    color: text,
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  historyMiniUnit: {
+    color: '#49677C',
+    fontSize: 9,
+    fontWeight: '900',
+  },
+  historyMiniSvgWrap: {
+    flex: 1,
+    minHeight: 112,
+  },
+  historyMiniGraphArea: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    gap: 6,
+  },
+  historyMiniYAxis: {
+    width: 17,
+    justifyContent: 'space-between',
+    paddingTop: 5,
+    paddingBottom: 14,
+  },
+  historyMiniAxisText: {
+    color: '#6B8194',
+    fontSize: 8,
+    fontWeight: '900',
+    textAlign: 'right',
+  },
+  historyMiniPlot: {
+    flex: 1,
+    position: 'relative',
+    borderBottomWidth: 1,
+    borderBottomColor: '#C9DBE5',
+    height: 112,
+  },
+  historyMiniGridTop: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 8,
+    height: 1,
+    backgroundColor: '#E3ECF1',
+  },
+  historyMiniGridMiddle: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 48,
+    height: 1,
+    backgroundColor: '#E3ECF1',
+  },
+  historyMiniGridBottom: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 88,
+    height: 1,
+    backgroundColor: '#E3ECF1',
+  },
+  historyMiniLineLayer: {
+    position: 'absolute',
+    left: 10,
+    top: 8,
+    width: 196,
+    height: 88,
+  },
+  historyMiniLineSegment: {
+    position: 'absolute',
+    height: 2.5,
+    borderRadius: 3,
+    backgroundColor: navy,
+    transformOrigin: '0px 1.25px',
+  },
+  historyMiniPointWrap: {
+    position: 'absolute',
+    width: 42,
+    alignItems: 'center',
+    gap: 3,
+  },
+  historyMiniPointValue: {
+    color: navy,
+    fontSize: 8.5,
+    fontWeight: '900',
+  },
+  historyMiniPoint: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: navy,
+    borderWidth: 1.5,
+    borderColor: '#FFFFFF',
+  },
+  historyMiniMonthLayer: {
+    position: 'absolute',
+    left: 10,
+    right: 0,
+    bottom: 0,
+    height: 14,
+  },
+  historyMiniMonthText: {
+    position: 'absolute',
+    width: 32,
+    color: '#49677C',
+    fontSize: 8.5,
+    fontWeight: '900',
+    textAlign: 'center',
   },
   carbonMeterTrack: {
     height: 16,
@@ -6544,20 +7632,31 @@ const styles = StyleSheet.create({
     backgroundColor: '#F7FBFF',
   },
   folderBreadcrumbCard: {
-    minHeight: 54,
-    borderWidth: 1,
-    borderColor: line,
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    backgroundColor: '#F7FBFF',
+    minHeight: 34,
+    paddingHorizontal: 4,
+    paddingVertical: 3,
     justifyContent: 'center',
+  },
+  folderBreadcrumbClickableRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  folderBreadcrumbRule: {
+    height: 1,
+    marginHorizontal: 7,
+    backgroundColor: line,
+  },
+  folderBreadcrumbDivider: {
+    color: text,
+    fontSize: 16,
+    fontWeight: '900',
   },
   folderBreadcrumbTitle: {
     color: navy,
-    fontSize: 13,
+    fontSize: 15,
     fontWeight: '900',
-    marginBottom: 3,
   },
   folderBreadcrumbText: {
     color: '#49677C',
@@ -6576,7 +7675,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   folderRow: {
-    minHeight: 72,
+    minHeight: 66,
     borderWidth: 1,
     borderColor: line,
     borderRadius: 10,
@@ -6590,6 +7689,12 @@ const styles = StyleSheet.create({
   folderRowSelected: {
     borderColor: navy,
     backgroundColor: pale,
+  },
+  folderRowEmoji: {
+    width: 28,
+    color: text,
+    fontSize: 22,
+    textAlign: 'center',
   },
   folderFileRow: {
     minHeight: 74,
@@ -6635,6 +7740,118 @@ const styles = StyleSheet.create({
     lineHeight: 28,
     fontWeight: '900',
     marginTop: -2,
+  },
+  folderTitleLine: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  folderTitleText: {
+    flex: 1,
+    color: text,
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  folderSizeText: {
+    color: '#49677C',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  monthConditionRow: {
+    minHeight: 76,
+    borderWidth: 1,
+    borderColor: line,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: '#FFFFFF',
+  },
+  monthStepper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  monthStepButton: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    borderWidth: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'transparent',
+  },
+  monthStepText: {
+    color: navy,
+    fontSize: 18,
+    lineHeight: 20,
+    fontWeight: '900',
+  },
+  sheetKeyboardAvoider: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    justifyContent: 'flex-end',
+  },
+  periodMonthSheet: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    bottom: 18,
+    borderRadius: 22,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    paddingBottom: 24,
+    gap: 14,
+    borderWidth: 1,
+    borderColor: '#C9DBE5',
+    shadowColor: '#000000',
+    shadowOpacity: 0.12,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: -4 },
+    elevation: 10,
+  },
+  keywordSheetDesc: {
+    textAlign: 'center',
+  },
+  periodMonthControl: {
+    minHeight: 58,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  periodMonthInputGroup: {
+    flex: 1,
+    minHeight: 52,
+    borderWidth: 1,
+    borderColor: line,
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  periodMonthInput: {
+    width: 44,
+    height: 36,
+    borderWidth: 1,
+    borderColor: '#C9DBE5',
+    borderRadius: 8,
+    backgroundColor: '#F7FBFD',
+    color: text,
+    fontSize: 17,
+    fontWeight: '900',
+    textAlign: 'center',
+    paddingHorizontal: 0,
+    paddingVertical: 0,
   },
   periodHeroCard: {
     minHeight: 70,
@@ -6968,6 +8185,13 @@ const styles = StyleSheet.create({
     height: '100%',
     backgroundColor: navy,
   },
+  listNoticeText: {
+    color: '#49677C',
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: '900',
+    marginBottom: 4,
+  },
   selectAllRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -7005,7 +8229,7 @@ const styles = StyleSheet.create({
   resultMetricGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 18,
+    gap: 12,
   },
   reviewMetricGrid: {
     flexDirection: 'row',
@@ -7016,13 +8240,13 @@ const styles = StyleSheet.create({
   resultMetricCard: {
     flex: 1,
     minWidth: 132,
-    minHeight: 84,
+    minHeight: 76,
     borderWidth: 1,
     borderColor: line,
     borderRadius: 10,
     backgroundColor: pale,
     paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingVertical: 12,
     justifyContent: 'center',
     gap: 8,
   },
@@ -7037,9 +8261,21 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 8,
   },
+  recentHeroHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 14,
+  },
   recentHeroDate: {
     color: text,
     fontSize: 22,
+    fontWeight: '900',
+  },
+  recentHeroSizeValue: {
+    color: text,
+    textAlign: 'right',
+    fontSize: 30,
     fontWeight: '900',
   },
   recentResultRow: {
@@ -7239,13 +8475,22 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 16,
-    paddingVertical: 13,
-    gap: 7,
+    paddingVertical: 14,
+    justifyContent: 'center',
   },
   recentCleanupTopRow: {
     flexDirection: 'row',
-    alignItems: 'flex-start',
+    alignItems: 'center',
     gap: 11,
+  },
+  recentCleanupSizeValue: {
+    minWidth: 116,
+    marginLeft: 'auto',
+    color: text,
+    textAlign: 'right',
+    fontSize: 30,
+    lineHeight: 36,
+    fontWeight: '900',
   },
   carbonBasisHeaderRow: {
     flexDirection: 'row',
@@ -7336,16 +8581,24 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   resultCategoryCard: {
-    minHeight: 72,
+    minHeight: 54,
     borderWidth: 1,
     borderColor: line,
     borderRadius: 10,
     backgroundColor: pale,
-    paddingHorizontal: 16,
-    paddingVertical: 13,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: 9,
+  },
+  resultCategoryMeta: {
+    minWidth: 86,
+    color: '#49677C',
+    textAlign: 'right',
+    fontSize: 14.5,
+    lineHeight: 18,
+    fontWeight: '900',
   },
   reviewSummaryCard: {
     minHeight: 72,
@@ -7364,10 +8617,17 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   resultGuideText: {
-    marginTop: 18,
+    marginTop: 6,
     color: text,
     textAlign: 'center',
     fontSize: 13,
+    fontWeight: '900',
+    textDecorationLine: 'underline',
+  },
+  resultWarningText: {
+    color: '#C13A3A',
+    fontSize: 12,
+    lineHeight: 17,
     fontWeight: '900',
   },
   reviewWarningText: {
@@ -7439,6 +8699,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 12,
   },
+  deleteStatusRowDone: {
+    borderColor: '#7BC79B',
+  },
   deleteStatusText: {
     color: text,
     fontSize: 16,
@@ -7456,6 +8719,15 @@ const styles = StyleSheet.create({
     textAlign: 'right',
     fontSize: 13,
     fontWeight: '900',
+  },
+  remainingCapacityText: {
+    color: text,
+    textAlign: 'center',
+    fontSize: 16,
+    lineHeight: 22,
+    fontWeight: '900',
+    marginTop: -6,
+    marginBottom: 8,
   },
   cleanupCheckCircle: {
     width: 118,
@@ -7499,6 +8771,81 @@ const styles = StyleSheet.create({
     color: text,
     fontSize: 22,
     fontWeight: '900',
+  },
+  cleanupCountCard: {
+    minHeight: 124,
+    gap: 12,
+  },
+  cleanupCountInnerRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  cleanupCountInnerCard: {
+    flex: 1,
+    minHeight: 58,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#D3E0E7',
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  cleanupCountLabel: {
+    color: '#49677C',
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  cleanupCountValue: {
+    color: text,
+    fontSize: 21,
+    fontWeight: '900',
+  },
+  cleanupCapacityCard: {
+    minHeight: 152,
+    gap: 13,
+  },
+  cleanupCapacityMetricRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  cleanupCapacityValue: {
+    color: text,
+    fontSize: 23,
+    fontWeight: '900',
+  },
+  cleanupDriveBarTrack: {
+    height: 18,
+    borderRadius: 18,
+    backgroundColor: '#DDE9EF',
+    overflow: 'hidden',
+    position: 'relative',
+  },
+  cleanupDriveCurrentBar: {
+    height: '100%',
+    borderTopLeftRadius: 18,
+    borderBottomLeftRadius: 18,
+    backgroundColor: navy,
+  },
+  cleanupDriveReclaimedBar: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    backgroundColor: '#E34242',
+  },
+  cleanupDriveTotalLabel: {
+    marginTop: -8,
+    color: '#49677C',
+    textAlign: 'right',
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  cleanupButtonSpacer: {
+    flex: 1,
+    minHeight: 44,
   },
   carbonStandardCard: {
     minHeight: 60,
@@ -7547,6 +8894,34 @@ const styles = StyleSheet.create({
   segmentTextActive: {
     color: '#FFFFFF',
   },
+  storagePrimaryTabs: {
+    height: 48,
+    marginTop: -10,
+    flexDirection: 'row',
+    borderWidth: 1,
+    borderColor: line,
+    borderRadius: 10,
+    overflow: 'hidden',
+    backgroundColor: '#FFFFFF',
+  },
+  storagePrimaryTab: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRightWidth: 1,
+    borderRightColor: line,
+  },
+  storagePrimaryTabActive: {
+    backgroundColor: navy,
+  },
+  storagePrimaryTabText: {
+    color: text,
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  storagePrimaryTabTextActive: {
+    color: '#FFFFFF',
+  },
   storageSummaryBar: {
     minHeight: 50,
     borderWidth: 1,
@@ -7571,13 +8946,35 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   storagePathCard: {
-    minHeight: 52,
+    minHeight: 44,
     borderWidth: 1,
     borderColor: line,
     borderRadius: 10,
     backgroundColor: pale,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     justifyContent: 'center',
+  },
+  folderListBox: {
+    borderWidth: 1,
+    borderColor: line,
+    borderRadius: 12,
+    backgroundColor: '#F5FAFC',
+    padding: 7,
+    gap: 7,
+  },
+  folderListScroll: {
+    maxHeight: 268,
+  },
+  folderListContent: {
+    gap: 8,
+    paddingBottom: 2,
+  },
+  storagePagerCard: {
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 7,
   },
   storageBreadcrumbRow: {
     flexDirection: 'row',
@@ -7611,17 +9008,107 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 12,
   },
+  storageItemCardCompact: {
+    minHeight: 56,
+    paddingVertical: 8,
+  },
+  storageListBox: {
+    height: 302,
+    borderWidth: 1,
+    borderColor: line,
+    borderRadius: 12,
+    backgroundColor: '#F5FAFC',
+    padding: 7,
+    gap: 7,
+  },
+  storageListScroll: {
+    flex: 1,
+  },
+  storageListContent: {
+    gap: 8,
+    paddingBottom: 1,
+  },
+  storagePagerRow: {
+    minHeight: 32,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 8,
+    paddingHorizontal: 2,
+  },
+  storagePagerText: {
+    color: text,
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  storagePagerButtons: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+  },
+  storagePagerButton: {
+    width: 30,
+    height: 30,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  storagePagerButtonDisabled: {
+    opacity: 0.42,
+  },
+  storagePagerGlyph: {
+    color: text,
+    fontSize: 25,
+    lineHeight: 27,
+    fontWeight: '900',
+  },
+  storagePagerGlyphDisabled: {
+    color: '#8FA2B0',
+  },
   storageDriveItemPressArea: {
     flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
   },
+  storageFolderEmoji: {
+    width: 34,
+    color: text,
+    fontSize: 24,
+    lineHeight: 30,
+    textAlign: 'center',
+  },
+  storageChevronButton: {
+    width: 38,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: -8,
+  },
   storageTitleRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
     flexWrap: 'wrap',
+  },
+  storageTitleRowCompact: {
+    marginTop: -2,
+  },
+  storageCompactMeta: {
+    color: '#49677C',
+    fontSize: 11.5,
+    lineHeight: 15,
+    fontWeight: '800',
+    marginTop: 2,
+  },
+  storageRightSize: {
+    minWidth: 48,
+    color: '#49677C',
+    fontSize: 12,
+    fontWeight: '900',
+    textAlign: 'right',
+  },
+  storageRightSizeDanger: {
+    color: '#C13A3A',
   },
   storageSubtitle: {
     color: text,
@@ -7648,13 +9135,12 @@ const styles = StyleSheet.create({
     fontSize: 10.5,
     fontWeight: '900',
   },
-  storageSelectAllRow: {
-    minHeight: 40,
+  storageSelectAllRowInBox: {
+    minHeight: 34,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    paddingHorizontal: 28,
-    marginTop: 22,
+    paddingHorizontal: 4,
   },
   permissionRevokedCard: {
     marginTop: 26,
@@ -7726,6 +9212,7 @@ const styles = StyleSheet.create({
   },
   storageDeleteTitle: {
     color: text,
+    textAlign: 'center',
     fontSize: 22,
     lineHeight: 29,
     fontWeight: '900',
@@ -7774,134 +9261,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#E4312B',
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  gmailPanel: {
-    borderWidth: 1,
-    borderColor: line,
-    borderRadius: 14,
-    backgroundColor: '#F6F8FC',
-    overflow: 'hidden',
-  },
-  gmailTopBar: {
-    minHeight: 56,
-    paddingHorizontal: 12,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-  },
-  gmailLogoMark: {
-    color: '#D93025',
-    fontSize: 23,
-    fontWeight: '900',
-  },
-  gmailSearchBox: {
-    flex: 1,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#EAF1FB',
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    gap: 8,
-  },
-  gmailSearchText: {
-    color: '#5F6B7A',
-    fontSize: 13,
-    fontWeight: '800',
-  },
-  gmailMailboxRow: {
-    paddingHorizontal: 10,
-    paddingBottom: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  gmailComposeButton: {
-    height: 40,
-    borderRadius: 13,
-    backgroundColor: '#C2E7FF',
-    paddingHorizontal: 12,
-    justifyContent: 'center',
-  },
-  gmailComposeText: {
-    color: text,
-    fontSize: 12,
-    fontWeight: '900',
-  },
-  gmailInboxPill: {
-    flex: 1,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#D3E3FD',
-    paddingHorizontal: 12,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  gmailInboxText: {
-    color: text,
-    fontSize: 12,
-    fontWeight: '900',
-  },
-  gmailInboxCount: {
-    color: text,
-    fontSize: 11,
-    fontWeight: '900',
-  },
-  gmailActionBar: {
-    height: 38,
-    borderTopWidth: 1,
-    borderBottomWidth: 1,
-    borderColor: '#E1E7EF',
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 12,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 14,
-  },
-  gmailActionText: {
-    color: '#4D5C68',
-    fontSize: 11,
-    fontWeight: '900',
-  },
-  gmailList: {
-    backgroundColor: '#FFFFFF',
-  },
-  gmailRow: {
-    minHeight: 43,
-    borderBottomWidth: 1,
-    borderBottomColor: '#E7EBF0',
-    paddingHorizontal: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  gmailStar: {
-    color: '#AAB3BC',
-    fontSize: 18,
-    fontWeight: '900',
-  },
-  gmailSenderWrap: {
-    width: 70,
-  },
-  gmailSender: {
-    color: text,
-    fontSize: 12.5,
-    fontWeight: '900',
-  },
-  gmailSubjectWrap: {
-    flex: 1,
-  },
-  gmailSubject: {
-    color: text,
-    fontSize: 12.5,
-    fontWeight: '900',
-  },
-  gmailMeta: {
-    color: '#647281',
-    fontSize: 10.5,
-    fontWeight: '800',
-    marginTop: 1,
   },
   fileTypeIcon: {
     width: 34,
@@ -8138,19 +9497,20 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
   },
   serviceIconBox: {
-    width: 42,
-    height: 42,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: line,
-    backgroundColor: '#E3F5FC',
+    width: 46,
+    height: 46,
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  serviceIconText: {
-    color: navy,
-    fontSize: 18,
-    fontWeight: '900',
+  serviceIconImage: {
+    width: 34,
+    height: 34,
+  },
+  connectedServiceIcon: {
+    width: 28,
+    height: 28,
   },
   connectedPill: {
     alignSelf: 'flex-start',
@@ -8215,6 +9575,21 @@ const styles = StyleSheet.create({
   },
   settingsBottomSpacer: {
     height: 72,
+  },
+  privacyWithdrawButton: {
+    height: 50,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderColor: '#D92F36',
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 6,
+  },
+  privacyWithdrawText: {
+    color: '#D92F36',
+    fontSize: 15,
+    fontWeight: '900',
   },
   summaryTintCard: {
     minHeight: 76,
@@ -8422,6 +9797,7 @@ const styles = StyleSheet.create({
   },
   modalTitle: {
     color: text,
+    textAlign: 'center',
     fontSize: 20,
     fontWeight: '900',
   },
@@ -8541,28 +9917,28 @@ const styles = StyleSheet.create({
     transform: [{ translateX: 20 }],
   },
   bottomNav: {
-    height: 72,
+    height: 64,
     borderTopWidth: 1,
     borderTopColor: line,
     flexDirection: 'row',
     backgroundColor: '#FFFFFF',
-    paddingHorizontal: 22,
+    paddingHorizontal: 12,
   },
   navButton: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 5,
+    gap: 3,
   },
   navIconFrame: {
-    width: 26,
-    height: 24,
+    width: 24,
+    height: 22,
     alignItems: 'center',
     justifyContent: 'center',
   },
   navLabel: {
     color: '#315A73',
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '900',
   },
   navLabelActive: {
@@ -8572,8 +9948,8 @@ const styles = StyleSheet.create({
     backgroundColor: navy,
   },
   navHomeImage: {
-    width: 22,
-    height: 22,
+    width: 20,
+    height: 20,
   },
   navHomeImageInactive: {
     opacity: 0.72,
@@ -8667,6 +10043,80 @@ const styles = StyleSheet.create({
     height: 5.4,
     borderRadius: 2,
     backgroundColor: '#2F6686',
+  },
+  navHistoryWrap: {
+    width: 22,
+    height: 22,
+    borderWidth: 2,
+    borderColor: '#2F6686',
+    borderRadius: 5,
+    paddingHorizontal: 4,
+    paddingVertical: 4,
+    justifyContent: 'space-between',
+    backgroundColor: '#FFFFFF',
+  },
+  navHistoryWrapActive: {
+    borderColor: navy,
+    backgroundColor: '#EAF7F2',
+  },
+  navHistoryLine: {
+    height: 2,
+    borderRadius: 2,
+    backgroundColor: '#2F6686',
+  },
+  navHistoryChart: {
+    width: 23,
+    height: 20,
+    position: 'relative',
+  },
+  navHistoryAxis: {
+    position: 'absolute',
+    left: 2,
+    right: 1,
+    bottom: 3,
+    height: 2.2,
+    borderRadius: 2,
+    backgroundColor: '#2F6686',
+  },
+  navHistorySegment: {
+    position: 'absolute',
+    height: 3,
+    borderRadius: 3,
+    backgroundColor: '#2F6686',
+  },
+  navHistorySegmentOne: {
+    left: 4,
+    bottom: 7,
+    width: 9.5,
+    transform: [{ rotate: '-28deg' }],
+  },
+  navHistorySegmentTwo: {
+    right: 3,
+    bottom: 10,
+    width: 10.5,
+    transform: [{ rotate: '34deg' }],
+  },
+  navHistoryDot: {
+    position: 'absolute',
+    width: 4.6,
+    height: 4.6,
+    borderRadius: 3,
+    backgroundColor: '#2F6686',
+  },
+  navHistoryDotOne: {
+    left: 2.5,
+    bottom: 6,
+  },
+  navHistoryDotTwo: {
+    left: 10,
+    bottom: 10.5,
+  },
+  navHistoryDotThree: {
+    right: 1.5,
+    bottom: 15,
+  },
+  navHistoryActiveFill: {
+    backgroundColor: navy,
   },
   navGearWrap: {
     width: 24,
