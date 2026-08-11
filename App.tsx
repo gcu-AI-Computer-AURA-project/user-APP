@@ -23,7 +23,11 @@ import AntDesign from '@expo/vector-icons/AntDesign';
 import Feather from '@expo/vector-icons/Feather';
 import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
 import { LineChart } from 'react-native-chart-kit';
-import Svg, { Defs, LinearGradient as SvgLinearGradient, Stop, Text as SvgText } from 'react-native-svg';
+import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
+import { authApi } from './src/api/auth';
+import { GOOGLE_OAUTH_REDIRECT_URI } from './src/api/config';
+import { userApi } from './src/api/user';
+import type { AuraPlatform, AuraServicePermissions, AuraUser } from './src/api/types';
 
 type Screen =
   | 'initial'
@@ -177,6 +181,12 @@ const formatMonthLabel = (monthIndex: number) => {
 const formatMonthShortLabel = (monthIndex: number) => {
   const { year, month } = getMonthParts(monthIndex);
   return `${`${year}`.slice(2)}.${`${month}`.padStart(2, '0')}`;
+};
+
+const getAuraPlatform = (): AuraPlatform => {
+  if (Platform.OS === 'ios') return 'IOS';
+  if (Platform.OS === 'android') return 'ANDROID';
+  return 'WEB';
 };
 
 const getMainTabForScreen = (screen: Screen): MainTab | null => {
@@ -818,6 +828,9 @@ export default function App() {
   const [privacyChecked, setPrivacyChecked] = useState(false);
   const [privacyDetailChecked, setPrivacyDetailChecked] = useState(false);
   const [permissions, setPermissions] = useState<PermissionState>({ gmail: false, drive: false, alarm: false });
+  const [apiAccessToken, setApiAccessToken] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<AuraUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
   const [permissionToast, setPermissionToast] = useState('');
   const [toastTarget, setToastTarget] = useState<Screen | null>(null);
   const [includeInput, setIncludeInput] = useState('');
@@ -1335,6 +1348,83 @@ export default function App() {
     }, duration);
   };
 
+  const applyApiUser = (user?: AuraUser | null) => {
+    if (!user) return;
+
+    setCurrentUser(user);
+
+    if (user.privacyConsentAgreed !== undefined) {
+      setPrivacyChecked(user.privacyConsentAgreed);
+      setPrivacyDetailChecked(user.privacyConsentAgreed);
+    }
+
+    if (user.permissions) {
+      setPermissions((items) => ({
+        ...items,
+        gmail: Boolean(user.permissions?.gmail ?? items.gmail),
+        drive: Boolean(user.permissions?.drive ?? items.drive),
+        alarm: Boolean(user.permissions?.alarm ?? items.alarm),
+      }));
+    }
+  };
+
+  const syncUserPermissions = async (nextPermissions: Partial<AuraServicePermissions>) => {
+    setPermissions((items) => ({ ...items, ...nextPermissions }));
+  };
+
+  const handleGoogleContinue = async () => {
+    if (!privacyChecked) {
+      showToast('개인정보 수집 및 분석 동의가 필요합니다');
+      return;
+    }
+
+    setAuthLoading(true);
+
+    try {
+      const authorizationCode = '';
+
+      if (!authorizationCode) {
+        showToast('Google OAuth authorization_code와 redirect URI 연결이 필요해요');
+        go('permissions');
+        return;
+      }
+
+      const session = await authApi.loginWithGoogle({
+        authorization_code: authorizationCode,
+        redirect_uri: GOOGLE_OAUTH_REDIRECT_URI,
+        platform: getAuraPlatform(),
+      });
+
+      const nextAccessToken = session.accessToken ?? null;
+      setApiAccessToken(nextAccessToken);
+
+      if (session.user) {
+        applyApiUser(session.user);
+      } else if (nextAccessToken) {
+        const user = await userApi.getMe({ accessToken: nextAccessToken });
+        applyApiUser(user);
+      }
+
+      if (nextAccessToken && privacyChecked) {
+        await userApi.saveConsent(
+          {
+            is_privacy_agreed: true,
+            is_ai_analysis_agreed: true,
+            is_metadata_only_agreed: true,
+            is_user_approval_required_agreed: true,
+            consent_version: 'v1.0',
+          },
+          { accessToken: nextAccessToken }
+        );
+      }
+    } catch {
+      showToast('API 서버 연결 실패: 시연 모드로 계속합니다');
+    } finally {
+      setAuthLoading(false);
+      go('permissions');
+    }
+  };
+
   const showPermissionToast = () => {
     showToast('Gmail 또는 Google Drive의 접근 권한을 허용해주세요');
   };
@@ -1422,7 +1512,7 @@ export default function App() {
   };
 
   const completeLoginPermissionSetup = () => {
-    setPermissions((items) => ({ ...items, gmail: true, drive: true }));
+    void syncUserPermissions({ gmail: true, drive: true, alarm: permissions.alarm });
     if (!permissions.alarm) {
       setSettingsToggles((items) => ({ ...items, scanComplete: false, aiNudge: false }));
     }
@@ -2090,13 +2180,9 @@ export default function App() {
                 </View>
               </Pressable>
               <PrimaryButton
-                title="구글 계정으로 계속"
+                title={authLoading ? '\uB85C\uADF8\uC778 \uC5F0\uACB0 \uC911...' : '\uAD6C\uAE00 \uACC4\uC815\uC73C\uB85C \uACC4\uC18D'}
                 onPress={() => {
-                  if (!privacyChecked) {
-                    showToast('개인정보 수집 및 분석 동의가 필요합니다');
-                    return;
-                  }
-                  go('permissions');
+                  void handleGoogleContinue();
                 }}
                 inline
               />
@@ -2149,6 +2235,7 @@ export default function App() {
             screen={screen}
             back={back}
             setPermissions={setPermissions}
+            onServicePermissionChange={syncUserPermissions}
             requestPushPermission={requestPushPermission}
           />
         );
@@ -2988,7 +3075,7 @@ export default function App() {
           <ScreenShell title="설정" titleIcon="settings" hideBack tightBottom>
             <Pressable style={styles.settingsProfileCard} onPress={() => go('account')}>
               <View style={styles.infoMain}>
-                <Text style={styles.infoTitleLarge}>user@gmail.com</Text>
+                <Text style={styles.infoTitleLarge}>{currentUser?.email ?? 'user@gmail.com'}</Text>
                 <Text style={styles.profileConnectionText}>
                   Gmail {permissions.gmail ? '연결됨' : '연결안됨'} / Drive {permissions.drive ? '연결됨' : '연결안됨'}
                 </Text>
@@ -3037,8 +3124,8 @@ export default function App() {
                 <Text style={styles.avatarText}>U</Text>
               </View>
               <View style={styles.infoMain}>
-                <Text style={styles.profileConnectionText}>AURA 사용자</Text>
-                <Text style={styles.infoTitleLarge}>user@gmail.com</Text>
+                <Text style={styles.profileConnectionText}>{currentUser?.name ?? 'AURA 사용자'}</Text>
+                <Text style={styles.infoTitleLarge}>{currentUser?.email ?? 'user@gmail.com'}</Text>
               </View>
             </View>
 
@@ -4490,11 +4577,13 @@ function PermissionDetail({
   screen,
   back,
   setPermissions,
+  onServicePermissionChange,
   requestPushPermission,
 }: {
   screen: PermissionScreen;
   back: () => void;
   setPermissions: React.Dispatch<React.SetStateAction<PermissionState>>;
+  onServicePermissionChange: (nextPermissions: Partial<AuraServicePermissions>) => Promise<void>;
   requestPushPermission: () => Promise<boolean>;
 }) {
   const info = {
@@ -4606,11 +4695,15 @@ function PermissionDetail({
         title={info.button}
         onPress={() => {
           if (info.key === 'alarm') {
-            void requestPushPermission().then(() => back());
+            void requestPushPermission().then((allowed) => {
+              void onServicePermissionChange({ alarm: allowed });
+              back();
+            });
             return;
           }
 
           setPermissions((items) => ({ ...items, [info.key]: true }));
+          void onServicePermissionChange({ [info.key]: true });
           back();
         }}
       />
