@@ -19,6 +19,9 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { Circle, Line, Path, Text as SvgText } from 'react-native-svg';
+import { authApi } from './src/api/auth';
+import { userApi } from './src/api/user';
+import type { AuraServicePermissions, AuraUser } from './src/api/types';
 
 type Screen =
   | 'initial'
@@ -760,6 +763,9 @@ export default function App() {
   const [privacyChecked, setPrivacyChecked] = useState(false);
   const [privacyDetailChecked, setPrivacyDetailChecked] = useState(false);
   const [permissions, setPermissions] = useState<PermissionState>({ gmail: false, drive: false, alarm: false });
+  const [apiAccessToken, setApiAccessToken] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<AuraUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
   const [permissionToast, setPermissionToast] = useState('');
   const [toastTarget, setToastTarget] = useState<Screen | null>(null);
   const [includeInput, setIncludeInput] = useState('');
@@ -1271,6 +1277,69 @@ export default function App() {
     }, duration);
   };
 
+  const applyApiUser = (user?: AuraUser | null) => {
+    if (!user) return;
+
+    setCurrentUser(user);
+
+    if (user.privacyConsentAgreed !== undefined) {
+      setPrivacyChecked(user.privacyConsentAgreed);
+      setPrivacyDetailChecked(user.privacyConsentAgreed);
+    }
+
+    if (user.permissions) {
+      setPermissions((items) => ({
+        ...items,
+        gmail: Boolean(user.permissions?.gmail ?? items.gmail),
+        drive: Boolean(user.permissions?.drive ?? items.drive),
+        alarm: Boolean(user.permissions?.alarm ?? items.alarm),
+      }));
+    }
+  };
+
+  const syncUserPermissions = async (nextPermissions: Partial<AuraServicePermissions>) => {
+    setPermissions((items) => ({ ...items, ...nextPermissions }));
+
+    if (!apiAccessToken) return;
+
+    try {
+      const user = await userApi.updatePermissions(nextPermissions, { accessToken: apiAccessToken });
+      applyApiUser(user);
+    } catch {
+      showToast('권한 상태를 서버에 저장하지 못했어요');
+    }
+  };
+
+  const handleGoogleContinue = async () => {
+    if (!privacyChecked) {
+      showToast('개인정보 수집 및 분석 동의가 필요합니다');
+      return;
+    }
+
+    setAuthLoading(true);
+
+    try {
+      const session = await authApi.loginWithGoogle({
+        privacyConsentAgreed: privacyChecked,
+      });
+
+      const nextAccessToken = session.accessToken ?? null;
+      setApiAccessToken(nextAccessToken);
+
+      if (session.user) {
+        applyApiUser(session.user);
+      } else if (nextAccessToken) {
+        const user = await userApi.getMe({ accessToken: nextAccessToken });
+        applyApiUser(user);
+      }
+    } catch {
+      showToast('API 서버 연결 실패: 시연 모드로 계속합니다');
+    } finally {
+      setAuthLoading(false);
+      go('permissions');
+    }
+  };
+
   const showPermissionToast = () => {
     showToast('Gmail 또는 Google Drive의 접근 권한을 허용해주세요');
   };
@@ -1358,7 +1427,7 @@ export default function App() {
   };
 
   const completeLoginPermissionSetup = () => {
-    setPermissions((items) => ({ ...items, gmail: true, drive: true }));
+    void syncUserPermissions({ gmail: true, drive: true, alarm: permissions.alarm });
     if (!permissions.alarm) {
       setSettingsToggles((items) => ({ ...items, scanComplete: false, aiNudge: false }));
     }
@@ -2013,13 +2082,9 @@ export default function App() {
               </View>
             </Pressable>
             <PrimaryButton
-              title="구글 계정으로 계속"
+              title={authLoading ? '로그인 연결 중...' : '구글 계정으로 계속'}
               onPress={() => {
-                if (!privacyChecked) {
-                  showToast('개인정보 수집 및 분석 동의가 필요합니다');
-                  return;
-                }
-                go('permissions');
+                void handleGoogleContinue();
               }}
               inline
             />
@@ -2071,6 +2136,7 @@ export default function App() {
             screen={screen}
             back={back}
             setPermissions={setPermissions}
+            onServicePermissionChange={syncUserPermissions}
             requestPushPermission={requestPushPermission}
           />
         );
@@ -2912,7 +2978,7 @@ export default function App() {
           <ScreenShell title="설정" titleIcon="settings" hideBack tightBottom>
             <Pressable style={styles.settingsProfileCard} onPress={() => go('account')}>
               <View style={styles.infoMain}>
-                <Text style={styles.infoTitleLarge}>user@gmail.com</Text>
+                <Text style={styles.infoTitleLarge}>{currentUser?.email ?? 'user@gmail.com'}</Text>
                 <Text style={styles.profileConnectionText}>
                   Gmail {permissions.gmail ? '연결됨' : '연결안됨'} / Drive {permissions.drive ? '연결됨' : '연결안됨'}
                 </Text>
@@ -2961,8 +3027,8 @@ export default function App() {
                 <Text style={styles.avatarText}>U</Text>
               </View>
               <View style={styles.infoMain}>
-                <Text style={styles.profileConnectionText}>AURA 사용자</Text>
-                <Text style={styles.infoTitleLarge}>user@gmail.com</Text>
+                <Text style={styles.profileConnectionText}>{currentUser?.name ?? 'AURA 사용자'}</Text>
+                <Text style={styles.infoTitleLarge}>{currentUser?.email ?? 'user@gmail.com'}</Text>
               </View>
             </View>
 
@@ -4368,11 +4434,13 @@ function PermissionDetail({
   screen,
   back,
   setPermissions,
+  onServicePermissionChange,
   requestPushPermission,
 }: {
   screen: PermissionScreen;
   back: () => void;
   setPermissions: React.Dispatch<React.SetStateAction<PermissionState>>;
+  onServicePermissionChange: (nextPermissions: Partial<AuraServicePermissions>) => Promise<void>;
   requestPushPermission: () => Promise<boolean>;
 }) {
   const info = {
@@ -4484,11 +4552,15 @@ function PermissionDetail({
         title={info.button}
         onPress={() => {
           if (info.key === 'alarm') {
-            void requestPushPermission().then(() => back());
+            void requestPushPermission().then((allowed) => {
+              void onServicePermissionChange({ alarm: allowed });
+              back();
+            });
             return;
           }
 
           setPermissions((items) => ({ ...items, [info.key]: true }));
+          void onServicePermissionChange({ [info.key]: true });
           back();
         }}
       />
