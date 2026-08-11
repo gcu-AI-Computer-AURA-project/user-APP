@@ -4,7 +4,12 @@
     "slug": "aura-app",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/wireframes/AURA-logo-concept.png",
+    "icon": "./assets/AURA-logo.png",
+    "splash": {
+      "image": "./assets/AURA-logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#FFFFFF"
+    },
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true
@@ -15,10 +20,8 @@
         "POST_NOTIFICATIONS"
       ],
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/wireframes/AURA-logo-concept.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/AURA-logo.png"
       },
       "predictiveBackGestureEnabled": false
     },
