@@ -3,6 +3,7 @@ import {
   Alert,
   Animated,
   BackHandler,
+  Dimensions,
   Easing,
   Image,
   KeyboardAvoidingView,
@@ -18,7 +19,11 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import Svg, { Circle, Line, Path, Text as SvgText } from 'react-native-svg';
+import AntDesign from '@expo/vector-icons/AntDesign';
+import Feather from '@expo/vector-icons/Feather';
+import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
+import { LineChart } from 'react-native-chart-kit';
+import Svg, { Defs, LinearGradient as SvgLinearGradient, Stop, Text as SvgText } from 'react-native-svg';
 
 type Screen =
   | 'initial'
@@ -28,6 +33,7 @@ type Screen =
   | 'drivePermission'
   | 'notificationPermission'
   | 'connected'
+  | 'onboardingIntro'
   | 'onboardingGhost'
   | 'onboardingCarbon'
   | 'home'
@@ -68,7 +74,10 @@ type Screen =
   | 'serviceWithdraw'
   | 'notice';
 
-type MainTab = 'home' | 'storage' | 'history' | 'settings';
+type MainTab = 'home' | 'storage' | 'trash' | 'history' | 'settings';
+type FloatingButtonVariant = 'scan' | 'delete' | 'trash' | 'restore';
+type FloatingAction = { variant: Exclude<FloatingButtonVariant, 'scan'>; onPress: () => void; small?: boolean };
+type FontAwesome5Name = React.ComponentProps<typeof FontAwesome5>['name'];
 type PermissionScreen = 'gmailPermission' | 'drivePermission' | 'notificationPermission';
 type PermissionState = { gmail: boolean; drive: boolean; alarm: boolean };
 type SettingsTogglesState = { scanComplete: boolean; aiNudge: boolean; marketing: boolean; autoScan: boolean };
@@ -130,12 +139,26 @@ type AuraDriveFile = {
   reason: string;
 };
 
-const navy = '#0B3566';
-const line = '#9FB8CA';
-const pale = '#EAF7F2';
-const text = '#0B2A4A';
-const auraLogo = require('./assets/wireframes/AURA-logo-concept.png');
-const navHomeIcon = require('./assets/nav/home-house-navy.png');
+const navy = '#57C879';
+const line = '#E8EAED';
+const pale = '#F4FFF7';
+const text = '#202124';
+const mutedText = '#9AA0A6';
+const softShadow = {
+  shadowColor: '#000000',
+  shadowOpacity: 0.075,
+  shadowRadius: 18,
+  shadowOffset: { width: 0, height: 0 },
+  elevation: 3,
+};
+const gentleShadow = {
+  shadowColor: '#000000',
+  shadowOpacity: 0.055,
+  shadowRadius: 13,
+  shadowOffset: { width: 0, height: 0 },
+  elevation: 2,
+};
+const auraLogo = require('./assets/AURA-logo.png');
 const gmailIcon = require('./assets/gmail-icon.png');
 const googleDriveIcon = require('./assets/google-drive-icon.png');
 const toMonthIndex = (year: number, month: number) => year * 12 + month - 1;
@@ -160,11 +183,16 @@ const getMainTabForScreen = (screen: Screen): MainTab | null => {
   if (
     screen === 'storageMail' ||
     screen === 'storageDrive' ||
-    screen === 'storageDetail' ||
+    screen === 'storageDetail'
+  ) {
+    return 'storage';
+  }
+
+  if (
     screen === 'storageTrash' ||
     screen === 'storageDriveTrash'
   ) {
-    return 'storage';
+    return 'trash';
   }
 
   if (
@@ -239,11 +267,32 @@ const getBackFallbackForScreen = (screen: Screen): Screen => {
 const defaultTabScreens: Record<MainTab, Screen> = {
   home: 'home',
   storage: 'storageMail',
+  trash: 'storageTrash',
   history: 'analysisHistory',
   settings: 'settings',
 };
-const loginFlowScreens: Screen[] = ['initial', 'privacy', 'permissions', 'connected', 'onboardingGhost', 'onboardingCarbon'];
-const mainTabOrder: MainTab[] = ['home', 'storage', 'history', 'settings'];
+const loginFlowScreens: Screen[] = ['initial', 'privacy', 'permissions', 'connected', 'onboardingIntro', 'onboardingGhost', 'onboardingCarbon'];
+const mainTabOrder: MainTab[] = ['home', 'storage', 'trash', 'history', 'settings'];
+const scanFlowScreens = new Set<Screen>([
+  'scanFlowSource',
+  'scanFlowFolder',
+  'scanFlowPeriod',
+  'scanSource',
+  'driveFolder',
+  'period',
+  'scanProgress',
+  'candidateSummary',
+  'mailList',
+  'driveList',
+  'largeList',
+  'protectedList',
+  'mailDetail',
+  'fileDetail',
+  'selectedReview',
+  'deleteConfirm',
+  'deleteProcessing',
+  'cleanupComplete',
+]);
 
 const NavigationContext = React.createContext<{
   current: Screen;
@@ -252,6 +301,7 @@ const NavigationContext = React.createContext<{
   navigateTab: (tab: MainTab) => void;
   back: () => void;
   connectedInstant?: boolean;
+  scanResultPending?: boolean;
 } | null>(null);
 
 const auraMailMessages: AuraMailMessage[] = [
@@ -309,8 +359,8 @@ const getDriveParentPath = (path: string) => {
 };
 const getDriveAncestorFolders = (path: string) => {
   const parts = splitDrivePath(path);
-  if (parts.length <= 2) return [];
-  return parts.slice(1, -1).map((_, index) => parts.slice(0, index + 2).join(' › '));
+  if (parts.length <= 1) return [];
+  return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join(' › '));
 };
 const getDriveFolderName = (path: string) => splitDrivePath(path).at(-1) ?? path;
 const getDirectDriveFolders = (parentPath: string) => {
@@ -334,7 +384,13 @@ const getDriveFolderSelectionGroup = (path: string) => [path, ...getDriveDescend
 const getDirectDriveFiles = (folderPath: string) => auraDriveFiles.filter((file) => file.folderPath === folderPath);
 const getDriveFileSelectionGroup = (folderPath: string) =>
   auraDriveFiles.filter((file) => file.folderPath === folderPath || file.folderPath.startsWith(`${folderPath} ›`));
-const hasDriveFolderContents = (path: string) => hasDriveFolderChildren(path) || getDirectDriveFiles(path).length > 0;
+const getDriveFolderSelected = (path: string, selectedFolders: string[], selectedFiles: string[]) => {
+  const folderGroup = getDriveFolderSelectionGroup(path);
+  const fileGroup = getDriveFileSelectionGroup(path).map((file) => file.id);
+  const hasSelectableChildren = folderGroup.length + fileGroup.length > 0;
+
+  return hasSelectableChildren && folderGroup.every((folder) => selectedFolders.includes(folder)) && fileGroup.every((file) => selectedFiles.includes(file));
+};
 const getStorageDriveItemsForFolder = (folderPath: string): StorageDriveItem[] => [
   ...getDirectDriveFolders(folderPath).map((folder) => ({
     id: `storage-folder-${folder.name}`,
@@ -748,12 +804,14 @@ export default function App() {
   const [lastTabScreens, setLastTabScreens] = useState<Record<MainTab, Screen>>({
     home: 'home',
     storage: 'storageMail',
+    trash: 'storageTrash',
     history: 'analysisHistory',
     settings: 'settings',
   });
   const [tabHistories, setTabHistories] = useState<Record<MainTab, Screen[]>>({
     home: [],
     storage: [],
+    trash: [],
     history: [],
     settings: [],
   });
@@ -779,6 +837,7 @@ export default function App() {
   const [storageDriveFolder, setStorageDriveFolder] = useState(driveRootPath);
   const [storageTrashMovedKeys, setStorageTrashMovedKeys] = useState<string[]>([]);
   const [storageDeletedKeys, setStorageDeletedKeys] = useState<string[]>([]);
+  const [storageRestoredKeys, setStorageRestoredKeys] = useState<string[]>([]);
   const [storageDriveMoveTargets, setStorageDriveMoveTargets] = useState<StorageDriveMoveTargets>({});
   const [selectedDriveFolders, setSelectedDriveFolders] = useState<string[]>([]);
   const [selectedDriveFiles, setSelectedDriveFiles] = useState<string[]>([]);
@@ -880,7 +939,8 @@ export default function App() {
     if (target === 'privacy' || target === 'permissions') return 'initial';
     if (target === 'gmailPermission' || target === 'drivePermission' || target === 'notificationPermission') return 'permissions';
     if (target === 'connected') return 'permissions';
-    if (target === 'onboardingGhost') return 'connected';
+    if (target === 'onboardingIntro') return 'connected';
+    if (target === 'onboardingGhost') return 'onboardingIntro';
     if (target === 'onboardingCarbon') return 'onboardingGhost';
     if (target === 'analysisHistory') return analysisHistoryReturnTarget;
 
@@ -1100,10 +1160,13 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (screen !== 'cleanupComplete') return undefined;
+
+    cleanupReclaimedOpacity.setValue(1);
     const animation = Animated.loop(
       Animated.sequence([
         Animated.timing(cleanupReclaimedOpacity, {
-          toValue: 0.28,
+          toValue: 0.12,
           duration: 620,
           useNativeDriver: true,
         }),
@@ -1117,7 +1180,7 @@ export default function App() {
 
     animation.start();
     return () => animation.stop();
-  }, [cleanupReclaimedOpacity]);
+  }, [cleanupReclaimedOpacity, screen]);
 
   const formatYearRange = (range: MonthRange) => `${formatMonthLabel(range.from)}부터 ${formatMonthLabel(range.to)}까지`;
   const getPeriodLabel = () => `열람 ${formatMonthDuration(lastOpenedBeforeMonths)} 이상 · 수정 ${formatMonthDuration(lastModifiedBeforeMonths)} 이상`;
@@ -1181,8 +1244,8 @@ export default function App() {
 
   const resetToFreshStart = () => {
     setHistory([]);
-    setLastTabScreens({ home: 'home', storage: 'storageMail', history: 'analysisHistory', settings: 'settings' });
-    setTabHistories({ home: [], storage: [], history: [], settings: [] });
+    setLastTabScreens({ home: 'home', storage: 'storageMail', trash: 'storageTrash', history: 'analysisHistory', settings: 'settings' });
+    setTabHistories({ home: [], storage: [], trash: [], history: [], settings: [] });
     setPrivacyChecked(false);
     setPrivacyDetailChecked(false);
     setPermissions({ gmail: false, drive: false, alarm: false });
@@ -1198,6 +1261,7 @@ export default function App() {
     setStorageDriveFolder(driveRootPath);
     setStorageTrashMovedKeys([]);
     setStorageDeletedKeys([]);
+    setStorageRestoredKeys([]);
     setStorageDriveMoveTargets({});
     setSelectedDriveFolders([]);
     setSelectedDriveFiles([]);
@@ -1366,6 +1430,22 @@ export default function App() {
     go('connected');
   };
 
+  const handleInitialPrivacyPress = () => {
+    if (privacyChecked) {
+      setPrivacyChecked(false);
+      setPrivacyDetailChecked(false);
+      return;
+    }
+
+    go('privacy');
+  };
+
+  const acceptPrivacyDetailConsent = () => {
+    setPrivacyChecked(true);
+    setPrivacyDetailChecked(true);
+    back();
+  };
+
   const openCompletedScanResult = () => {
     if (toastTimer.current) {
       clearTimeout(toastTimer.current);
@@ -1414,7 +1494,7 @@ export default function App() {
       return;
     }
     if (scanSources.folder && !selectedDriveFolders.length && !selectedDriveFiles.length) {
-      showToast('분석할 Drive 폴더나 문서를 선택해주세요');
+      showToast('분석할 Drive 폴더를 선택해주세요');
       go('scanFlowFolder');
       return;
     }
@@ -1453,26 +1533,29 @@ export default function App() {
   };
 
   const toggleAllDriveFolders = () => {
-    const visibleFolders = getVisibleDriveFolders(driveCurrentFolder, driveFolderSearch);
-    const visibleFiles = driveFolderSearch.trim() ? [] : getDirectDriveFiles(driveCurrentFolder);
+    const targetFolder = driveCurrentFolder;
+    const isSelectedByParent = getDriveAncestorFolders(targetFolder).some((ancestor) => selectedDriveFolders.includes(ancestor));
 
-    if (!visibleFolders.length && !visibleFiles.length) {
+    if (isSelectedByParent) {
+      showToast('먼저 상위 폴더를 해제해주세요');
+      return;
+    }
+
+    const allFolderGroups = getDriveFolderSelectionGroup(targetFolder);
+    const allFileIds = getDriveFileSelectionGroup(targetFolder).map((file) => file.id);
+
+    if (!allFolderGroups.length && !allFileIds.length) {
       showToast('선택할 Drive 항목이 없어요');
       return;
     }
 
-    const visibleFolderGroups = visibleFolders.flatMap((folder) => getDriveFolderSelectionGroup(folder.name));
-    const visibleFileIds = Array.from(new Set([
-      ...visibleFolders.flatMap((folder) => getDriveFileSelectionGroup(folder.name).map((file) => file.id)),
-      ...visibleFiles.map((file) => file.id),
-    ]));
     const allSelected =
-      visibleFolderGroups.every((folder) => selectedDriveFolders.includes(folder)) &&
-      visibleFileIds.every((fileId) => selectedDriveFiles.includes(fileId));
+      allFolderGroups.every((folder) => selectedDriveFolders.includes(folder)) &&
+      allFileIds.every((fileId) => selectedDriveFiles.includes(fileId));
     if (allSelected) {
       setSelectedDriveFolders((items) => {
-        const next = items.filter((item) => !visibleFolderGroups.includes(item));
-        const nextFiles = selectedDriveFiles.filter((item) => !visibleFileIds.includes(item));
+        const next = items.filter((item) => !allFolderGroups.includes(item));
+        const nextFiles = selectedDriveFiles.filter((item) => !allFileIds.includes(item));
         setSelectedDriveFiles(nextFiles);
         setScanSources((sources) => ({ ...sources, folder: Boolean(next.length || nextFiles.length), drive: next.length || nextFiles.length ? true : sources.drive }));
         return next;
@@ -1480,17 +1563,13 @@ export default function App() {
       return;
     }
 
-    setSelectedDriveFolders((items) => Array.from(new Set([...items, ...visibleFolderGroups])));
-    setSelectedDriveFiles((items) => Array.from(new Set([...items, ...visibleFileIds])));
+    setSelectedDriveFolders((items) => Array.from(new Set([...items, ...allFolderGroups])));
+    setSelectedDriveFiles((items) => Array.from(new Set([...items, ...allFileIds])));
     setScanSources((items) => ({ ...items, drive: true, folder: true }));
   };
 
   const back = () => {
-    if (screen === 'privacy') {
-      setPrivacyChecked(privacyDetailChecked);
-    }
-
-    if (screen === 'onboardingGhost') {
+    if (screen === 'onboardingIntro') {
       setHasSeenConnectedSuccess(true);
       setSkipConnectedAnimation(true);
       setConnectedDone(true);
@@ -1668,8 +1747,8 @@ export default function App() {
       }
 
       setSkipConnectedAnimation(false);
-      setConnectedDone(false);
-      setConnectedStep(0);
+      setConnectedDone(true);
+      setConnectedStep(3);
     }
   }, [screen]);
 
@@ -1682,21 +1761,8 @@ export default function App() {
   }, [permissions.gmail, permissions.drive]);
 
   useEffect(() => {
-    if (screen !== 'connected' || !connectedDone) return;
-    if (skipConnectedAnimation) {
-      setConnectedStep(3);
-      return;
-    }
-
-    const gmailTimer = setTimeout(() => setConnectedStep(1), 120);
-    const driveTimer = setTimeout(() => setConnectedStep(2), 220);
-    const buttonTimer = setTimeout(() => setConnectedStep(3), 320);
-
-    return () => {
-      clearTimeout(gmailTimer);
-      clearTimeout(driveTimer);
-      clearTimeout(buttonTimer);
-    };
+    if (screen !== 'connected') return;
+    setConnectedStep(3);
   }, [screen, connectedDone, skipConnectedAnimation]);
 
   useEffect(() => {
@@ -1775,6 +1841,17 @@ export default function App() {
       const next = { ...items };
       keys.forEach((key) => {
         next[`${prefix}:${key}`] = !allChecked;
+      });
+      return next;
+    });
+  };
+  const clearSelectionPrefix = (prefix: string) => {
+    setChecked((items) => {
+      const next = { ...items };
+      Object.keys(next).forEach((key) => {
+        if (key.startsWith(`${prefix}:`)) {
+          delete next[key];
+        }
       });
       return next;
     });
@@ -1895,8 +1972,7 @@ export default function App() {
   };
 
   const toggleDriveFolder = (folder: string) => {
-    const isSelectedByParent = selectedDriveFolders.includes(folder) &&
-      getDriveAncestorFolders(folder).some((ancestor) => selectedDriveFolders.includes(ancestor));
+    const isSelectedByParent = getDriveAncestorFolders(folder).some((ancestor) => selectedDriveFolders.includes(ancestor));
 
     if (isSelectedByParent) {
       showToast('먼저 상위 폴더를 해제해주세요');
@@ -1921,27 +1997,25 @@ export default function App() {
     });
   };
 
-  const toggleDriveFile = (fileId: string) => {
-    setSelectedDriveFiles((items) => {
-      const next = items.includes(fileId) ? items.filter((item) => item !== fileId) : [...items, fileId];
-      setScanSources((sources) => ({ ...sources, drive: next.length || selectedDriveFolders.length ? true : sources.drive, folder: Boolean(next.length || selectedDriveFolders.length) }));
-      return next;
-    });
-  };
-
   const render = () => {
     const visibleDriveFolders = getVisibleDriveFolders(driveCurrentFolder, driveFolderSearch);
-    const visibleDriveFolderGroups = visibleDriveFolders.flatMap((folder) => getDriveFolderSelectionGroup(folder.name));
-    const visibleDriveFilePreviews = driveFolderSearch.trim() ? [] : getDirectDriveFiles(driveCurrentFolder);
-    const visibleDriveFileIds = Array.from(new Set([
-      ...visibleDriveFolders.flatMap((folder) => getDriveFileSelectionGroup(folder.name).map((file) => file.id)),
-      ...visibleDriveFilePreviews.map((file) => file.id),
-    ]));
+    const currentDriveSelectionFolder = driveCurrentFolder;
+    const currentDriveFolderGroups = getDriveFolderSelectionGroup(currentDriveSelectionFolder);
+    const currentDriveFileIds = Array.from(new Set(getDriveFileSelectionGroup(currentDriveSelectionFolder).map((file) => file.id)));
+    const drivePickerTotalItemCount = currentDriveFolderGroups.length + currentDriveFileIds.length;
     const allDriveFoldersSelected =
-      (visibleDriveFolderGroups.length > 0 || visibleDriveFileIds.length > 0) &&
-      visibleDriveFolderGroups.every((folder) => selectedDriveFolders.includes(folder)) &&
-      visibleDriveFileIds.every((fileId) => selectedDriveFiles.includes(fileId));
-    const driveParentFolder = getDriveParentPath(driveCurrentFolder);
+      drivePickerTotalItemCount > 0 &&
+      currentDriveFolderGroups.every((folder) => selectedDriveFolders.includes(folder)) &&
+      currentDriveFileIds.every((fileId) => selectedDriveFiles.includes(fileId));
+    const driveFolderPathParts = splitDrivePath(currentDriveSelectionFolder);
+    const driveFolderBreadcrumbs = [
+      { label: '내 Drive', path: driveRootPath, type: 'folder' as const },
+      ...driveFolderPathParts.slice(1).map((part, index, parts) => ({
+        label: part,
+        path: [driveRootPath, ...parts.slice(0, index + 1)].join(' › '),
+        type: 'folder' as const,
+      })),
+    ];
     const isDriveSearching = Boolean(driveFolderSearch.trim());
     const activeScanResult = lastScan?.result ?? scanResultRef.current;
     const promoMailItems = activeScanResult.mailItems.filter((item) => item.desc?.includes('광고') || item.desc?.includes('프로모션'));
@@ -1985,7 +2059,6 @@ export default function App() {
     const cleanupCurrentUsedGB = Math.max(0, cleanupDriveTotalGB - cleanupRemainingGB - cleanupReclaimedGB);
     const cleanupCurrentUsedPercent = Math.min(100, Math.max(0, (cleanupCurrentUsedGB / cleanupDriveTotalGB) * 100));
     const cleanupReclaimedPercent = Math.min(100 - cleanupCurrentUsedPercent, Math.max(0, (cleanupReclaimedGB / cleanupDriveTotalGB) * 100));
-    const excludedCandidateCount = Math.max(0, activeScanResult.candidateCount - selectedCandidateCount);
     const checkedCleanupSizeLabel = selectedTotalSizeLabel;
     const homeScanStatusTitle =
       homeScanNotice === 'completed' ? '스캔이 완료됐어요' : homeScanNotice === 'cancelled' ? '스캔이 중단됐어요' : '스캔 진행 중';
@@ -2002,27 +2075,32 @@ export default function App() {
           <ScreenShell noNav>
             <View style={styles.heroSpacer} />
             <Logo large />
-            <Text style={styles.heroTitle}>AURA로 개인 클라우드 관리{'\n'}시작해 보세요</Text>
-            <Pressable style={styles.initialConsentLink} onPress={() => go('privacy')}>
-              <View style={styles.initialConsentLinkTextBox}>
-                <View style={styles.initialConsentTitleRow}>
-                  <CheckBox checked={privacyChecked} onPress={() => go('privacy')} compact />
-                  <Text style={styles.initialConsentLinkText}>개인정보 수집 및 분석 동의 보기</Text>
+            <Text style={styles.heroTitle}>
+              <Text style={styles.heroTitleBrand}>AURA</Text>
+              로 개인 클라우드 관리{'\n'}시작해 보세요
+            </Text>
+            <View style={styles.initialActionBlock}>
+              <Pressable style={styles.initialConsentLink} onPress={handleInitialPrivacyPress}>
+                <View style={styles.initialConsentLinkTextBox}>
+                  <View style={styles.initialConsentTitleRow}>
+                    <CheckBox checked={privacyChecked} onPress={handleInitialPrivacyPress} compact />
+                    <Text style={styles.initialConsentLinkText}>개인정보 수집 및 분석 동의 보기</Text>
+                  </View>
+                  <View style={styles.initialConsentLinkLine} />
                 </View>
-                <View style={styles.initialConsentLinkLine} />
-              </View>
-            </Pressable>
-            <PrimaryButton
-              title="구글 계정으로 계속"
-              onPress={() => {
-                if (!privacyChecked) {
-                  showToast('개인정보 수집 및 분석 동의가 필요합니다');
-                  return;
-                }
-                go('permissions');
-              }}
-              inline
-            />
+              </Pressable>
+              <PrimaryButton
+                title="구글 계정으로 계속"
+                onPress={() => {
+                  if (!privacyChecked) {
+                    showToast('개인정보 수집 및 분석 동의가 필요합니다');
+                    return;
+                  }
+                  go('permissions');
+                }}
+                inline
+              />
+            </View>
           </ScreenShell>
         );
 
@@ -2043,8 +2121,8 @@ export default function App() {
                 <PrivacyBody>서비스 탈퇴 또는 Google 연결 해제 시까지</PrivacyBody>
               </View>
             </Card>
-            <Pressable style={[styles.consentRow, styles.privacyAgreeRow]} onPress={acceptPrivacyConsentAndBack}>
-              <CheckBox checked={privacyDetailChecked} onPress={acceptPrivacyConsentAndBack} />
+            <Pressable style={[styles.consentRow, styles.privacyAgreeRow]} onPress={acceptPrivacyDetailConsent}>
+              <CheckBox checked={privacyDetailChecked} onPress={acceptPrivacyDetailConsent} />
               <Text style={styles.consentText}>필수 수집 및 분석에 동의합니다</Text>
             </Pressable>
           </ScreenShell>
@@ -2085,34 +2163,49 @@ export default function App() {
                 setHasSeenConnectedSuccess(true);
               }}
             />
-            {connectedDone ? (
-              <RevealIn duration={skipConnectedAnimation ? 0 : 420} distance={skipConnectedAnimation ? 0 : 6}>
-                <Text style={styles.centerTitle}>모든 서비스가 연결됐어요</Text>
-              </RevealIn>
-            ) : (
-              <View style={styles.centerTitleSpace} />
-            )}
+            <RevealIn duration={skipConnectedAnimation ? 0 : 180} distance={skipConnectedAnimation ? 0 : 4}>
+              <Text style={styles.centerTitle}>모든 서비스가 연결됐어요</Text>
+            </RevealIn>
             <ConnectedInfoRow service="gmail" title="Gmail" status={permissions.gmail ? '연결됨' : '연결안됨'} visible={connectedStep >= 1} />
             <ConnectedInfoRow service="drive" title="Drive" status={permissions.drive ? '연결됨' : '연결안됨'} visible={connectedStep >= 2} />
-            {connectedStep >= 3 ? (
-              <RevealIn style={styles.connectedButtonReveal} duration={skipConnectedAnimation ? 0 : 560} distance={skipConnectedAnimation ? 0 : 12}>
-                <PrimaryButton title="AURA 둘러보기" onPress={() => go('onboardingGhost')} inline />
-              </RevealIn>
-            ) : (
-              <View style={styles.connectedButtonPlaceholder} />
-            )}
+            <RevealIn style={styles.connectedButtonReveal} duration={skipConnectedAnimation ? 0 : 180} distance={skipConnectedAnimation ? 0 : 4}>
+              <PrimaryButton title="AURA 둘러보기" onPress={() => go('onboardingIntro')} inline />
+            </RevealIn>
+          </ScreenShell>
+        );
+
+      case 'onboardingIntro':
+        return (
+          <ScreenShell noNav disableScroll>
+            <View style={styles.onboardingIntroContent}>
+              <Logo large />
+              <View style={styles.onboardingIntroTextBox}>
+                <View style={styles.onboardingIntroTitleRow}>
+                  <AuraGradientWord size={34} />
+                  <Text style={styles.onboardingIntroTitleText}>(AI-based Unused Resource Analyzer)는</Text>
+                </View>
+                <Text style={styles.onboardingIntroBody}>AI 기반 개인 클라우드 관리 서비스 입니다.</Text>
+              </View>
+            </View>
+            <View style={styles.onboardingButtonReveal}>
+              <View style={styles.auraFeelPlaceholder} />
+              <PrimaryButton title="다음" onPress={() => go('onboardingGhost')} inline />
+            </View>
           </ScreenShell>
         );
 
       case 'onboardingGhost':
         return (
-          <ScreenShell title="유령 데이터 탐지" noNav>
-            <GhostScanAnimation skip={onboardingGhostDone} onDone={() => setOnboardingGhostDone(true)} />
+          <ScreenShell title="유령 데이터 탐지" noNav disableScroll>
+            <GhostScanAnimation skip onDone={() => setOnboardingGhostDone(true)} />
             <View style={styles.onboardingDescriptionRow}>
-              <Text style={styles.onboardingDescriptionIcon}>👻</Text>
-              <Text style={[styles.centerBody, styles.onboardingDescriptionText]}>스캔이 끝나면 메일과 Drive 정리 후보를{'\n'}분류별로 보여줘요.</Text>
+              <View style={styles.onboardingDescriptionIcon}>
+                <FontAwesome5 name="ghost" size={28} color={navy} solid />
+              </View>
+              <Text style={[styles.centerBody, styles.onboardingDescriptionText]}>스캔이 끝나면 메일과 Drive 정리 후보를 분류별로 보여줘요.</Text>
             </View>
             <View style={styles.onboardingButtonReveal}>
+              <View style={styles.auraFeelPlaceholder} />
               <PrimaryButton title="다음" onPress={() => go('onboardingCarbon')} inline />
             </View>
           </ScreenShell>
@@ -2120,14 +2213,20 @@ export default function App() {
 
       case 'onboardingCarbon':
         return (
-          <ScreenShell title="스캔 이력 관리" noNav>
+          <ScreenShell title="스캔 이력 관리" noNav disableScroll>
             <CarbonSaveAnimation skip={onboardingCarbonDone} onDone={() => setOnboardingCarbonDone(true)} />
             <View style={styles.onboardingDescriptionRow}>
-              <Text style={styles.onboardingDescriptionIcon}>📈</Text>
-              <Text style={[styles.centerBody, styles.onboardingDescriptionText]}>정리한 클라우드 용량을 월별 그래프로 확인해요.</Text>
+              <View style={styles.onboardingDescriptionIcon}>
+                <FontAwesome5 name="chart-line" size={28} color={navy} />
+              </View>
+              <Text style={[styles.centerBody, styles.onboardingDescriptionText]}>정리한 클라우드 용량을 스캔별 그래프로 확인해요.</Text>
             </View>
             <View style={styles.auraFeelReveal}>
-              <Text style={styles.auraFeelText}>이제 AURA를 경험해보세요!</Text>
+              <View style={styles.auraFeelTextRow}>
+                <Text style={styles.auraFeelText}>이제</Text>
+                <AuraGradientWord size={27} />
+                <Text style={styles.auraFeelText}>를 경험해보세요!</Text>
+              </View>
             </View>
             <View style={styles.onboardingButtonReveal}>
               <PrimaryButton title="AURA 시작하기" onPress={() => replace('home')} inline />
@@ -2137,7 +2236,7 @@ export default function App() {
 
       case 'home':
         return (
-          <ScreenShell title="홈" titleIcon="home" hideBack tightBottom>
+          <ScreenShell title="홈" titleIcon="home" hideBack tightBottom hideFloatingScan={homeScanNotice === 'completed'}>
             <Card tint style={styles.capacityCard}>
               <View style={styles.capacityCardRow}>
                 <View style={styles.infoMain}>
@@ -2163,29 +2262,31 @@ export default function App() {
                     <Text style={styles.homeChevron}>›</Text>
                   </View>
                 </View>
-                <Text style={styles.meta}>
-                  {lastScan ? `마지막 스캔 ${formatScanDateOnly(lastScan.dateLabel)} · ${lastScan.sourceLabel}` : '마지막 스캔 없음'}
-                </Text>
-                <View style={styles.divider} />
                 {lastScan ? (
                   <>
-                <View style={styles.rowBetween}>
-                  <Text style={styles.homeSummaryCapacityLabel} numberOfLines={1}>확보 용량</Text>
-                  <Text style={styles.homeSummaryValue}>{selectedTotalSizeLabel}</Text>
-                </View>
-                    <Pressable
-                      style={styles.homeTrashButton}
-                      onPress={(event) => {
-                        event.stopPropagation();
-                        replace('storageTrash');
-                      }}
-                    >
-                      <Text style={styles.homeTrashButtonText}>휴지통으로 이동</Text>
-                    </Pressable>
-                    <Text style={styles.homeTrashGuide}>휴지통을 비워 용량을 확보하세요</Text>
+                    <Text style={styles.meta}>
+                      마지막 스캔 {formatScanDateOnly(lastScan.dateLabel)} · {lastScan.sourceLabel}
+                    </Text>
+                    <View style={styles.divider} />
+                    <View style={styles.homeSummaryCapacityRow}>
+                      <View style={styles.infoMain}>
+                        <Text style={styles.homeSummaryCapacityLabel} numberOfLines={1}>확보용량</Text>
+                        <Text style={styles.homeSummaryValue}>{selectedTotalSizeLabel}</Text>
+                      </View>
+                      <Pressable
+                        style={styles.homeTrashIconButton}
+                        onPress={(event) => {
+                          event.stopPropagation();
+                          replace('storageTrash');
+                        }}
+                      >
+                        <TrashOutlineIcon />
+                      </Pressable>
+                    </View>
                   </>
                 ) : (
                   <View style={styles.homeEmptySummary}>
+                    <Feather name="clock" size={42} color={mutedText} />
                     <Text style={styles.homeEmptyTitle}>아직 분석 기록이 없어요</Text>
                   </View>
                 )}
@@ -2223,29 +2324,31 @@ export default function App() {
                 ) : homeScanNotice === 'completed' ? (
                   <View style={styles.scanStatusActions}>
                     <Pressable style={styles.scanStatusButton} onPress={openCompletedScanResult}>
-                      <Text style={styles.scanStatusButtonText}>결과 보기</Text>
+                      <Text style={styles.scanStatusButtonText}>결과 보러가기</Text>
                     </Pressable>
                   </View>
                 ) : null}
               </Card>
             ) : null}
             <View style={styles.homeActionSpacer} />
-            <OutlineButton title="키워드·파일 조건 설정하기" onPress={() => go('keywordFile')} />
-            <PrimaryButton
-              title={homeScanNotice === 'completed' ? '결과 보기' : homeScanNotice === 'running' ? '스캔중' : '스캔하기'}
-              onPress={handleHomeScanPress}
-              inline
-            />
+            <OutlineButton title="키워드 설정하기" onPress={() => go('keywordFile')} />
+            {homeScanNotice !== 'completed' ? (
+              <PrimaryButton
+                title={homeScanNotice === 'running' ? '스캔중' : '스캔하기'}
+                onPress={handleHomeScanPress}
+                inline
+              />
+            ) : null}
           </ScreenShell>
         );
 
       case 'recentDetail':
         return lastScan ? (
           <ScreenShell title="최근 분석 상세">
+            <SectionTitle>최근 분석 요약</SectionTitle>
             <View style={styles.recentHeroCard}>
               <View style={styles.recentHeroHeaderRow}>
                 <View style={styles.infoMain}>
-                  <Text style={styles.infoTitle}>최근 분석 요약</Text>
                   <Text style={styles.recentHeroDate}>{formatScanDateOnly(lastScan.dateLabel)}</Text>
                 </View>
                 <Text style={styles.recentHeroSizeValue}>{selectedTotalSizeLabel}</Text>
@@ -2253,7 +2356,7 @@ export default function App() {
               <Text style={styles.infoDesc}>{lastScan.sourceLabel}</Text>
               <View style={styles.thinDivider} />
               <View style={styles.rowBetween}>
-                <Text style={styles.cardLabel}>정리 후보</Text>
+                <Text style={[styles.cardLabel, styles.textStrong]}>정리 후보</Text>
                 <Text style={styles.rowRight}>{selectedCandidateCount}개</Text>
               </View>
             </View>
@@ -2364,26 +2467,18 @@ export default function App() {
       case 'scanFlowFolder':
         return (
           <ScreenShell title="Drive 폴더 선택" tightBottom>
-            <Pressable style={styles.folderSelectAllCard} onPress={toggleAllDriveFolders}>
+            <Pressable style={styles.folderSelectAllInlineRow} onPress={toggleAllDriveFolders}>
               <CheckBox checked={allDriveFoldersSelected} onPress={toggleAllDriveFolders} compact />
-              <View style={styles.infoMain}>
-                <Text style={styles.infoTitle}>{allDriveFoldersSelected ? '전체 선택 해제' : '전체 선택'}</Text>
-                <Text style={styles.infoDesc}>
-                  {visibleDriveFolderGroups.length || visibleDriveFileIds.length
-                    ? `${visibleDriveFolderGroups.filter((folder) => selectedDriveFolders.includes(folder)).length + visibleDriveFileIds.filter((fileId) => selectedDriveFiles.includes(fileId)).length}/${visibleDriveFolderGroups.length + visibleDriveFileIds.length}개 항목 선택됨`
-                    : '선택할 항목이 없어요'}
-                </Text>
-              </View>
+              <Text style={styles.folderSelectAllTitle}>{allDriveFoldersSelected ? '전체 선택 해제' : '전체 선택'}</Text>
             </Pressable>
             <View style={styles.folderListBox}>
               <View style={styles.folderBreadcrumbCard}>
                 <View style={styles.folderBreadcrumbClickableRow}>
-                  {splitDrivePath(driveCurrentFolder).map((part, index, parts) => {
-                    const path = parts.slice(0, index + 1).join(' › ');
+                  {driveFolderBreadcrumbs.map((crumb, index, parts) => {
                     return (
-                      <React.Fragment key={path}>
-                        <Pressable onPress={() => setDriveCurrentFolder(path)} hitSlop={8}>
-                          <Text style={styles.folderBreadcrumbTitle}>{part}</Text>
+                      <React.Fragment key={crumb.path}>
+                        <Pressable onPress={() => setDriveCurrentFolder(crumb.path)} hitSlop={8}>
+                          <Text style={[styles.folderBreadcrumbTitle, index < parts.length - 1 && styles.folderBreadcrumbAncestor]}>{crumb.label}</Text>
                         </Pressable>
                         {index < parts.length - 1 ? <Text style={styles.folderBreadcrumbDivider}>›</Text> : null}
                       </React.Fragment>
@@ -2396,16 +2491,16 @@ export default function App() {
                 style={styles.folderListScroll}
                 contentContainerStyle={styles.folderListContent}
                 nestedScrollEnabled
-                showsVerticalScrollIndicator={visibleDriveFolders.length + visibleDriveFilePreviews.length > 5}
+                showsVerticalScrollIndicator={visibleDriveFolders.length > 5}
               >
                 {visibleDriveFolders.length ? (
                   visibleDriveFolders.map((folder) => (
                     <FolderRow
                       key={folder.name}
                       title={isDriveSearching ? folder.name : getDriveFolderName(folder.name)}
-                      desc={formatFolderMeta(folder.meta)}
-                      selected={selectedDriveFolders.includes(folder.name)}
-                      canOpen={hasDriveFolderContents(folder.name)}
+                      desc={folder.meta ? formatFolderMeta(folder.meta) : undefined}
+                      selected={getDriveFolderSelected(folder.name, selectedDriveFolders, selectedDriveFiles)}
+                      canOpen={hasDriveFolderChildren(folder.name)}
                       onPress={() => toggleDriveFolder(folder.name)}
                       onOpen={() => {
                         setDriveFolderSearch('');
@@ -2414,19 +2509,10 @@ export default function App() {
                     />
                   ))
                 ) : null}
-                {visibleDriveFilePreviews.length ? (
-                  visibleDriveFilePreviews.map((file) => (
-                    <DriveFolderFileRow
-                      key={file.id}
-                      file={file}
-                      selected={selectedDriveFiles.includes(file.id)}
-                    />
-                  ))
-                ) : null}
-                {!visibleDriveFolders.length && !visibleDriveFilePreviews.length ? (
+                {!visibleDriveFolders.length ? (
                   <EmptyState
                     title={driveFolderSearch.trim() ? '폴더 없음' : '비어있는 폴더'}
-                    desc={driveFolderSearch.trim() ? '검색 결과에 해당하는 폴더가 없어요.' : '현재 폴더 안에 하위 폴더나 문서가 없어요.'}
+                    desc={driveFolderSearch.trim() ? '검색 결과에 해당하는 폴더가 없어요.' : '현재 폴더 안에 하위 폴더가 없어요.'}
                   />
                 ) : null}
               </ScrollView>
@@ -2502,46 +2588,35 @@ export default function App() {
 
       case 'scanProgress':
         return (
-          <View style={styles.scanOverlayScreen}>
-            <View style={styles.scanOverlayHomePreview}>
-              <LogoRow />
-              <View style={styles.homeRule} />
-              <Card tint style={styles.capacityCard}>
-                <Text style={styles.cardLabel}>남은 용량</Text>
-                <Text style={styles.bigNumber}>2.6GB</Text>
-              </Card>
-              <Card tint style={styles.homeSummaryCard}>
-                <Text style={styles.cardTitle}>최근 분석 요약</Text>
-                <Text style={styles.meta}>{lastScan ? `마지막 스캔 ${lastScan.dateLabel}` : '마지막 스캔 없음'}</Text>
-              </Card>
-            </View>
-            <View style={styles.scanSidePanel} {...scanSidePanelResponder.panHandlers}>
-              <DeviceStatusBar compact />
-              <View style={styles.scanPanelHeader}>
-                <View style={styles.infoMain}>
-                  <Text style={styles.title}>스캔 진행 중</Text>
-                  <Text style={styles.scanPanelSubtitle}>홈으로 돌아가도 분석은 계속됩니다</Text>
+          <ScreenShell title="스캔 진행" disableScroll>
+            <View style={styles.scanFullContent}>
+              <Card tint style={styles.scanFullPanel}>
+                <Text style={styles.scanFullKicker}>AURA가 분석 중이에요</Text>
+                <ProgressCircle progress={scanProgress} />
+                <Text style={styles.scanFullStatusText}>{scanProgress < 50 ? '메일 및 드라이브 데이터 수집중' : '수집 데이터 AI 분석중'}</Text>
+                <View style={styles.progressTrack}>
+                  <View style={[styles.progressFill, { width: `${scanProgress}%` }]} />
                 </View>
+              </Card>
+              <View style={styles.scanFullStatusGrid}>
+                <DeleteStatusRow
+                  service="gmail"
+                  title="Gmail"
+                  status={scanProgress >= 50 ? '완료' : '진행'}
+                  done={scanProgress >= 50}
+                />
+                <DeleteStatusRow
+                  service="drive"
+                  title="Google Drive"
+                  status={scanProgress >= 100 ? '완료' : '진행'}
+                  done={scanProgress >= 100}
+                />
               </View>
-              <View style={styles.scanFloatingPanel}>
-                <View style={styles.rowBetween}>
-                  <View style={styles.infoMain}>
-                    <Text style={styles.infoTitleLarge}>AURA가 분석 중이에요</Text>
-                    <Text style={styles.infoDesc}>{scanProgress < 50 ? '메일 및 드라이브 데이터 수집중' : '수집 데이터 AI 분석중'}</Text>
-                  </View>
-                  <Text style={styles.scanPercent}>{scanProgress}%</Text>
-                </View>
-                <ProgressCircle progress={scanProgress} compact />
-              </View>
-              <View style={styles.progressTrack}>
-                <View style={[styles.progressFill, { width: `${scanProgress}%` }]} />
-              </View>
-              <OutlineButton
-                title="취소하기"
-                onPress={cancelScan}
-              />
+              <View style={styles.scanProgressSpacer} />
+              <OutlineButton title="취소하기" onPress={cancelScan} />
+              <PrimaryButton title="홈으로 이동" onPress={() => replace('home')} inline />
             </View>
-          </View>
+          </ScreenShell>
         );
 
       case 'candidateSummary':
@@ -2626,7 +2701,7 @@ export default function App() {
             toggle={toggleCheck}
             setAll={setAll}
             openFilter={openFilterSheet}
-            notice={driveListMode === 'duplicate' ? '중복 의심 파일의 경우 확인 후 직접 선택해주세요' : undefined}
+            notice={driveListMode === 'duplicate' ? '유사 중복 파일은 안전을 위해 미선택으로 제공돼요.\n삭제할 항목만 직접 선택해주세요.' : undefined}
             onOpenItem={(item) => {
               setSelectedScanItem(item);
               go('fileDetail');
@@ -2700,11 +2775,7 @@ export default function App() {
               title="보호 항목 제외"
               desc="영수증 · 계약서 · 즐겨찾기"
             />
-            {excludedCandidateCount ? (
-              <Text style={styles.reviewWarningText}>체크 해제한 {excludedCandidateCount}개 항목은 휴지통 이동 대상에서 제외됩니다.</Text>
-            ) : (
-              <Text style={styles.reviewWarningText}>보호할 항목이 있다면 이전 목록에서 체크를 해제하세요.</Text>
-            )}
+            <Text style={styles.reviewWarningText}>보호할 항목이 있다면 이전 목록에서 체크를 해제하세요.</Text>
             <PrimaryButton title="휴지통으로 이동" onPress={() => go('deleteConfirm')} />
             <OutlineButton title="요약 화면으로 돌아가기" onPress={() => replace('candidateSummary')} />
           </ScreenShell>
@@ -2713,7 +2784,7 @@ export default function App() {
       case 'deleteConfirm':
         return (
           <View style={styles.modalScreenRoot}>
-            <ScreenShell title="선택 항목 검토">
+            <ScreenShell title="선택 항목 검토" disableScroll>
               <View style={styles.reviewMetricGrid}>
                 <ResultMetricCard label="선택 항목" value={`${selectedCandidateCount}개`} />
                 <ResultMetricCard label="예상 확보" value={checkedCleanupSizeLabel} />
@@ -2730,8 +2801,9 @@ export default function App() {
                 title="보호 항목 제외"
                 desc="영수증 · 계약서 · 즐겨찾기"
               />
-              <Text style={styles.reviewWarningText}>최종 승인 전까지 어떤 항목도 이동하지 않아요.</Text>
+              <Text style={styles.reviewWarningText}>보호할 항목이 있다면 이전 목록에서 체크를 해제하세요.</Text>
               <PrimaryButton title="휴지통으로 이동" onPress={() => {}} />
+              <OutlineButton title="요약 화면으로 돌아가기" onPress={() => replace('candidateSummary')} />
             </ScreenShell>
             <Animated.View
               style={[
@@ -2747,7 +2819,7 @@ export default function App() {
               <Pressable style={StyleSheet.absoluteFill} onPress={back} />
               <BottomSheetPanel motion={deleteConfirmMotion} outputRange={[0, 260]} style={styles.deleteApprovalPanel} onClose={back}>
                 <Text style={styles.deleteApprovalTitle}>휴지통 이동을 승인하시겠어요?</Text>
-                <Text style={styles.deleteApprovalDesc}>선택한 {selectedCandidateCount}개 항목 · {checkedCleanupSizeLabel}를 휴지통으로 이동합니다.</Text>
+                <Text style={styles.deleteApprovalDesc}>선택한 {selectedCandidateCount}개 항목을 휴지통으로 이동합니다.</Text>
                 <View style={styles.twoButtons}>
                   <OutlineButton title="취소" onPress={back} half />
                   <PrimaryButton
@@ -2766,11 +2838,13 @@ export default function App() {
           <ScreenShell title="삭제 진행" disableScroll>
             <ProgressCircle progress={deleteProgress} />
             <DeleteStatusRow
+              service="gmail"
               title="Gmail"
               status={deleteProgress >= 45 ? '완료' : '진행'}
               done={deleteProgress >= 45}
             />
             <DeleteStatusRow
+              service="drive"
               title="Google Drive"
               status={deleteProgress >= 100 ? '완료' : '진행'}
               done={deleteProgress >= 100}
@@ -2788,7 +2862,7 @@ export default function App() {
           <ScreenShell title="정리 완료" hideBack tightBottom disableScroll>
             <Text style={styles.cleanupTitle}>정리가 완료됐어요!</Text>
             <Card tint style={styles.cleanupCountCard}>
-              <Text style={styles.cardLabel}>정리 항목</Text>
+              <Text style={[styles.cardLabel, styles.textStrong]}>정리 항목</Text>
               <View style={styles.cleanupCountInnerRow}>
                 <View style={styles.cleanupCountInnerCard}>
                   <Text style={styles.cleanupCountLabel}>메일</Text>
@@ -2802,11 +2876,11 @@ export default function App() {
             </Card>
             <Card tint style={styles.cleanupCapacityCard}>
               <View style={styles.cleanupCapacityMetricRow}>
-                <Text style={styles.cardLabel}>확보 용량</Text>
+                <Text style={[styles.cardLabel, styles.textStrong]}>확보 용량</Text>
                 <Text style={styles.cleanupCapacityValue}>{checkedCleanupSizeLabel}</Text>
               </View>
               <View style={styles.cleanupCapacityMetricRow}>
-                <Text style={styles.cardLabel}>남은 용량</Text>
+                <Text style={[styles.cardLabel, styles.textStrong]}>남은 용량</Text>
                 <Text style={styles.cleanupCapacityValue}>{remainingAfterCleanup}</Text>
               </View>
               <View style={styles.cleanupDriveBarTrack}>
@@ -2881,19 +2955,21 @@ export default function App() {
             checked={checked}
             toggle={toggleCheck}
             setAll={setAll}
-            openFilter={openFilterSheet}
+            clearSelectionPrefix={clearSelectionPrefix}
             showToast={showToast}
             onReconnect={openAccountFromPermissionRevoked}
-            goMail={() => replace('storageMail')}
-            goDrive={() => replace('storageDrive')}
+            goMail={() => replace(screen === 'storageTrash' || screen === 'storageDriveTrash' ? 'storageTrash' : 'storageMail')}
+            goDrive={() => replace(screen === 'storageTrash' || screen === 'storageDriveTrash' ? 'storageDriveTrash' : 'storageDrive')}
             goTrash={() => replace(screen === 'storageDrive' || screen === 'storageDriveTrash' ? 'storageDriveTrash' : 'storageTrash')}
             storageDriveFolder={storageDriveFolder}
             setStorageDriveFolder={setStorageDriveFolder}
             storageTrashMovedKeys={storageTrashMovedKeys}
             storageDeletedKeys={storageDeletedKeys}
+            storageRestoredKeys={storageRestoredKeys}
             storageDriveMoveTargets={storageDriveMoveTargets}
             setStorageTrashMovedKeys={setStorageTrashMovedKeys}
             setStorageDeletedKeys={setStorageDeletedKeys}
+            setStorageRestoredKeys={setStorageRestoredKeys}
             setStorageDriveMoveTargets={setStorageDriveMoveTargets}
             openStorageDetail={(item) => {
               setSelectedStorageDetail(item);
@@ -3000,12 +3076,18 @@ export default function App() {
               onPress={openPeriodSettings}
             />
 
-            <Pressable style={styles.keywordConditionCard} onPress={openKeywordChoiceSheet}>
-              <View style={styles.rowBetween}>
-                <Text style={styles.infoTitle}>삭제 대상 포함·제외 키워드</Text>
-                <Text style={styles.chevron}>›</Text>
-              </View>
-            </Pressable>
+            <InfoRow
+              title="삭제 대상 포함 키워드"
+              desc={includeKeywords.length ? includeKeywords.join(', ') : '설정된 포함 키워드 없음'}
+              right="변경  ›"
+              onPress={() => openKeywordSheet('include')}
+            />
+            <InfoRow
+              title="삭제 대상 제외 키워드"
+              desc={excludeKeywords.length ? excludeKeywords.join(', ') : '설정된 제외 키워드 없음'}
+              right="변경  ›"
+              onPress={() => openKeywordSheet('exclude')}
+            />
             <PrimaryButton title="기본 조건 저장" onPress={back} />
           </ScreenShell>
         );
@@ -3058,14 +3140,14 @@ export default function App() {
               <>
                 <View style={styles.carbonTotalCard}>
                   <View>
-                    <Text style={styles.infoDesc}>전체 누적 삭제 용량</Text>
+                    <Text style={styles.cardLabel}>전체 누적 삭제 용량</Text>
                     <Text style={styles.carbonTotalValue}>{checkedCleanupSizeLabel}</Text>
                   </View>
                   <View style={styles.monthCarbonPill}>
                     <Text style={styles.monthCarbonText}>이번 달 +{checkedCleanupSizeLabel}</Text>
                   </View>
                 </View>
-                <SectionTitle>스캔별 확보 용량 변화</SectionTitle>
+                <SectionTitle>스캔별 확보 용량 현황</SectionTitle>
                 <CarbonStatsGraph sizeLabel={checkedCleanupSizeLabel} />
                 <View style={styles.rowBetween}>
                   <SectionTitle>최근 정리 기록</SectionTitle>
@@ -3102,7 +3184,7 @@ export default function App() {
                   <View style={styles.recentCleanupTopRow}>
                     <View style={styles.infoMain}>
                       <Text style={styles.infoTitle}>{lastScan.dateLabel}</Text>
-                      <Text style={styles.infoDesc}>{lastScan.sourceLabel} · {selectedCandidateCount}개 정리</Text>
+                      <Text style={styles.infoDesc}>Gmail {selectedMailCleanupCount}개 · Drive {selectedDriveCleanupCount}개</Text>
                     </View>
                     <Text style={styles.recentCleanupSizeValue}>{checkedCleanupSizeLabel}</Text>
                   </View>
@@ -3176,6 +3258,10 @@ export default function App() {
       return;
     }
 
+    if (screen === 'permissions') {
+      return;
+    }
+
     const loginIndex = loginFlowScreens.indexOf(screen);
     if (loginIndex >= 0) {
       const nextIndex = direction === 'left' ? loginIndex + 1 : loginIndex - 1;
@@ -3230,6 +3316,7 @@ export default function App() {
           navigateTab,
           back,
           connectedInstant: screen === 'connected' && skipConnectedAnimation,
+          scanResultPending: homeScanNotice === 'completed' || homeScanNotice === 'running',
         }}
       >
         <SafeAreaView style={styles.page} edges={['top', 'bottom']}>
@@ -3416,9 +3503,6 @@ export default function App() {
                   }
                   setPermissionToast('');
                   setToastTarget(null);
-                  if (toastTarget === 'candidateSummary') {
-                    setHomeScanNotice('none');
-                  }
                   replace(toastTarget);
                 }}
               >
@@ -3446,6 +3530,9 @@ function ScreenShell({
   tightBottom,
   titleIcon,
   disableScroll,
+  hideFloatingScan,
+  floatingAction,
+  tintBackground,
 }: {
   title?: string;
   subtitle?: string;
@@ -3458,12 +3545,23 @@ function ScreenShell({
   tightBottom?: boolean;
   titleIcon?: MainTab;
   disableScroll?: boolean;
+  hideFloatingScan?: boolean;
+  floatingAction?: FloatingAction | FloatingAction[];
+  tintBackground?: boolean;
 }) {
   const navigation = useContext(NavigationContext);
   const handleBack = hideBack ? undefined : onBack ?? navigation?.back;
+  const floatingActions = floatingAction ? (Array.isArray(floatingAction) ? floatingAction : [floatingAction]) : [];
+  const shouldShowFloatingScan =
+    !noNav &&
+    !hideFloatingScan &&
+    floatingActions.length === 0 &&
+    !navigation?.scanResultPending &&
+    navigation?.currentTab !== 'settings' &&
+    !scanFlowScreens.has(navigation?.current ?? 'initial');
 
   return (
-    <View style={styles.shell}>
+    <View style={[styles.shell, tintBackground && styles.shellTint]}>
       {title ? (
         <View style={[styles.header, hideBack && styles.headerNoBack]}>
           <DeviceStatusBar compact />
@@ -3519,6 +3617,16 @@ function ScreenShell({
           {children}
         </ScrollView>
       )}
+      {floatingActions.map((action, index) => (
+        <FloatingScanButton
+          key={`${action.variant}-${index}`}
+          variant={action.variant}
+          onPress={action.onPress}
+          small={action.small}
+          offsetIndex={floatingActions.length - index - 1}
+        />
+      ))}
+      {shouldShowFloatingScan ? <FloatingScanButton /> : null}
       {!noNav ? <BottomNav /> : null}
     </View>
   );
@@ -3537,6 +3645,7 @@ function BottomNav() {
     <View style={styles.bottomNav}>
       <NavButton label="홈" type="home" active={currentTab === 'home'} onPress={() => navigation?.navigateTab('home')} />
       <NavButton label="정리함" type="storage" active={currentTab === 'storage'} onPress={() => navigation?.navigateTab('storage')} />
+      <NavButton label="휴지통" type="trash" active={currentTab === 'trash'} onPress={() => navigation?.navigateTab('trash')} />
       <NavButton label="스캔 이력" type="history" active={currentTab === 'history'} onPress={() => navigation?.navigateTab('history')} />
       <NavButton label="설정" type="settings" active={currentTab === 'settings'} onPress={() => navigation?.navigateTab('settings')} />
     </View>
@@ -3550,7 +3659,7 @@ function NavButton({
   onPress,
 }: {
   label: string;
-  type: 'home' | 'storage' | 'history' | 'settings';
+  type: MainTab;
   active?: boolean;
   onPress: () => void;
 }) {
@@ -3562,59 +3671,58 @@ function NavButton({
   );
 }
 
-function NavIcon({ type, active }: { type: 'home' | 'storage' | 'history' | 'settings'; active: boolean }) {
-  if (type === 'home') {
-    return (
-      <View style={styles.navIconFrame}>
-        <Image source={navHomeIcon} style={[styles.navHomeImage, !active && styles.navHomeImageInactive]} resizeMode="contain" />
-      </View>
-    );
-  }
+function FloatingScanButton({
+  variant = 'scan',
+  onPress,
+  small,
+  offsetIndex = 0,
+}: {
+  variant?: FloatingButtonVariant;
+  onPress?: () => void;
+  small?: boolean;
+  offsetIndex?: number;
+}) {
+  const navigation = useContext(NavigationContext);
+  const isTrash = variant === 'trash';
+  const isDelete = variant === 'delete';
+  const isRestore = variant === 'restore';
 
-  if (type === 'storage') {
-    return (
-      <View style={styles.navIconFrame}>
-        <View style={[styles.navLocker, active && styles.navLockerActive]}>
-          <View style={[styles.navLockerDoor, active && styles.navLockerDoorActive]}>
-            <View style={styles.navLockerVent} />
-            <View style={styles.navLockerVent} />
-            <View style={styles.navLockerHandle} />
-          </View>
-        </View>
-      </View>
-    );
-  }
+  return (
+    <Pressable
+      style={[
+        styles.floatingScanButton,
+        { bottom: 78 + offsetIndex * 64 },
+        small && styles.floatingSmallButton,
+        isDelete && styles.floatingDeleteButton,
+        isTrash && styles.floatingTrashButton,
+        isRestore && styles.floatingRestoreButton,
+      ]}
+      onPress={onPress ?? (() => navigation?.navigate('scanFlowSource'))}
+    >
+      {isRestore ? (
+        <FontAwesome5 name="undo-alt" size={small ? 18 : 22} color={mutedText} />
+      ) : null}
+      {isTrash || isDelete ? (
+        <TrashOutlineIcon danger={isTrash} muted={isDelete} compact />
+      ) : !isRestore ? (
+        <AntDesign name="scan" size={30} color={navy} />
+      ) : null}
+    </Pressable>
+  );
+}
 
-  if (type === 'history') {
-    return (
-      <View style={styles.navIconFrame}>
-        <View style={styles.navHistoryChart}>
-          <View style={[styles.navHistoryAxis, active && styles.navHistoryActiveFill]} />
-          <View style={[styles.navHistorySegment, styles.navHistorySegmentOne, active && styles.navHistoryActiveFill]} />
-          <View style={[styles.navHistorySegment, styles.navHistorySegmentTwo, active && styles.navHistoryActiveFill]} />
-          <View style={[styles.navHistoryDot, styles.navHistoryDotOne, active && styles.navHistoryActiveFill]} />
-          <View style={[styles.navHistoryDot, styles.navHistoryDotTwo, active && styles.navHistoryActiveFill]} />
-          <View style={[styles.navHistoryDot, styles.navHistoryDotThree, active && styles.navHistoryActiveFill]} />
-        </View>
-      </View>
-    );
-  }
+function NavIcon({ type, active }: { type: MainTab; active: boolean }) {
+  const iconName: Record<MainTab, FontAwesome5Name> = {
+    home: 'home',
+    storage: 'archive',
+    trash: 'trash-alt',
+    history: 'chart-line',
+    settings: 'cog',
+  };
 
   return (
     <View style={styles.navIconFrame}>
-      <View style={styles.navGearWrap}>
-        <View style={[styles.navGearTooth, styles.navGearTop, active && styles.navIconActiveFill]} />
-        <View style={[styles.navGearTooth, styles.navGearTopRight, active && styles.navIconActiveFill]} />
-        <View style={[styles.navGearTooth, styles.navGearRight, active && styles.navIconActiveFill]} />
-        <View style={[styles.navGearTooth, styles.navGearBottomRight, active && styles.navIconActiveFill]} />
-        <View style={[styles.navGearTooth, styles.navGearBottom, active && styles.navIconActiveFill]} />
-        <View style={[styles.navGearTooth, styles.navGearBottomLeft, active && styles.navIconActiveFill]} />
-        <View style={[styles.navGearTooth, styles.navGearLeft, active && styles.navIconActiveFill]} />
-        <View style={[styles.navGearTooth, styles.navGearTopLeft, active && styles.navIconActiveFill]} />
-        <View style={[styles.navGearRing, active && styles.navGearRingActive]}>
-          <View style={[styles.navGearCore, active && styles.navGearCoreActive]} />
-        </View>
-      </View>
+      <FontAwesome5 name={iconName[type]} size={23} color={active ? navy : mutedText} solid />
     </View>
   );
 }
@@ -3622,6 +3730,34 @@ function NavIcon({ type, active }: { type: 'home' | 'storage' | 'history' | 'set
 function Logo({ large, medium }: { large?: boolean; medium?: boolean }) {
   return (
     <Image source={auraLogo} style={[styles.logoImage, medium && styles.logoImageMedium, large && styles.logoImageLarge]} resizeMode="contain" />
+  );
+}
+
+function AuraGradientWord({ size = 27 }: { size?: number }) {
+  const gradientId = useRef(`auraGradientText-${Math.random().toString(36).slice(2)}`).current;
+  const width = size * 3.25;
+  const height = size + 10;
+
+  return (
+    <Svg width={width} height={height} viewBox={`0 0 ${width} ${height}`}>
+      <Defs>
+        <SvgLinearGradient id={gradientId} x1="0" y1="0" x2={width} y2="0">
+          <Stop offset="0" stopColor="#35C878" />
+          <Stop offset="0.52" stopColor="#8DECA8" />
+          <Stop offset="1" stopColor="#3FBF75" />
+        </SvgLinearGradient>
+      </Defs>
+      <SvgText
+        x={width / 2}
+        y={size + 1}
+        fill={`url(#${gradientId})`}
+        fontSize={size}
+        fontWeight="900"
+        textAnchor="middle"
+      >
+        AURA
+      </SvgText>
+    </Svg>
   );
 }
 
@@ -3798,23 +3934,10 @@ function FolderRow({
   );
 }
 
-function DriveFolderFileRow({ file, selected }: { file: AuraDriveFile; selected: boolean }) {
-  return (
-    <View style={[styles.folderFileRow, selected && styles.folderRowSelected]}>
-      <FileOutlineIcon type={file.type} />
-      <View style={styles.infoMain}>
-        <Text style={styles.infoTitle}>{file.title}</Text>
-      </View>
-      <Text style={styles.folderSizeText}>{formatDataSize(file.sizeMB)}</Text>
-    </View>
-  );
-}
-
 function FolderOutlineIcon() {
   return (
-    <View style={styles.folderOutlineIcon}>
-      <View style={styles.folderOutlineTab} />
-      <View style={styles.folderOutlineBody} />
+    <View style={styles.fileIconFrame}>
+      <FontAwesome5 name="folder" size={28} color={navy} />
     </View>
   );
 }
@@ -3823,28 +3946,29 @@ function FileOutlineIcon({ type }: { type: string }) {
   const normalizedType = type.toUpperCase();
   const isImage = ['JPG', 'JPEG', 'PNG', 'SVG'].includes(normalizedType);
   const isArchive = ['ZIP', 'RAR', '7Z'].includes(normalizedType);
+  const isPdf = normalizedType === 'PDF';
+  const isWord = ['HWP', 'DOC', 'DOCX'].includes(normalizedType);
+  const iconName: FontAwesome5Name = isImage
+    ? 'file-image'
+    : isArchive
+      ? 'file-archive'
+      : isPdf
+        ? 'file-pdf'
+        : isWord
+          ? 'file-alt'
+          : 'file';
 
   return (
-    <View style={styles.fileOutlineIcon}>
-      <View style={styles.fileOutlineFold} />
-      {isImage ? (
-        <>
-          <View style={styles.fileImageSun} />
-          <View style={styles.fileImageMountain} />
-        </>
-      ) : isArchive ? (
-        <View style={styles.fileZipRail}>
-          {[0, 1, 2, 3].map((item) => (
-            <View key={item} style={styles.fileZipTooth} />
-          ))}
-        </View>
-      ) : (
-        <>
-          <View style={styles.fileDocLineWide} />
-          <View style={styles.fileDocLine} />
-          <View style={styles.fileDocLineShort} />
-        </>
-      )}
+    <View style={styles.fileIconFrame}>
+      <FontAwesome5 name={iconName} size={26} color={navy} solid={isArchive} />
+    </View>
+  );
+}
+
+function TrashOutlineIcon({ danger, muted, compact }: { danger?: boolean; muted?: boolean; compact?: boolean }) {
+  return (
+    <View style={[styles.fileIconFrame, compact && styles.fileIconFrameCompact]}>
+      <FontAwesome5 name="trash-alt" size={compact ? 21 : 24} color={danger ? '#D95050' : muted ? mutedText : navy} solid={danger} />
     </View>
   );
 }
@@ -3894,7 +4018,7 @@ function KeywordBottomSheet({
             {isInclude ? '해당 키워드가 있는 메일을 정리 후보에 포함합니다' : '해당 키워드가 있는 메일은 정리 후보에서 보호합니다'}
           </Text>
           <View style={styles.inputRow}>
-            <TextInput value={input} onChangeText={setInput} placeholder="키워드 입력" placeholderTextColor="#6B8194" style={styles.input} />
+            <TextInput value={input} onChangeText={setInput} placeholder="키워드 입력" placeholderTextColor={mutedText} style={styles.input} />
             <Pressable style={styles.addButton} onPress={onAddInput}>
               <Text style={styles.addButtonText}>추가</Text>
             </Pressable>
@@ -3939,16 +4063,19 @@ function PeriodMonthSheet({
   const title = type === 'opened' ? '마지막으로 연 날짜' : '마지막 수정일';
   const onlyNumber = (value: string) => value.replace(/[^0-9]/g, '');
   const clampMonths = (value: number) => Math.max(1, Math.min(120, value));
-  const syncDraft = (value: number) => {
+  const syncDraft = (value: number, commit = false) => {
     const nextValue = clampMonths(value);
     setDraftMonths(nextValue);
     setYearText(`${Math.floor(nextValue / 12)}`);
     setMonthText(`${nextValue % 12}`);
+    if (commit) {
+      onChange(nextValue);
+    }
   };
   const commitTypedValue = () => {
     const years = Number.parseInt(yearText, 10) || 0;
     const restMonths = Number.parseInt(monthText, 10) || 0;
-    syncDraft(years * 12 + Math.min(11, restMonths));
+    syncDraft(years * 12 + Math.min(11, restMonths), true);
   };
   const applyValue = () => {
     const years = Number.parseInt(yearText, 10) || 0;
@@ -3979,7 +4106,7 @@ function PeriodMonthSheet({
         <BottomSheetPanel motion={motion} outputRange={[0, 340]} style={styles.periodMonthSheet} onClose={onClose}>
           <Text style={styles.modalTitle}>{title}</Text>
           <View style={styles.periodMonthControl}>
-            <Pressable style={styles.monthStepButton} onPress={() => syncDraft(draftMonths - 1)}>
+            <Pressable style={styles.monthStepButton} onPress={() => syncDraft(draftMonths - 1, true)}>
               <Text style={styles.monthStepText}>-</Text>
             </Pressable>
             <View style={styles.periodMonthInputGroup}>
@@ -4004,7 +4131,7 @@ function PeriodMonthSheet({
               />
               <Text style={styles.periodUnit}>개월</Text>
             </View>
-            <Pressable style={styles.monthStepButton} onPress={() => syncDraft(draftMonths + 1)}>
+            <Pressable style={styles.monthStepButton} onPress={() => syncDraft(draftMonths + 1, true)}>
               <Text style={styles.monthStepText}>+</Text>
             </Pressable>
           </View>
@@ -4355,11 +4482,6 @@ function PushNotificationPermissionContent() {
           ))}
         </View>
       ))}
-      <View style={styles.permissionReasonNote}>
-        <Text style={styles.permissionReasonNoteText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82}>
-          알림 없이도 앱에서 분석 결과를 확인할 수 있어요.
-        </Text>
-      </View>
     </Card>
   );
 }
@@ -4452,7 +4574,7 @@ function PermissionDetail({
           items: ['메일과 파일의 원문 내용은 AI에게 전달되지 않아요.', '광고성 알림은 보내지 않아요.', '알림 설정은 언제든 변경할 수 있어요.'],
         },
       ],
-      reasonNote: '알림 없이도 앱에서 분석 결과를 확인할 수 있어요.',
+      reasonNote: '',
       guide: '설정에서 언제든 권한을 변경할 수 있어요',
       button: '푸시 알림 허용',
       key: 'alarm' as const,
@@ -4532,7 +4654,7 @@ function KeywordEditor({
     <ScreenShell title={type === 'include' ? '포함 키워드 설정' : '제외 키워드 설정'}>
       <Text style={styles.meta}>{type === 'include' ? '해당 키워드가 있는 메일을 정리 후보에 포함합니다.' : '해당 키워드가 있는 항목은 정리 후보에서 제외합니다.'}</Text>
       <View style={styles.inputRow}>
-        <TextInput value={input} onChangeText={setInput} placeholder="키워드 입력" placeholderTextColor="#6B8194" style={styles.input} />
+        <TextInput value={input} onChangeText={setInput} placeholder="키워드 입력" placeholderTextColor={mutedText} style={styles.input} />
         <Pressable style={styles.addButton} onPress={() => addKeyword(type)}>
           <Text style={styles.addButtonText}>추가</Text>
         </Pressable>
@@ -4645,9 +4767,24 @@ function ScanItemDetailScreen({
   );
 }
 
-function DeleteStatusRow({ title, desc, status, done }: { title: string; desc?: string; status: string; done?: boolean }) {
+function DeleteStatusRow({
+  service,
+  title,
+  desc,
+  status,
+  done,
+}: {
+  service: 'gmail' | 'drive';
+  title: string;
+  desc?: string;
+  status: string;
+  done?: boolean;
+}) {
+  const iconSource = service === 'gmail' ? gmailIcon : googleDriveIcon;
+
   return (
     <View style={styles.deleteStatusRow}>
+      <Image source={iconSource} style={styles.deleteStatusServiceIcon} resizeMode="contain" />
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
         {desc ? <Text style={styles.infoDesc}>{desc}</Text> : null}
@@ -4705,87 +4842,68 @@ function RecentResultRow({ title, desc, value }: { title: string; desc?: string;
 }
 
 function CarbonStatsGraph({ sizeLabel }: { sizeLabel: string }) {
+  const reveal = useRef(new Animated.Value(0)).current;
   const current = sizeLabelToMB(sizeLabel) / 1024;
-  const max = Math.max(5, current);
-  const currentMonth = `${nowForScanRange.getMonth() + 1}월`;
-  const rawPoints = current > 0 ? [{ month: currentMonth, value: current }] : [];
-  const chartWidth = 226;
-  const chartHeight = 116;
-  const points = rawPoints.map((point, index) => ({
-    ...point,
-    label: `${point.value.toFixed(1)}GB`,
-    x: rawPoints.length === 1 ? chartWidth / 2 : index * (chartWidth / (rawPoints.length - 1)),
-    y: chartHeight - (point.value / max) * 96 - 10,
-  }));
-  const baseSegments =
-    points.length === 1
-      ? [{ month: '기준', value: 0, label: '0.0g', x: 14, y: chartHeight - 10 }, points[0]]
-      : points;
-  const segments = baseSegments.slice(0, -1).map((point, index) => {
-    const next = baseSegments[index + 1];
-    const dx = next.x - point.x;
-    const dy = next.y - point.y;
-    return {
-      key: `${point.month}-${next.month}`,
-      left: point.x,
-      top: point.y,
-      width: Math.sqrt(dx * dx + dy * dy),
-      angle: `${Math.atan2(dy, dx)}rad`,
-    };
+  const chartWidth = Math.max(260, Dimensions.get('window').width - 96);
+  const scanValues = current > 0
+    ? [
+        Math.max(0.2, current * 0.55),
+        Math.max(0.3, current * 1.18),
+        Math.max(0.2, current),
+      ]
+    : [0];
+
+  useEffect(() => {
+    reveal.setValue(0);
+    Animated.timing(reveal, {
+      toValue: 1,
+      duration: 850,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+  }, [reveal, sizeLabel]);
+
+  const revealWidth = reveal.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0%', '100%'],
   });
 
   return (
     <View style={styles.statsGraphCard}>
-      <View style={styles.rowBetween}>
-        <Text style={styles.infoTitle}>스캔별 확보 용량</Text>
-        <Text style={styles.infoDesc}>GB</Text>
-      </View>
-      <View style={styles.graphArea}>
-        <View style={styles.graphYAxis}>
-          {['5GB', '3GB', '1GB', '0'].map((tick) => (
-            <Text key={tick} style={styles.graphAxisText}>{tick}</Text>
-          ))}
-        </View>
-        <View style={styles.graphPlot}>
-          <View style={styles.graphGridLineTop} />
-          <View style={styles.graphGridLineMiddle} />
-          <View style={styles.graphGridLineBottom} />
-          {points.length ? (
-            <>
-              <View style={styles.lineGraphLayer}>
-                {segments.map((segment) => (
-                  <View
-                    key={segment.key}
-                    style={[
-                      styles.lineGraphSegment,
-                      {
-                        left: segment.left,
-                        top: segment.top,
-                        width: segment.width,
-                        transform: [{ rotate: segment.angle }],
-                      },
-                    ]}
-                  />
-                ))}
-                {points.map((point) => (
-                  <View key={point.month} style={[styles.lineGraphPointWrap, { left: point.x - 18, top: point.y - 28 }]}>
-                    <Text style={styles.graphValue}>{point.label}</Text>
-                    <View style={styles.lineGraphPoint} />
-                  </View>
-                ))}
-              </View>
-          <View style={styles.graphMonthLayer}>
-            {points.map((point) => (
-              <Text key={point.month} style={[styles.graphMonth, { left: point.x - 16 }]}>{point.month}</Text>
-            ))}
-          </View>
-            </>
-          ) : (
-            <View style={styles.graphEmptyState}>
-              <Text style={styles.infoDesc}>포함된 정리 기록이 없어요</Text>
-            </View>
-          )}
-        </View>
+      <View style={styles.statsChartClip}>
+        <Animated.View style={[styles.statsChartReveal, { width: revealWidth }]}>
+          <LineChart
+            data={{
+              labels: scanValues.map((_, index) => `${index + 1}회`),
+              datasets: [{ data: scanValues }],
+            }}
+            width={chartWidth}
+            height={180}
+            yAxisSuffix="GB"
+            chartConfig={{
+              backgroundGradientFrom: '#FFFFFF',
+              backgroundGradientTo: '#FFFFFF',
+              color: (opacity = 1) => `rgba(82, 190, 116, ${opacity})`,
+              labelColor: (opacity = 1) => `rgba(120, 129, 134, ${opacity})`,
+              decimalPlaces: 1,
+              propsForBackgroundLines: {
+                stroke: '#E8ECEF',
+                strokeDasharray: '',
+              },
+              propsForDots: {
+                r: '4',
+                strokeWidth: '2',
+                stroke: '#52BE74',
+              },
+            }}
+            bezier
+            fromZero
+            segments={4}
+            withOuterLines={false}
+            withVerticalLines={false}
+            style={styles.statsLineChart}
+          />
+        </Animated.View>
       </View>
     </View>
   );
@@ -4798,7 +4916,7 @@ function StorageScreen({
   checked,
   toggle,
   setAll,
-  openFilter,
+  clearSelectionPrefix,
   showToast,
   onReconnect,
   goMail,
@@ -4808,9 +4926,11 @@ function StorageScreen({
   setStorageDriveFolder,
   storageTrashMovedKeys,
   storageDeletedKeys,
+  storageRestoredKeys,
   storageDriveMoveTargets,
   setStorageTrashMovedKeys,
   setStorageDeletedKeys,
+  setStorageRestoredKeys,
   setStorageDriveMoveTargets,
   openStorageDetail,
 }: {
@@ -4820,7 +4940,7 @@ function StorageScreen({
   checked: Record<string, boolean>;
   toggle: (key: string) => void;
   setAll: (prefix: string, keys: string[]) => void;
-  openFilter: () => void;
+  clearSelectionPrefix: (prefix: string) => void;
   showToast: (message: string, target?: Screen, duration?: number) => void;
   onReconnect: () => void;
   goMail: () => void;
@@ -4830,19 +4950,24 @@ function StorageScreen({
   setStorageDriveFolder: (folder: string) => void;
   storageTrashMovedKeys: string[];
   storageDeletedKeys: string[];
+  storageRestoredKeys: string[];
   storageDriveMoveTargets: StorageDriveMoveTargets;
   setStorageTrashMovedKeys: React.Dispatch<React.SetStateAction<string[]>>;
   setStorageDeletedKeys: React.Dispatch<React.SetStateAction<string[]>>;
+  setStorageRestoredKeys: React.Dispatch<React.SetStateAction<string[]>>;
   setStorageDriveMoveTargets: React.Dispatch<React.SetStateAction<StorageDriveMoveTargets>>;
   openStorageDetail: (item: StorageDetailItem) => void;
 }) {
   const isDrive = mode === 'storageDrive' || mode === 'storageDriveTrash';
   const isTrash = mode === 'storageTrash' || mode === 'storageDriveTrash';
+  const screenTitle = isTrash ? '휴지통' : '정리함';
   const [selectionMode, setSelectionMode] = useState(false);
   const [deleteSheetMode, setDeleteSheetMode] = useState<'trash' | 'permanent' | null>(null);
+  const [restoreSheetVisible, setRestoreSheetVisible] = useState(false);
   const [deleteConfirmChecked, setDeleteConfirmChecked] = useState(false);
-  const [storagePage, setStoragePage] = useState(0);
+  const [restoreConfirmChecked, setRestoreConfirmChecked] = useState(false);
   const [storageDriveTrashFolder, setStorageDriveTrashFolder] = useState(driveRootPath);
+  const [storagePage, setStoragePage] = useState(0);
   const prefix = mode === 'storageDriveTrash' ? 'storageDriveTrash' : isTrash ? 'storageTrash' : isDrive ? 'storageDrive' : 'storageMail';
   const summary = scan?.result ?? defaultStorageSummary;
   const mailItems = summary.storageMailItems;
@@ -4906,7 +5031,7 @@ function StorageScreen({
   const itemStorageKey = (id: string) => `${prefix}:${id}`;
   const isHiddenFromCurrentList = (id: string) => {
     const key = itemStorageKey(id);
-    return storageDeletedKeys.includes(key) || (!isTrash && storageTrashMovedKeys.includes(key));
+    return storageDeletedKeys.includes(key) || storageRestoredKeys.includes(key) || (!isTrash && storageTrashMovedKeys.includes(key));
   };
   const trashItems = rawTrashItems.filter((item) => !isHiddenFromCurrentList(item.id));
   const visibleMailItems = mailItems.filter((item) => !isHiddenFromCurrentList(item.id));
@@ -4937,14 +5062,14 @@ function StorageScreen({
     : [];
   const activeItems = mode === 'storageDriveTrash' ? driveTrashItems : isTrash ? trashItems : isDrive ? visibleDriveItems : visibleMailItems;
   const mailPagedSourceItems = !isDrive ? (isTrash ? trashItems : visibleMailItems) : [];
-  const storagePageSize = 20;
-  const totalStoragePages = Math.max(1, Math.ceil(mailPagedSourceItems.length / storagePageSize));
-  const safeStoragePage = Math.min(storagePage, totalStoragePages - 1);
-  const storagePageStart = mailPagedSourceItems.length ? safeStoragePage * storagePageSize : 0;
-  const storagePageEnd = Math.min(mailPagedSourceItems.length, storagePageStart + storagePageSize);
-  const pagedMailItems = mailPagedSourceItems.slice(storagePageStart, storagePageEnd);
-  const canGoPrevStoragePage = safeStoragePage > 0;
-  const canGoNextStoragePage = safeStoragePage < totalStoragePages - 1;
+  const mailPageSize = 20;
+  const mailPageCount = Math.max(1, Math.ceil(mailPagedSourceItems.length / mailPageSize));
+  const safeStoragePage = Math.min(storagePage, mailPageCount - 1);
+  const mailPageStart = safeStoragePage * mailPageSize;
+  const mailPageEnd = Math.min(mailPageStart + mailPageSize, mailPagedSourceItems.length);
+  const mailPagedItems = mailPagedSourceItems.slice(mailPageStart, mailPageEnd);
+  const mailPageRangeStart = mailPagedSourceItems.length ? mailPageStart + 1 : 0;
+  const mailPageRangeEnd = mailPagedSourceItems.length ? mailPageEnd : 0;
   const ids = activeItems.map((item) => item.id);
   const isItemChecked = (id: string) => checked[`${prefix}:${id}`] ?? false;
   const getStorageDriveSelectionIds = (item: StorageDriveItem) => {
@@ -4953,35 +5078,47 @@ function StorageScreen({
       .filter((candidate) => candidate.id === item.id || Boolean(candidate.fullPath && (candidate.fullPath === item.fullPath || candidate.fullPath.startsWith(`${item.fullPath} ›`))))
       .map((candidate) => candidate.id);
   };
-  const isStorageDriveItemChecked = (item: StorageDriveItem) => getStorageDriveSelectionIds(item).every(isItemChecked);
+  const isStorageDriveItemChecked = (item: StorageDriveItem) => {
+    const selectionIds = getStorageDriveSelectionIds(item);
+    if (item.type === 'F' && item.fullPath) {
+      const descendantIds = storageDriveUniverse
+        .filter((candidate) => candidate.id !== item.id && Boolean(candidate.fullPath && candidate.fullPath.startsWith(`${item.fullPath} ›`)))
+        .map((candidate) => candidate.id);
+      if (descendantIds.length > 0 && descendantIds.every(isItemChecked)) return true;
+    }
+    return selectionIds.every(isItemChecked);
+  };
   const getStorageDriveTrashSelectionIds = (item: StorageDriveItem) => {
     if (item.type !== 'F' || !item.fullPath) return [item.id];
     return driveTrashUniverse
       .filter((candidate) => candidate.id === item.id || Boolean(candidate.fullPath && (candidate.fullPath === item.fullPath || candidate.fullPath.startsWith(`${item.fullPath} ›`))))
       .map((candidate) => candidate.id);
   };
-  const isStorageDriveTrashItemChecked = (item: StorageDriveItem) => getStorageDriveTrashSelectionIds(item).every(isItemChecked);
+  const isStorageDriveTrashItemChecked = (item: StorageDriveItem) => {
+    const selectionIds = getStorageDriveTrashSelectionIds(item);
+    if (item.type === 'F' && item.fullPath) {
+      const descendantIds = driveTrashUniverse
+        .filter((candidate) => candidate.id !== item.id && Boolean(candidate.fullPath && candidate.fullPath.startsWith(`${item.fullPath} ›`)))
+        .map((candidate) => candidate.id);
+      if (descendantIds.length > 0 && descendantIds.every(isItemChecked)) return true;
+    }
+    return selectionIds.every(isItemChecked);
+  };
   const activeSelectionIds = isDrive && !isTrash
     ? Array.from(new Set((activeItems as StorageDriveItem[]).flatMap(getStorageDriveSelectionIds)))
     : mode === 'storageDriveTrash'
       ? Array.from(new Set((activeItems as StorageDriveItem[]).flatMap(getStorageDriveTrashSelectionIds)))
-      : ids;
+      : mailPagedItems.map((item) => item.id);
   const allChecked = activeSelectionIds.length > 0 && activeSelectionIds.every(isItemChecked);
   const selectedItems = isDrive && !isTrash
     ? storageDriveUniverse.filter((item) => !isHiddenFromCurrentList(item.id) && isItemChecked(item.id))
     : mode === 'storageDriveTrash'
       ? driveTrashUniverse.filter((item) => !isHiddenFromCurrentList(item.id) && isItemChecked(item.id))
     : activeItems.filter((item) => isItemChecked(item.id));
-  const selectedActiveItemCount = activeSelectionIds.filter(isItemChecked).length;
-  const selectedStorageSize = selectedItems.reduce((sum, item) => {
-    const sizeText = 'meta' in item ? `${item.subtitle} ${item.meta}` : item.subtitle;
-    return sum + extractStorageSizeMB(sizeText);
-  }, 0);
-  const selectedStorageSizeLabel = formatDataSize(selectedStorageSize);
-
+  const selectedActiveItemCount = selectedItems.length;
   useEffect(() => {
     setStoragePage(0);
-  }, [mode, storageDriveFolder]);
+  }, [mode, storageDriveFolder, storageDriveTrashFolder]);
 
   useEffect(() => {
     if (storagePage !== safeStoragePage) {
@@ -5043,9 +5180,26 @@ function StorageScreen({
     setDeleteConfirmChecked(false);
     setDeleteSheetMode(modeToOpen);
   };
+  const openRestoreSheet = () => {
+    if (!selectedItems.length) {
+      showToast('복구할 항목을 선택해주세요');
+      return;
+    }
+    setRestoreConfirmChecked(false);
+    setRestoreSheetVisible(true);
+  };
   const closeDeleteSheet = () => {
     setDeleteSheetMode(null);
     setDeleteConfirmChecked(false);
+  };
+  const closeRestoreSheet = () => {
+    setRestoreSheetVisible(false);
+    setRestoreConfirmChecked(false);
+  };
+  const getMovedTrashOriginalKey = (id: string) => {
+    if (id.startsWith('trash-mail-moved-')) return `storageMail:${id.replace('trash-mail-moved-', '')}`;
+    if (id.startsWith('trash-drive-moved-')) return `storageDrive:${id.replace('trash-drive-moved-', '')}`;
+    return null;
   };
   const confirmStorageDelete = () => {
     if (!deleteConfirmChecked) {
@@ -5057,18 +5211,56 @@ function StorageScreen({
     closeDeleteSheet();
     if (permanent) {
       setStorageDeletedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
+      clearSelectionPrefix(prefix);
+      setSelectionMode(false);
       showToast('영구 삭제가 완료됐어요');
       return;
     }
 
     setStorageTrashMovedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
+    clearSelectionPrefix(prefix);
+    setSelectionMode(false);
     showToast('선택 항목을 휴지통으로 이동했어요');
-    goTrash();
   };
+  const confirmStorageRestore = () => {
+    if (!restoreConfirmChecked) {
+      showToast('복구 확인 체크가 필요합니다');
+      return;
+    }
+
+    const selectedKeys = selectedItems.map((item) => itemStorageKey(item.id));
+    const movedSourceKeys = selectedItems
+      .map((item) => getMovedTrashOriginalKey(item.id))
+      .filter((key): key is string => Boolean(key));
+
+    closeRestoreSheet();
+    setStorageRestoredKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
+    if (movedSourceKeys.length) {
+      setStorageTrashMovedKeys((items) => items.filter((key) => !movedSourceKeys.includes(key)));
+    }
+    clearSelectionPrefix(prefix);
+    setSelectionMode(false);
+    showToast('선택 항목을 정리함으로 복구했어요');
+  };
+  const storageFloatingActions: FloatingAction[] | undefined = selectionMode && !deleteSheetMode && !restoreSheetVisible
+    ? isTrash
+      ? [
+          { variant: 'restore', onPress: openRestoreSheet, small: true },
+          { variant: 'trash', onPress: () => openDeleteSheet('permanent') },
+        ]
+      : [{ variant: 'delete', onPress: () => openDeleteSheet('trash') }]
+    : undefined;
 
   return (
     <View style={styles.modalScreenRoot}>
-    <ScreenShell title="정리함" titleIcon="storage" hideBack tightBottom disableScroll>
+    <ScreenShell
+      title={screenTitle}
+      titleIcon={isTrash ? 'trash' : 'storage'}
+      hideBack
+      tightBottom
+      hideFloatingScan={selectionMode || Boolean(deleteSheetMode) || restoreSheetVisible}
+      floatingAction={storageFloatingActions}
+    >
       <View style={styles.storagePrimaryTabs}>
         <Pressable style={[styles.storagePrimaryTab, !isDrive && styles.storagePrimaryTabActive]} onPress={goMail}>
           <Text style={[styles.storagePrimaryTabText, !isDrive && styles.storagePrimaryTabTextActive]}>메일</Text>
@@ -5077,95 +5269,66 @@ function StorageScreen({
           <Text style={[styles.storagePrimaryTabText, isDrive && styles.storagePrimaryTabTextActive]}>Drive</Text>
         </Pressable>
       </View>
-      <View style={styles.segment}>
-        <Pressable style={[styles.segmentItem, !isTrash && styles.segmentSubActive]} onPress={isDrive ? goDrive : goMail}>
-          <Text style={styles.segmentText}>저장된 데이터</Text>
-        </Pressable>
-        <Pressable style={[styles.segmentItem, isTrash && styles.segmentSubActive]} onPress={goTrash}>
-          <Text style={styles.segmentText}>휴지통</Text>
-        </Pressable>
-      </View>
       {!serviceConnected ? (
         <PermissionRevokedCard onPress={onReconnect} />
       ) : (
-        <>
-          <View style={styles.storageSummaryBar}>
-            <Text style={styles.storageSummaryText}>
-              {mode === 'storageDriveTrash' ? `Drive 휴지통 ${driveTrashItems.length}개` : isTrash ? `휴지통 ${trashItems.length}개` : isDrive ? `Drive ${visibleDriveItems.length}개` : `메일 ${visibleMailItems.length}개`}
-            </Text>
-            <Pressable onPress={openFilter} hitSlop={8}>
-              <Text style={styles.storageFilterText}>필터/정렬</Text>
-            </Pressable>
-          </View>
-          {!activeItems.length ? (
-            <EmptyState
-              title={isTrash ? '휴지통이 비어있어요' : isDrive ? '현재 폴더가 비어있어요' : '메일이 없어요'}
-              desc={isDrive && !isTrash ? '이 위치 아래에 표시할 폴더나 파일이 없어요.' : '현재 표시할 항목이 없어요.'}
-            />
+        <View style={styles.storageLooseList}>
+          {isDrive ? (
+            <View style={styles.storagePathCard}>
+              <View style={styles.storageBreadcrumbRow}>
+                {storageDriveBreadcrumbs.map((crumb, index) => (
+                  <React.Fragment key={crumb.path}>
+                    <Pressable
+                      onPress={() => {
+                        if (mode === 'storageDriveTrash') {
+                          setStorageDriveTrashFolder(crumb.path);
+                          return;
+                        }
+                        setStorageDriveFolder(crumb.path);
+                      }}
+                      hitSlop={8}
+                    >
+                      <Text style={[styles.storageBreadcrumbText, index === storageDriveBreadcrumbs.length - 1 && styles.storageBreadcrumbCurrent]}>
+                        {crumb.label}
+                      </Text>
+                    </Pressable>
+                    {index < storageDriveBreadcrumbs.length - 1 ? <Text style={styles.storageBreadcrumbDivider}>›</Text> : null}
+                  </React.Fragment>
+                ))}
+              </View>
+              <Text style={styles.storagePathCountText}>{activeItems.length}개</Text>
+            </View>
           ) : (
-              <View style={styles.storageListBox}>
-                {isDrive ? (
-                  <View style={styles.storagePathCard}>
-                    <View style={styles.storageBreadcrumbRow}>
-                      {storageDriveBreadcrumbs.map((crumb, index) => (
-                        <React.Fragment key={crumb.path}>
-                          <Pressable
-                            onPress={() => {
-                              if (mode === 'storageDriveTrash') {
-                                setStorageDriveTrashFolder(crumb.path);
-                                return;
-                              }
-                              setStorageDriveFolder(crumb.path);
-                            }}
-                            hitSlop={8}
-                          >
-                            <Text style={[styles.storageBreadcrumbText, index === storageDriveBreadcrumbs.length - 1 && styles.storageBreadcrumbCurrent]}>
-                              {crumb.label}
-                            </Text>
-                          </Pressable>
-                          {index < storageDriveBreadcrumbs.length - 1 ? <Text style={styles.storageBreadcrumbDivider}>›</Text> : null}
-                        </React.Fragment>
-                      ))}
-                    </View>
-                  </View>
-                ) : null}
-                {!isDrive ? (
-                  <View style={[styles.storagePathCard, styles.storagePagerCard]}>
-                    <Text style={styles.storagePagerText}>
-                      {mailPagedSourceItems.length}개 중 {storagePageStart + 1}~{storagePageEnd}개
-                    </Text>
-                    <View style={styles.storagePagerButtons}>
-                      <Pressable
-                        style={[styles.storagePagerButton, !canGoPrevStoragePage && styles.storagePagerButtonDisabled]}
-                        onPress={() => {
-                          if (canGoPrevStoragePage) setStoragePage((page) => Math.max(0, page - 1));
-                        }}
-                      >
-                        <Text style={[styles.storagePagerGlyph, !canGoPrevStoragePage && styles.storagePagerGlyphDisabled]}>‹</Text>
-                      </Pressable>
-                      <Pressable
-                        style={[styles.storagePagerButton, !canGoNextStoragePage && styles.storagePagerButtonDisabled]}
-                        onPress={() => {
-                          if (canGoNextStoragePage) setStoragePage((page) => Math.min(totalStoragePages - 1, page + 1));
-                        }}
-                      >
-                        <Text style={[styles.storagePagerGlyph, !canGoNextStoragePage && styles.storagePagerGlyphDisabled]}>›</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-                ) : null}
-                {activeItems.length && selectionMode ? (
-                  <Pressable style={styles.storageSelectAllRowInBox} onPress={toggleAllActiveStorageItems}>
-                    <CheckBox checked={allChecked} onPress={toggleAllActiveStorageItems} compact />
-                    <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택'}</Text>
-                  </Pressable>
-                ) : null}
-                <ScrollView
-                  style={styles.storageListScroll}
-                  contentContainerStyle={styles.storageListContent}
-                  nestedScrollEnabled
-                  showsVerticalScrollIndicator={(isDrive ? activeItems.length : pagedMailItems.length) > 5}
+            <View style={[styles.storagePathCard, styles.storagePagerCard]}>
+              <Text style={styles.storagePagerText}>
+                메일 {mailPagedSourceItems.length}개 중 {mailPageRangeStart}~{mailPageRangeEnd}개
+              </Text>
+              <View style={styles.storagePagerButtons}>
+                <Pressable
+                  style={[styles.storagePagerButton, safeStoragePage <= 0 && styles.storagePagerButtonDisabled]}
+                  disabled={safeStoragePage <= 0}
+                  onPress={() => setStoragePage((page) => Math.max(0, page - 1))}
                 >
+                  <Text style={[styles.storagePagerGlyph, safeStoragePage <= 0 && styles.storagePagerGlyphDisabled]}>‹</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.storagePagerButton, safeStoragePage >= mailPageCount - 1 && styles.storagePagerButtonDisabled]}
+                  disabled={safeStoragePage >= mailPageCount - 1}
+                  onPress={() => setStoragePage((page) => Math.min(mailPageCount - 1, page + 1))}
+                >
+                  <Text style={[styles.storagePagerGlyph, safeStoragePage >= mailPageCount - 1 && styles.storagePagerGlyphDisabled]}>›</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
+          {activeItems.length > 0 && selectionMode ? (
+            <Pressable style={styles.storageSelectAllRowInBox} onPress={toggleAllActiveStorageItems}>
+              <CheckBox checked={allChecked} onPress={toggleAllActiveStorageItems} compact />
+              <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택'}</Text>
+            </Pressable>
+          ) : null}
+          {activeItems.length ? (
+            <View style={styles.storageListContent}>
                   {mode === 'storageDriveTrash'
                     ? driveTrashItems.map((item) => (
                         <StorageDriveCard
@@ -5185,7 +5348,7 @@ function StorageScreen({
                         />
                       ))
                     : isTrash
-                    ? pagedMailItems.map((item) => (
+                    ? mailPagedItems.map((item) => (
                         <StorageMailCard
                           key={item.id}
                           prefix={prefix}
@@ -5214,7 +5377,7 @@ function StorageScreen({
                           compact
                         />
                       ))
-                      : pagedMailItems.map((item) => (
+                      : mailPagedItems.map((item) => (
                         <StorageMailCard
                           key={item.id}
                           prefix={prefix}
@@ -5227,34 +5390,33 @@ function StorageScreen({
                           compact
                         />
                       ))}
-                </ScrollView>
-              </View>
-            )}
-          {activeItems.length ? (
-            <>
-              {isDrive && !isTrash ? (
-                <OutlineButton title="삭제하기" onPress={() => openDeleteSheet('trash')} />
-              ) : (
-                <OutlineButton
-                  title="삭제하기"
-                  danger={isTrash}
-                  onPress={() => (isTrash ? openDeleteSheet('permanent') : openDeleteSheet('trash'))}
-                />
-              )}
-            </>
-          ) : null}
-        </>
+            </View>
+          ) : (
+            <EmptyState
+              title={isTrash ? '휴지통이 비어있어요' : isDrive ? '현재 폴더가 비어있어요' : '메일이 없어요'}
+              desc={isDrive && !isTrash ? '이 위치 아래에 표시할 폴더나 파일이 없어요.' : '현재 표시할 항목이 없어요.'}
+            />
+          )}
+        </View>
       )}
     </ScreenShell>
     {deleteSheetMode ? (
       <StorageDeleteSheet
         permanent={deleteSheetMode === 'permanent'}
         count={selectedItems.length}
-        sizeLabel={selectedStorageSizeLabel}
         checked={deleteConfirmChecked}
         onToggle={() => setDeleteConfirmChecked((value) => !value)}
         onCancel={closeDeleteSheet}
         onConfirm={confirmStorageDelete}
+      />
+    ) : null}
+    {restoreSheetVisible ? (
+      <StorageRestoreSheet
+        count={selectedItems.length}
+        checked={restoreConfirmChecked}
+        onToggle={() => setRestoreConfirmChecked((value) => !value)}
+        onCancel={closeRestoreSheet}
+        onConfirm={confirmStorageRestore}
       />
     ) : null}
     </View>
@@ -5276,7 +5438,6 @@ function PermissionRevokedCard({ onPress }: { onPress: () => void }) {
 function StorageDeleteSheet({
   permanent,
   count,
-  sizeLabel,
   checked,
   onToggle,
   onCancel,
@@ -5284,7 +5445,6 @@ function StorageDeleteSheet({
 }: {
   permanent: boolean;
   count: number;
-  sizeLabel: string;
   checked: boolean;
   onToggle: () => void;
   onCancel: () => void;
@@ -5309,7 +5469,7 @@ function StorageDeleteSheet({
         <View style={permanent ? styles.storageDeleteWarningBox : styles.storageDeleteInfoBox}>
           <Text style={styles.storageDeleteWarningTitle}>{permanent ? '이 작업은 되돌릴 수 없습니다' : '휴지통으로 이동됩니다'}</Text>
           <Text style={styles.storageDeleteWarningText}>
-            선택한 {count}개 · 총 {sizeLabel}가 {permanent ? '완전히 삭제됩니다' : '휴지통으로 이동됩니다'}
+            선택한 {count}개 항목이 {permanent ? '완전히 삭제됩니다' : '휴지통으로 이동됩니다'}
           </Text>
         </View>
         <CheckLine
@@ -5321,6 +5481,51 @@ function StorageDeleteSheet({
           <OutlineButton title="취소" onPress={onCancel} half />
           <Pressable style={[styles.storageDeleteDangerButton, !checked && styles.dangerButtonDisabled, styles.halfButton]} onPress={onConfirm}>
             <Text style={styles.dangerText}>{permanent ? '영구 삭제' : '휴지통 이동'}</Text>
+          </Pressable>
+        </View>
+      </BottomSheetPanel>
+    </View>
+  );
+}
+
+function StorageRestoreSheet({
+  count,
+  checked,
+  onToggle,
+  onCancel,
+  onConfirm,
+}: {
+  count: number;
+  checked: boolean;
+  onToggle: () => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const sheetMotion = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    sheetMotion.setValue(1);
+    Animated.timing(sheetMotion, {
+      toValue: 0,
+      duration: 240,
+      useNativeDriver: false,
+    }).start();
+  }, [sheetMotion]);
+
+  return (
+    <View style={styles.storageDeleteOverlay}>
+      <Pressable style={StyleSheet.absoluteFill} onPress={onCancel} />
+      <BottomSheetPanel motion={sheetMotion} outputRange={[0, 360]} style={styles.storageDeleteSheet} onClose={onCancel}>
+        <Text style={styles.storageDeleteTitle}>정리함으로 복구할까요?</Text>
+        <View style={styles.storageRestoreInfoBox}>
+          <Text style={styles.storageDeleteWarningTitle}>정리함으로 다시 이동됩니다</Text>
+          <Text style={styles.storageDeleteWarningText}>선택한 {count}개 항목이 정리함으로 복구됩니다</Text>
+        </View>
+        <CheckLine label="복구 내용을 확인했습니다" checked={checked} onPress={onToggle} />
+        <View style={styles.twoButtons}>
+          <OutlineButton title="취소" onPress={onCancel} half />
+          <Pressable style={[styles.storageRestoreButton, !checked && styles.restoreButtonDisabled, styles.halfButton]} onPress={onConfirm}>
+            <Text style={styles.restoreText}>복구하기</Text>
           </Pressable>
         </View>
       </BottomSheetPanel>
@@ -5572,9 +5777,18 @@ function ListScreen({
   const selectedCount = selectedItems.length;
   const selectedSizeLabel = formatDataSize(sumScanItemSize(selectedItems));
 
+  const noticeParts = notice?.split('\n') ?? [];
+
   return (
     <ScreenShell title={title}>
-      {notice ? <Text style={styles.listNoticeText}>{notice}</Text> : null}
+      {notice ? (
+        <Text style={styles.listNoticeText}>
+          {noticeParts[0]}
+          {noticeParts.slice(1).map((part) => (
+            <Text key={part} style={styles.listNoticeDanger}>{'\n'}{part}</Text>
+          ))}
+        </Text>
+      ) : null}
       <Pressable style={styles.selectAllRow} onPress={() => setAll(prefix, items.map((item) => item.id))}>
         <CheckBox checked={allChecked} onPress={() => setAll(prefix, items.map((item) => item.id))} />
         <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택'}</Text>
@@ -5670,7 +5884,7 @@ function ToggleRow({
   });
   const trackColor = progress.interpolate({
     inputRange: [0, 1],
-    outputRange: ['#C8D5DD', navy],
+    outputRange: ['#DFF6E6', navy],
   });
 
   return (
@@ -5772,67 +5986,33 @@ function EmptyState({ title, desc }: { title: string; desc: string }) {
 }
 
 function GhostScanAnimation({ onDone, skip }: { onDone: () => void; skip?: boolean }) {
-  const [foundStep, setFoundStep] = useState(skip ? 2 : 0);
   const doneCalled = useRef(false);
 
   useEffect(() => {
-    if (skip) {
-      setFoundStep(2);
-      return;
-    }
-
-    const firstTimer = setTimeout(() => setFoundStep(1), 620);
-    const secondTimer = setTimeout(() => setFoundStep(2), 1120);
     const doneTimer = setTimeout(() => {
       if (!doneCalled.current) {
         doneCalled.current = true;
         onDone();
       }
-    }, 1850);
+    }, skip ? 0 : 450);
 
     return () => {
-      clearTimeout(firstTimer);
-      clearTimeout(secondTimer);
       clearTimeout(doneTimer);
     };
-  }, [skip]);
+  }, [onDone, skip]);
 
   return (
     <View style={styles.ghostPreviewCard}>
-      <View style={styles.ghostPreviewHeader}>
-        <Text style={styles.ghostPreviewTitle}>분석 결과 요약</Text>
-        <Text style={styles.ghostPreviewPercent}>{foundStep >= 2 ? '완료' : '분석 중'}</Text>
+      <Text style={styles.ghostPreviewTitle}>분석 결과 요약</Text>
+      <View style={styles.resultMetricGrid}>
+        <ResultMetricCard label="정리 후보" value="8개" />
+        <ResultMetricCard label="예상 확보" value="2.1GB" />
       </View>
-      <View style={styles.onboardingMetricGrid}>
-        <View style={styles.onboardingMetricCard}>
-          <Text style={styles.onboardingMetricLabel}>정리 후보</Text>
-          <Text style={styles.onboardingMetricValue}>{foundStep >= 2 ? '124개' : '...'}</Text>
-        </View>
-        <View style={styles.onboardingMetricCard}>
-          <Text style={styles.onboardingMetricLabel}>예상 확보</Text>
-          <Text style={styles.onboardingMetricValue}>{foundStep >= 2 ? '2.1GB' : '...'}</Text>
-        </View>
-      </View>
-      <View style={styles.ghostDataPanel}>
-        <GhostDataRow label="광고·프로모션 메일" meta="42개 · 320MB" active={foundStep >= 1} />
-        <GhostDataRow label="오래된 메일" meta="31개 · 280MB" active={foundStep >= 1} />
-        <GhostDataRow label="중복 파일" meta="18개 · 1.1GB" active={foundStep >= 2} />
-        <GhostDataRow label="대용량 파일" meta="33개 · 400MB" active={foundStep >= 2} />
-        <Text style={styles.ghostProtectedText}>제외 키워드 보호 대상 확인</Text>
-      </View>
-    </View>
-  );
-}
-
-function GhostDataRow({ label, meta, active }: { label: string; meta: string; active: boolean }) {
-  return (
-    <View style={[styles.ghostDataRow, active && styles.ghostDataRowActive]}>
-      <View style={[styles.ghostDot, active && styles.ghostDotActive]} />
-      <View style={styles.infoMain}>
-        <Text style={styles.ghostDataLabel}>{label}</Text>
-        <Text style={styles.ghostDataMeta}>{meta}</Text>
-      </View>
-      <Text style={[styles.ghostDataStatus, active && styles.ghostDataStatusActive]}>{active ? '›' : '...'}</Text>
+      <ResultCategoryCard title="광고·프로모션 메일" desc="2개 · 93MB" onPress={() => undefined} />
+      <ResultCategoryCard title="오래된 메일" desc="0개 · 0.0MB" onPress={() => undefined} />
+      <ResultCategoryCard title="오래된 파일" desc="5개 · 1.2GB" onPress={() => undefined} />
+      <ResultCategoryCard title="중복 파일" desc="2개 · 2.0GB" warning="미선택 2개" onPress={() => undefined} />
+      <ResultCategoryCard title="대용량 파일" desc="1개 · 760MB" onPress={() => undefined} />
     </View>
   );
 }
@@ -5865,65 +6045,17 @@ function CarbonSaveAnimation({ onDone, skip }: { onDone: () => void; skip?: bool
 
   return (
     <View style={styles.carbonPreviewCard}>
-      <View style={styles.carbonTopRow}>
-        <Text style={styles.carbonTopLabel}>스캔 이력</Text>
-      </View>
       <View style={styles.historyTotalMiniCard}>
         <View>
-          <Text style={styles.onboardingMetricLabel}>전체 누적 정리 용량</Text>
+          <Text style={styles.onboardingMetricLabel}>전체 누적 삭제 용량</Text>
           <Text style={styles.historyTotalMiniValue}>{step >= 1 ? '6.8GB' : '...'}</Text>
         </View>
         <View style={styles.historyMiniPill}>
           <Text style={styles.historyMiniPillText}>최근 스캔 +2.6GB</Text>
         </View>
       </View>
-      <View style={styles.historyGraphMiniCard}>
-        <View style={styles.rowBetween}>
-          <Text style={styles.historyGraphMiniTitle}>스캔별 정리 용량</Text>
-          <Text style={styles.historyMiniUnit}>GB</Text>
-        </View>
-        <HistoryMiniLineChart />
-      </View>
-    </View>
-  );
-}
-
-function HistoryMiniLineChart() {
-  const chartPoints = [
-    { scan: '1회', label: '3.4GB', x: 58, y: 36, labelY: 19 },
-    { scan: '2회', label: '0.8GB', x: 126, y: 78, labelY: 99 },
-    { scan: '3회', label: '2.6GB', x: 194, y: 52, labelY: 35 },
-  ];
-
-  return (
-    <View style={styles.historyMiniSvgWrap}>
-      <Svg width="100%" height="100%" viewBox="0 0 230 122">
-        <Line x1="30" y1="18" x2="218" y2="18" stroke="#E3ECF1" strokeWidth="1.5" />
-        <Line x1="30" y1="58" x2="218" y2="58" stroke="#E3ECF1" strokeWidth="1.5" />
-        <Line x1="30" y1="98" x2="218" y2="98" stroke="#E3ECF1" strokeWidth="1.5" />
-        <SvgText x="16" y="18" fill="#6B8194" fontSize="10" fontWeight="900" textAnchor="middle">5</SvgText>
-        <SvgText x="16" y="58" fill="#6B8194" fontSize="10" fontWeight="900" textAnchor="middle">3</SvgText>
-        <SvgText x="16" y="98" fill="#6B8194" fontSize="10" fontWeight="900" textAnchor="middle">1</SvgText>
-        <Path
-          d="M58 36 L126 78 L194 52"
-          fill="none"
-          stroke={navy}
-          strokeWidth="4.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-        {chartPoints.map((point) => (
-          <React.Fragment key={point.scan}>
-            <SvgText x={point.x} y={point.labelY} fill={navy} fontSize="10.5" fontWeight="900" textAnchor="middle">
-              {point.label}
-            </SvgText>
-            <Circle cx={point.x} cy={point.y} r="5.5" fill={navy} stroke="#FFFFFF" strokeWidth="2" />
-            <SvgText x={point.x} y="117" fill="#49677C" fontSize="10" fontWeight="900" textAnchor="middle">
-              {point.scan}
-            </SvgText>
-          </React.Fragment>
-        ))}
-      </Svg>
+      <SectionTitle>스캔별 확보 용량 현황</SectionTitle>
+      <CarbonStatsGraph sizeLabel="2.6GB" />
     </View>
   );
 }
@@ -6059,7 +6191,7 @@ function ConnectedSuccessIcon({ onDone, skip }: { onDone: () => void; skip?: boo
     const spin = Animated.loop(
       Animated.timing(rotate, {
         toValue: 1,
-        duration: 760,
+        duration: 420,
         useNativeDriver: false,
       })
     );
@@ -6067,7 +6199,7 @@ function ConnectedSuccessIcon({ onDone, skip }: { onDone: () => void; skip?: boo
 
     const startedAt = Date.now();
     const timer = setInterval(() => {
-      const next = Math.min(100, Math.round(((Date.now() - startedAt) / 1350) * 100));
+      const next = Math.min(100, Math.round(((Date.now() - startedAt) / 450) * 100));
       setProgress(next);
 
       if (next >= 100) {
@@ -6093,7 +6225,7 @@ function ConnectedSuccessIcon({ onDone, skip }: { onDone: () => void; skip?: boo
           }
         });
       }
-    }, 35);
+    }, 20);
 
     return () => {
       clearInterval(timer);
@@ -6130,8 +6262,35 @@ function ConnectedSuccessIcon({ onDone, skip }: { onDone: () => void; skip?: boo
 }
 
 function ProgressCircle({ progress, compact }: { progress: number; compact?: boolean }) {
+  const spin = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const animation = Animated.loop(
+      Animated.timing(spin, {
+        toValue: 1,
+        duration: 1150,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      }),
+    );
+    animation.start();
+    return () => animation.stop();
+  }, [spin]);
+
+  const rotate = spin.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0deg', '360deg'],
+  });
+
   return (
     <View style={[styles.progressCircle, compact && styles.progressCircleCompact]}>
+      <Animated.View
+        style={[
+          styles.progressSpinnerRing,
+          compact && styles.progressSpinnerRingCompact,
+          { transform: [{ rotate }] },
+        ]}
+      />
       <Text style={[styles.progressText, compact && styles.progressTextCompact]}>{progress}%</Text>
     </View>
   );
@@ -6181,7 +6340,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderLeftWidth: 1,
     borderLeftColor: line,
-    shadowColor: '#09233F',
+    shadowColor: '#000000',
     shadowOpacity: 0.18,
     shadowRadius: 18,
     shadowOffset: { width: -8, height: 0 },
@@ -6206,10 +6365,42 @@ const styles = StyleSheet.create({
   },
   scanPanelSubtitle: {
     marginTop: 5,
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12.5,
     fontWeight: '900',
     lineHeight: 17,
+  },
+  scanFullContent: {
+    flex: 1,
+    gap: 12,
+    paddingBottom: 118,
+  },
+  scanFullPanel: {
+    minHeight: 280,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 13,
+    paddingVertical: 24,
+  },
+  scanFullKicker: {
+    color: text,
+    fontSize: 18,
+    lineHeight: 24,
+    fontWeight: '900',
+  },
+  scanFullStatusText: {
+    color: mutedText,
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: '900',
+  },
+  scanFullStatusGrid: {
+    gap: 10,
+    marginBottom: 28,
+  },
+  scanProgressSpacer: {
+    flex: 1,
+    minHeight: 20,
   },
   toastOverlay: {
     position: 'absolute',
@@ -6218,14 +6409,14 @@ const styles = StyleSheet.create({
     bottom: 64,
     minHeight: 58,
     borderRadius: 14,
-    backgroundColor: 'rgba(11, 53, 102, 0.78)',
+    backgroundColor: 'rgba(87, 200, 121, 0.92)',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 18,
     paddingVertical: 12,
     zIndex: 999,
     elevation: 999,
-    shadowColor: '#0B2A4A',
+    shadowColor: '#57C879',
     shadowOpacity: 0.18,
     shadowRadius: 12,
     shadowOffset: { width: 0, height: 6 },
@@ -6259,6 +6450,9 @@ const styles = StyleSheet.create({
   shell: {
     flex: 1,
     backgroundColor: '#FFFFFF',
+  },
+  shellTint: {
+    backgroundColor: '#F2FFF7',
   },
   modalScreenRoot: {
     flex: 1,
@@ -6357,11 +6551,11 @@ const styles = StyleSheet.create({
     color: text,
     fontSize: 21,
     lineHeight: 27,
-    fontWeight: '900',
+    fontWeight: '800',
   },
   subtitle: {
     marginTop: 5,
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12.5,
     fontWeight: '900',
     lineHeight: 17,
@@ -6395,20 +6589,20 @@ const styles = StyleSheet.create({
   logoImage: {
     width: 56,
     height: 56,
-    borderRadius: 14,
+    borderRadius: 0,
   },
   logoImageMedium: {
-    width: 104,
-    height: 104,
-    borderRadius: 22,
+    width: 118,
+    height: 118,
+    borderRadius: 0,
     alignSelf: 'center',
     marginTop: 18,
     marginBottom: 16,
   },
   logoImageLarge: {
-    width: 128,
-    height: 128,
-    borderRadius: 24,
+    width: 248,
+    height: 248,
+    borderRadius: 0,
     alignSelf: 'center',
   },
   logoText: {
@@ -6431,20 +6625,25 @@ const styles = StyleSheet.create({
     marginBottom: 22,
   },
   heroTitle: {
-    marginVertical: 42,
+    marginTop: 34,
+    marginBottom: 24,
     color: text,
     textAlign: 'center',
     fontSize: 22,
     lineHeight: 32,
     fontWeight: '900',
   },
+  heroTitleBrand: {
+    color: navy,
+  },
   primaryButton: {
     height: 50,
-    borderRadius: 8,
+    borderRadius: 18,
     backgroundColor: navy,
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: 8,
+    ...gentleShadow,
   },
   primaryButtonLower: {
     marginTop: 'auto',
@@ -6452,13 +6651,13 @@ const styles = StyleSheet.create({
   primaryText: {
     color: '#FFFFFF',
     fontSize: 15,
-    fontWeight: '900',
+    fontWeight: '800',
   },
   outlineButton: {
     height: 48,
-    borderRadius: 9,
-    borderWidth: 1.5,
-    borderColor: navy,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: line,
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: 8,
@@ -6468,9 +6667,9 @@ const styles = StyleSheet.create({
     borderColor: '#D92F36',
   },
   outlineText: {
-    color: navy,
+    color: text,
     fontSize: 15,
-    fontWeight: '900',
+    fontWeight: '800',
   },
   outlineTextDanger: {
     color: '#D92F36',
@@ -6511,7 +6710,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   initialConsentSub: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12.5,
     lineHeight: 16,
     fontWeight: '800',
@@ -6520,10 +6719,14 @@ const styles = StyleSheet.create({
     alignSelf: 'center',
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 35,
-    marginBottom: 24,
+    marginTop: 0,
+    marginBottom: 10,
     width: 260,
     minHeight: 38,
+  },
+  initialActionBlock: {
+    marginTop: 4,
+    gap: 4,
   },
   initialConsentLinkTextBox: {
     alignItems: 'center',
@@ -6546,7 +6749,7 @@ const styles = StyleSheet.create({
     marginTop: 9,
     width: 218,
     height: 1,
-    backgroundColor: '#6E8495',
+    backgroundColor: line,
   },
   consentText: {
     color: text,
@@ -6561,7 +6764,7 @@ const styles = StyleSheet.create({
   },
   helperText: {
     textAlign: 'center',
-    color: '#46677A',
+    color: mutedText,
     fontSize: 12,
     fontWeight: '800',
     lineHeight: 18,
@@ -6569,8 +6772,8 @@ const styles = StyleSheet.create({
   checkbox: {
     width: 26,
     height: 26,
-    borderRadius: 6,
-    borderWidth: 1.5,
+    borderRadius: 8,
+    borderWidth: 1,
     borderColor: navy,
     backgroundColor: '#FFFFFF',
     alignItems: 'center',
@@ -6596,12 +6799,13 @@ const styles = StyleSheet.create({
     lineHeight: 17,
   },
   card: {
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 14,
+    borderRadius: 22,
     padding: 16,
     backgroundColor: '#FFFFFF',
     gap: 8,
+    ...softShadow,
   },
   cardTint: {
     backgroundColor: pale,
@@ -6648,7 +6852,7 @@ const styles = StyleSheet.create({
   capacityCard: {
     minHeight: 82,
     justifyContent: 'center',
-    borderRadius: 14,
+    borderRadius: 20,
     paddingHorizontal: 15,
   },
   capacityCardRow: {
@@ -6665,12 +6869,12 @@ const styles = StyleSheet.create({
     color: navy,
     textAlign: 'right',
     fontSize: 12,
-    fontWeight: '900',
+    fontWeight: '800',
   },
   capacityUsageTrack: {
     height: 9,
     borderRadius: 9,
-    backgroundColor: '#D8E5EC',
+    backgroundColor: '#EAF9EF',
     overflow: 'hidden',
   },
   capacityUsageFill: {
@@ -6682,66 +6886,60 @@ const styles = StyleSheet.create({
     height: 0,
   },
   homeSummaryCard: {
-    minHeight: 178,
+    minHeight: 154,
     justifyContent: 'space-between',
-    paddingVertical: 15,
+    paddingVertical: 16,
+  },
+  homeSummaryCapacityRow: {
+    minHeight: 60,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 14,
   },
   homeSummaryValue: {
     color: text,
-    textAlign: 'right',
-    fontSize: 25,
-    fontWeight: '900',
+    fontSize: 30,
+    fontWeight: '800',
   },
   homeSummaryCapacityLabel: {
     minWidth: 110,
     color: text,
     fontSize: 18,
     lineHeight: 24,
-    fontWeight: '900',
+    fontWeight: '800',
   },
-  homeTrashButton: {
-    height: 42,
-    minWidth: 172,
-    paddingHorizontal: 22,
-    alignSelf: 'center',
-    marginTop: 6,
-    borderRadius: 10,
-    borderWidth: 1.6,
-    borderColor: navy,
+  homeTrashIconButton: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
     backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: line,
+    ...gentleShadow,
   },
-  homeTrashButtonText: {
-    color: navy,
-    fontSize: 15,
-    fontWeight: '900',
-  },
-  homeTrashGuide: {
-    color: '#49677C',
-    textAlign: 'center',
-    fontSize: 12,
-    lineHeight: 17,
-    fontWeight: '800',
+  homeTrashIconText: {
+    fontSize: 24,
+    lineHeight: 30,
   },
   homeEmptySummary: {
-    minHeight: 64,
-    borderRadius: 12,
-    backgroundColor: 'rgba(255,255,255,0.55)',
-    borderWidth: 1,
-    borderColor: '#C9DBE5',
+    minHeight: 96,
+    alignItems: 'center',
     paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingVertical: 12,
     justifyContent: 'center',
-    gap: 8,
+    gap: 12,
   },
   homeEmptyTitle: {
-    color: text,
-    fontSize: 17,
+    color: mutedText,
+    fontSize: 13,
     fontWeight: '900',
+    textAlign: 'center',
   },
   homeEmptyDesc: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12,
     lineHeight: 17,
     fontWeight: '800',
@@ -6759,34 +6957,36 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   privacyBody: {
-    color: '#49677C',
+    color: text,
     fontSize: 13.5,
     lineHeight: 24,
     fontWeight: '800',
   },
   infoRow: {
     minHeight: 72,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     paddingHorizontal: 14,
     paddingVertical: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
     backgroundColor: '#FFFFFF',
+    ...gentleShadow,
   },
   permissionRow: {
     minHeight: 72,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     paddingHorizontal: 14,
     paddingVertical: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     backgroundColor: '#FFFFFF',
+    ...gentleShadow,
   },
   permissionDetailButton: {
     width: 42,
@@ -6797,15 +6997,16 @@ const styles = StyleSheet.create({
   },
   permissionFeatureCard: {
     minHeight: 70,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     paddingHorizontal: 14,
     paddingVertical: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     backgroundColor: '#FFFFFF',
+    ...gentleShadow,
   },
   permissionFeatureIcon: {
     width: 28,
@@ -6830,7 +7031,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   permissionBlockedText: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 13,
     lineHeight: 19,
     fontWeight: '800',
@@ -6853,7 +7054,7 @@ const styles = StyleSheet.create({
     gap: 9,
   },
   permissionReasonDescription: {
-    color: '#244B64',
+    color: text,
     fontSize: 13,
     lineHeight: 20,
     fontWeight: '900',
@@ -6865,7 +7066,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   permissionReasonText: {
-    color: '#49677C',
+    color: text,
     fontSize: 13,
     lineHeight: 22,
     fontWeight: '800',
@@ -6892,7 +7093,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   infoDesc: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12,
     fontWeight: '800',
     lineHeight: 17,
@@ -6908,7 +7109,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   rowRightMuted: {
-    color: '#6C8392',
+    color: mutedText,
   },
   flexGrow: {
     flex: 1,
@@ -6986,7 +7187,7 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,255,255,0.85)',
   },
   statusLightGreen: {
-    backgroundColor: '#2EB872',
+    backgroundColor: navy,
   },
   statusLightRed: {
     backgroundColor: '#D94A4A',
@@ -7029,20 +7230,21 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   previewText: {
-    color: '#6A91A8',
+    color: mutedText,
     fontSize: 15,
     fontWeight: '900',
   },
   emptyStateCard: {
     minHeight: 220,
     borderRadius: 16,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
     backgroundColor: pale,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 20,
     gap: 10,
+    ...gentleShadow,
   },
   emptyStateIcon: {
     width: 54,
@@ -7056,7 +7258,7 @@ const styles = StyleSheet.create({
     marginBottom: 2,
   },
   emptyStateIconText: {
-    color: '#6C8392',
+    color: mutedText,
     fontSize: 24,
     lineHeight: 28,
     fontWeight: '900',
@@ -7069,7 +7271,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   emptyStateDesc: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 13,
     lineHeight: 20,
     fontWeight: '800',
@@ -7083,7 +7285,7 @@ const styles = StyleSheet.create({
     height: 50,
   },
   onboardingDescriptionRow: {
-    minHeight: 58,
+    minHeight: 52,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'flex-start',
@@ -7091,11 +7293,12 @@ const styles = StyleSheet.create({
     alignSelf: 'stretch',
     paddingLeft: 42,
     paddingRight: 24,
-    marginVertical: 18,
+    marginVertical: 12,
   },
   onboardingDescriptionIcon: {
-    fontSize: 24,
-    lineHeight: 28,
+    width: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   onboardingDescriptionText: {
     flexShrink: 1,
@@ -7103,34 +7306,47 @@ const styles = StyleSheet.create({
     textAlign: 'left',
   },
   auraFeelReveal: {
-    minHeight: 58,
+    minHeight: 48,
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 4,
-    marginBottom: 8,
+    marginTop: 0,
+    marginBottom: 6,
   },
   auraFeelPlaceholder: {
-    minHeight: 58,
-    marginTop: 4,
-    marginBottom: 8,
+    minHeight: 48,
+    marginTop: 0,
+    marginBottom: 6,
   },
   auraFeelText: {
-    color: navy,
+    color: text,
     textAlign: 'center',
     fontSize: 20,
     lineHeight: 28,
     fontWeight: '900',
     letterSpacing: -0.2,
   },
+  auraFeelTextRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+  },
+  auraFeelBrand: {
+    color: navy,
+    fontSize: 24,
+    textShadowColor: '#DDF8E6',
+    textShadowRadius: 8,
+  },
   ghostPreviewCard: {
-    height: 228,
-    borderRadius: 16,
-    borderWidth: 1,
+    height: 330,
+    borderRadius: 24,
+    borderWidth: 0,
     borderColor: line,
-    backgroundColor: '#F4FBF8',
-    padding: 12,
-    gap: 8,
+    backgroundColor: '#FFFFFF',
+    padding: 16,
+    gap: 10,
     overflow: 'hidden',
+    ...softShadow,
   },
   ghostPreviewHeader: {
     flexDirection: 'row',
@@ -7139,85 +7355,116 @@ const styles = StyleSheet.create({
   },
   ghostPreviewTitle: {
     color: text,
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  onboardingIntroContent: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 24,
+  },
+  onboardingIntroTextBox: {
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 18,
+  },
+  onboardingIntroTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexWrap: 'wrap',
+    gap: 4,
+  },
+  onboardingIntroTitleText: {
+    color: text,
     fontSize: 15,
+    lineHeight: 22,
+    fontWeight: '900',
+  },
+  onboardingIntroBody: {
+    color: text,
+    textAlign: 'center',
+    fontSize: 20,
+    lineHeight: 29,
     fontWeight: '900',
   },
   ghostPreviewPercent: {
     color: navy,
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: '900',
   },
   onboardingMetricGrid: {
-    height: 48,
+    height: 76,
     flexDirection: 'row',
-    gap: 8,
+    gap: 12,
   },
   onboardingMetricCard: {
     flex: 1,
-    borderWidth: 1,
-    borderColor: '#C9DBE5',
-    borderRadius: 10,
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 10,
-    paddingVertical: 7,
+    borderWidth: 0,
+    borderColor: line,
+    borderRadius: 18,
+    backgroundColor: pale,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
     justifyContent: 'center',
-    gap: 3,
+    gap: 5,
   },
   onboardingMetricLabel: {
-    color: '#315A73',
+    color: mutedText,
     fontSize: 9.5,
     fontWeight: '900',
   },
   onboardingMetricValue: {
     color: text,
-    fontSize: 15,
+    fontSize: 20,
     fontWeight: '900',
   },
   ghostDataPanel: {
     flex: 1,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#C9DBE5',
-    backgroundColor: '#FFFFFF',
-    padding: 8,
-    gap: 5,
+    borderRadius: 20,
+    borderWidth: 0,
+    borderColor: line,
+    backgroundColor: 'transparent',
+    padding: 0,
+    gap: 8,
     overflow: 'hidden',
   },
   ghostDataRow: {
-    minHeight: 24,
-    borderRadius: 7,
-    paddingHorizontal: 8,
+    minHeight: 40,
+    borderRadius: 16,
+    paddingHorizontal: 12,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 7,
-    backgroundColor: '#F7FAFC',
+    gap: 9,
+    backgroundColor: pale,
   },
   ghostDataRowActive: {
-    backgroundColor: '#EAF7F2',
-    borderWidth: 1,
-    borderColor: '#B6DCCE',
+    backgroundColor: '#E9FFF0',
+    borderWidth: 0,
+    borderColor: '#CDEFD8',
   },
   ghostDot: {
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: '#B4C7D4',
+    backgroundColor: line,
   },
   ghostDotActive: {
-    backgroundColor: '#26B191',
+    backgroundColor: navy,
   },
   ghostDataLabel: {
     color: text,
-    fontSize: 10.5,
+    fontSize: 12,
     fontWeight: '900',
   },
   ghostDataMeta: {
-    color: '#5D7588',
-    fontSize: 9,
+    color: mutedText,
+    fontSize: 10,
     fontWeight: '800',
   },
   ghostDataStatus: {
-    color: '#7C93A3',
+    color: mutedText,
     fontSize: 17,
     lineHeight: 18,
     fontWeight: '900',
@@ -7227,9 +7474,9 @@ const styles = StyleSheet.create({
   },
   ghostProtectedText: {
     alignSelf: 'center',
-    color: navy,
-    fontSize: 9.5,
-    lineHeight: 12,
+    color: text,
+    fontSize: 11,
+    lineHeight: 14,
     fontWeight: '900',
     textDecorationLine: 'underline',
   },
@@ -7237,8 +7484,8 @@ const styles = StyleSheet.create({
     minHeight: 48,
     borderRadius: 12,
     backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#C9DBE5',
+    borderWidth: 0,
+    borderColor: line,
     paddingHorizontal: 12,
     flexDirection: 'row',
     alignItems: 'center',
@@ -7253,19 +7500,20 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   ghostCandidateDesc: {
-    color: '#5D7588',
+    color: mutedText,
     fontSize: 10,
     fontWeight: '800',
   },
   carbonPreviewCard: {
-    height: 254,
-    borderRadius: 16,
-    borderWidth: 1,
+    height: 330,
+    borderRadius: 24,
+    borderWidth: 0,
     borderColor: line,
-    backgroundColor: '#F4FBF8',
-    padding: 12,
-    gap: 8,
+    backgroundColor: '#FFFFFF',
+    padding: 16,
+    gap: 10,
     overflow: 'hidden',
+    ...softShadow,
   },
   carbonTopRow: {
     flexDirection: 'row',
@@ -7274,17 +7522,17 @@ const styles = StyleSheet.create({
   },
   carbonTopLabel: {
     color: text,
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: '900',
   },
   historyTotalMiniCard: {
-    minHeight: 46,
-    borderWidth: 1,
-    borderColor: '#C9DBE5',
-    borderRadius: 10,
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 10,
-    paddingVertical: 7,
+    minHeight: 82,
+    borderWidth: 0,
+    borderColor: line,
+    borderRadius: 18,
+    backgroundColor: pale,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -7292,39 +7540,39 @@ const styles = StyleSheet.create({
   },
   historyTotalMiniValue: {
     color: text,
-    fontSize: 16,
+    fontSize: 26,
     fontWeight: '900',
   },
   historyMiniPill: {
     minHeight: 24,
     borderRadius: 12,
-    backgroundColor: '#DDF4FB',
+    backgroundColor: '#E9FFF0',
     paddingHorizontal: 9,
     alignItems: 'center',
     justifyContent: 'center',
   },
   historyMiniPillText: {
     color: navy,
-    fontSize: 9,
+    fontSize: 10,
     fontWeight: '900',
   },
   historyGraphMiniCard: {
     flex: 1,
-    borderWidth: 1,
-    borderColor: '#C9DBE5',
-    borderRadius: 10,
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    gap: 8,
+    borderWidth: 0,
+    borderColor: line,
+    borderRadius: 18,
+    backgroundColor: pale,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 10,
   },
   historyGraphMiniTitle: {
     color: text,
-    fontSize: 11,
+    fontSize: 13,
     fontWeight: '900',
   },
   historyMiniUnit: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 9,
     fontWeight: '900',
   },
@@ -7345,7 +7593,7 @@ const styles = StyleSheet.create({
     paddingBottom: 14,
   },
   historyMiniAxisText: {
-    color: '#6B8194',
+    color: mutedText,
     fontSize: 8,
     fontWeight: '900',
     textAlign: 'right',
@@ -7354,7 +7602,7 @@ const styles = StyleSheet.create({
     flex: 1,
     position: 'relative',
     borderBottomWidth: 1,
-    borderBottomColor: '#C9DBE5',
+    borderBottomColor: line,
     height: 112,
   },
   historyMiniGridTop: {
@@ -7363,7 +7611,7 @@ const styles = StyleSheet.create({
     right: 0,
     top: 8,
     height: 1,
-    backgroundColor: '#E3ECF1',
+    backgroundColor: line,
   },
   historyMiniGridMiddle: {
     position: 'absolute',
@@ -7371,7 +7619,7 @@ const styles = StyleSheet.create({
     right: 0,
     top: 48,
     height: 1,
-    backgroundColor: '#E3ECF1',
+    backgroundColor: line,
   },
   historyMiniGridBottom: {
     position: 'absolute',
@@ -7379,7 +7627,7 @@ const styles = StyleSheet.create({
     right: 0,
     top: 88,
     height: 1,
-    backgroundColor: '#E3ECF1',
+    backgroundColor: line,
   },
   historyMiniLineLayer: {
     position: 'absolute',
@@ -7424,7 +7672,7 @@ const styles = StyleSheet.create({
   historyMiniMonthText: {
     position: 'absolute',
     width: 32,
-    color: '#49677C',
+    color: mutedText,
     fontSize: 8.5,
     fontWeight: '900',
     textAlign: 'center',
@@ -7432,20 +7680,20 @@ const styles = StyleSheet.create({
   carbonMeterTrack: {
     height: 16,
     borderRadius: 8,
-    backgroundColor: '#DCE9EF',
+    backgroundColor: '#EAF9EF',
     overflow: 'hidden',
   },
   carbonMeterFill: {
     height: 16,
     borderRadius: 8,
-    backgroundColor: '#26B191',
+    backgroundColor: navy,
   },
   carbonResultCard: {
     flex: 1,
     borderRadius: 14,
     backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#C9DBE5',
+    borderWidth: 0,
+    borderColor: line,
     alignItems: 'center',
     justifyContent: 'center',
     gap: 7,
@@ -7459,14 +7707,17 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   carbonResultDesc: {
-    color: '#5D7588',
+    color: mutedText,
     fontSize: 11,
     fontWeight: '800',
   },
   cardLabel: {
-    color: '#315A73',
+    color: mutedText,
     fontSize: 14,
     fontWeight: '900',
+  },
+  textStrong: {
+    color: text,
   },
   cardTitle: {
     color: text,
@@ -7479,7 +7730,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   meta: {
-    color: '#4B6A7E',
+    color: mutedText,
     fontSize: 12.5,
     fontWeight: '800',
     lineHeight: 18,
@@ -7542,8 +7793,8 @@ const styles = StyleSheet.create({
     height: 34,
     borderRadius: 17,
     borderWidth: 1,
-    borderColor: '#8EC8DA',
-    backgroundColor: '#DDF4F9',
+    borderColor: line,
+    backgroundColor: pale,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -7601,19 +7852,20 @@ const styles = StyleSheet.create({
   },
   scanSourceCard: {
     minHeight: 78,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     paddingHorizontal: 14,
     paddingVertical: 13,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     backgroundColor: '#FFFFFF',
+    ...gentleShadow,
   },
   scanSourceCardSelected: {
     backgroundColor: pale,
-    borderColor: navy,
+    borderColor: line,
   },
   scanSummaryCard: {
     minHeight: 68,
@@ -7622,7 +7874,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     paddingHorizontal: 16,
     paddingVertical: 13,
-    backgroundColor: '#DDF4FB',
+    backgroundColor: pale,
     justifyContent: 'center',
   },
   folderSearchBox: {
@@ -7642,7 +7894,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   searchPlaceholder: {
-    color: '#6B8194',
+    color: mutedText,
     fontSize: 13,
     fontWeight: '900',
   },
@@ -7654,16 +7906,31 @@ const styles = StyleSheet.create({
     paddingVertical: 0,
   },
   folderSelectAllCard: {
-    minHeight: 58,
-    borderWidth: 1,
-    borderColor: navy,
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 11,
+    minHeight: 64,
+    borderWidth: 0,
+    borderColor: line,
+    borderRadius: 18,
+    paddingHorizontal: 16,
+    paddingVertical: 13,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
-    backgroundColor: '#F7FBFF',
+    gap: 14,
+    backgroundColor: '#FFFFFF',
+    ...gentleShadow,
+  },
+  folderSelectAllInlineRow: {
+    minHeight: 42,
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    gap: 10,
+    paddingHorizontal: 2,
+    paddingVertical: 2,
+  },
+  folderSelectAllTitle: {
+    color: text,
+    fontSize: 18,
+    fontWeight: '900',
   },
   folderBreadcrumbCard: {
     minHeight: 34,
@@ -7689,11 +7956,14 @@ const styles = StyleSheet.create({
   },
   folderBreadcrumbTitle: {
     color: navy,
-    fontSize: 15,
+    fontSize: 16,
     fontWeight: '900',
   },
+  folderBreadcrumbAncestor: {
+    color: text,
+  },
   folderBreadcrumbText: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 11.5,
     lineHeight: 16,
     fontWeight: '800',
@@ -7710,15 +7980,16 @@ const styles = StyleSheet.create({
   },
   folderRow: {
     minHeight: 66,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     paddingHorizontal: 14,
     paddingVertical: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     backgroundColor: '#FFFFFF',
+    ...gentleShadow,
   },
   folderRowSelected: {
     borderColor: navy,
@@ -7728,6 +7999,16 @@ const styles = StyleSheet.create({
     width: 30,
     height: 28,
     justifyContent: 'flex-end',
+  },
+  fileIconFrame: {
+    width: 32,
+    height: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  fileIconFrameCompact: {
+    width: 26,
+    height: 26,
   },
   folderOutlineTab: {
     position: 'absolute',
@@ -7750,25 +8031,13 @@ const styles = StyleSheet.create({
     borderColor: navy,
     backgroundColor: '#FFFFFF',
   },
-  folderFileRow: {
-    minHeight: 74,
-    borderWidth: 1,
-    borderColor: line,
-    borderRadius: 10,
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
   folderIcon: {
     width: 38,
     height: 38,
     borderRadius: 8,
     borderWidth: 1,
     borderColor: line,
-    backgroundColor: '#E3F5FC',
+    backgroundColor: pale,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -7783,7 +8052,7 @@ const styles = StyleSheet.create({
     borderRadius: 17,
     borderWidth: 1,
     borderColor: line,
-    backgroundColor: '#F7FBFF',
+    backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: -2,
@@ -7807,7 +8076,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   folderSizeText: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 13,
     fontWeight: '900',
   },
@@ -7862,11 +8131,11 @@ const styles = StyleSheet.create({
     paddingTop: 10,
     paddingBottom: 24,
     gap: 14,
-    borderWidth: 1,
-    borderColor: '#C9DBE5',
+    borderWidth: 0,
+    borderColor: line,
     shadowColor: '#000000',
-    shadowOpacity: 0.12,
-    shadowRadius: 14,
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
     shadowOffset: { width: 0, height: -4 },
     elevation: 10,
   },
@@ -7897,9 +8166,9 @@ const styles = StyleSheet.create({
     width: 44,
     height: 36,
     borderWidth: 1,
-    borderColor: '#C9DBE5',
+    borderColor: line,
     borderRadius: 8,
-    backgroundColor: '#F7FBFD',
+    backgroundColor: '#FFFFFF',
     color: text,
     fontSize: 17,
     fontWeight: '900',
@@ -7956,7 +8225,7 @@ const styles = StyleSheet.create({
     marginBottom: 18,
   },
   yearRangeLabel: {
-    color: '#6B8194',
+    color: mutedText,
     fontSize: 11,
     fontWeight: '900',
     marginBottom: 4,
@@ -8012,7 +8281,7 @@ const styles = StyleSheet.create({
     paddingVertical: 0,
   },
   periodUnit: {
-    color: '#6B8194',
+    color: mutedText,
     fontSize: 12,
     fontWeight: '900',
   },
@@ -8025,7 +8294,7 @@ const styles = StyleSheet.create({
     width: 226,
     height: 30,
     borderRadius: 15,
-    backgroundColor: '#D8E5EC',
+    backgroundColor: line,
     alignSelf: 'center',
     marginTop: 22,
     marginBottom: 34,
@@ -8066,7 +8335,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   yearTickText: {
-    color: '#6B8194',
+    color: mutedText,
     fontSize: 10,
     fontWeight: '800',
   },
@@ -8115,20 +8384,34 @@ const styles = StyleSheet.create({
     width: 130,
     height: 130,
     borderRadius: 65,
-    borderWidth: 8,
-    borderColor: '#8EC8DA',
     backgroundColor: pale,
     alignItems: 'center',
     justifyContent: 'center',
     alignSelf: 'center',
-    marginTop: 80,
+    marginTop: 42,
+    position: 'relative',
   },
   progressCircleCompact: {
     width: 108,
     height: 108,
     borderRadius: 54,
-    borderWidth: 7,
     marginTop: 18,
+  },
+  progressSpinnerRing: {
+    position: 'absolute',
+    width: 130,
+    height: 130,
+    borderRadius: 65,
+    borderWidth: 8,
+    borderColor: '#DDF8E6',
+    borderTopColor: navy,
+    borderRightColor: '#AEE8BE',
+  },
+  progressSpinnerRingCompact: {
+    width: 108,
+    height: 108,
+    borderRadius: 54,
+    borderWidth: 7,
   },
   progressText: {
     color: navy,
@@ -8140,7 +8423,7 @@ const styles = StyleSheet.create({
   },
   homeScanStatusCard: {
     borderColor: navy,
-    backgroundColor: '#F7FBFF',
+    backgroundColor: '#FFFFFF',
   },
   homeScanBadge: {
     overflow: 'hidden',
@@ -8155,8 +8438,8 @@ const styles = StyleSheet.create({
   homeScanBadgeMuted: {
     overflow: 'hidden',
     borderRadius: 999,
-    backgroundColor: '#D8E5EC',
-    color: '#6B8194',
+    backgroundColor: line,
+    color: mutedText,
     fontSize: 10,
     fontWeight: '900',
     paddingHorizontal: 9,
@@ -8165,7 +8448,7 @@ const styles = StyleSheet.create({
   miniProgressTrack: {
     height: 7,
     borderRadius: 7,
-    backgroundColor: '#D8E5EC',
+    backgroundColor: line,
     overflow: 'hidden',
     marginTop: 14,
   },
@@ -8211,7 +8494,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: line,
     borderRadius: 16,
-    backgroundColor: '#F7FBFF',
+    backgroundColor: '#FFFFFF',
     paddingHorizontal: 16,
     paddingVertical: 18,
   },
@@ -8221,7 +8504,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   scanConditionLine: {
-    color: '#6B8194',
+    color: mutedText,
     fontSize: 11,
     lineHeight: 16,
     fontWeight: '800',
@@ -8231,7 +8514,7 @@ const styles = StyleSheet.create({
   progressTrack: {
     height: 9,
     borderRadius: 9,
-    backgroundColor: '#D8E5EC',
+    backgroundColor: line,
     overflow: 'hidden',
     marginVertical: 20,
   },
@@ -8240,11 +8523,14 @@ const styles = StyleSheet.create({
     backgroundColor: navy,
   },
   listNoticeText: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 13,
     lineHeight: 18,
     fontWeight: '900',
     marginBottom: 4,
+  },
+  listNoticeDanger: {
+    color: '#D65353',
   },
   selectAllRow: {
     flexDirection: 'row',
@@ -8295,25 +8581,27 @@ const styles = StyleSheet.create({
     flex: 1,
     minWidth: 132,
     minHeight: 76,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 20,
     backgroundColor: pale,
     paddingHorizontal: 16,
     paddingVertical: 12,
     justifyContent: 'center',
     gap: 8,
+    ...gentleShadow,
   },
   recentHeroCard: {
     minHeight: 98,
-    borderWidth: 1.5,
-    borderColor: '#21C7C7',
-    borderRadius: 12,
+    borderWidth: 0,
+    borderColor: line,
+    borderRadius: 20,
     backgroundColor: pale,
     paddingHorizontal: 16,
     paddingVertical: 14,
     justifyContent: 'center',
     gap: 8,
+    ...gentleShadow,
   },
   recentHeroHeaderRow: {
     flexDirection: 'row',
@@ -8334,15 +8622,16 @@ const styles = StyleSheet.create({
   },
   recentResultRow: {
     minHeight: 76,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 16,
     paddingVertical: 13,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
+    ...gentleShadow,
   },
   recentResultValue: {
     minWidth: 72,
@@ -8354,9 +8643,9 @@ const styles = StyleSheet.create({
   },
   carbonTotalCard: {
     minHeight: 104,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 12,
+    borderRadius: 20,
     backgroundColor: pale,
     paddingHorizontal: 18,
     paddingVertical: 15,
@@ -8364,19 +8653,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 12,
+    ...softShadow,
   },
   carbonTotalValue: {
     color: text,
-    fontSize: 25,
+    fontSize: 36,
     fontWeight: '900',
     marginTop: 5,
   },
   monthCarbonPill: {
     minHeight: 32,
     borderRadius: 16,
-    backgroundColor: '#DDF4F9',
-    borderWidth: 1,
-    borderColor: '#8EC8DA',
+    backgroundColor: pale,
+    borderWidth: 0,
+    borderColor: line,
     paddingHorizontal: 12,
     alignItems: 'center',
     justifyContent: 'center',
@@ -8387,17 +8677,29 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   statsGraphCard: {
-    minHeight: 230,
-    borderWidth: 1,
+    minHeight: 204,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 12,
+    borderRadius: 20,
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 16,
     paddingVertical: 14,
     gap: 12,
+    ...softShadow,
+  },
+  statsLineChart: {
+    marginLeft: -18,
+    borderRadius: 16,
+  },
+  statsChartClip: {
+    width: '100%',
+    overflow: 'hidden',
+  },
+  statsChartReveal: {
+    overflow: 'hidden',
   },
   graphArea: {
-    height: 166,
+    height: 142,
     flexDirection: 'row',
     alignItems: 'stretch',
     gap: 9,
@@ -8409,7 +8711,7 @@ const styles = StyleSheet.create({
     paddingTop: 8,
   },
   graphAxisText: {
-    color: '#6B8194',
+    color: mutedText,
     fontSize: 10,
     fontWeight: '900',
     textAlign: 'right',
@@ -8418,8 +8720,8 @@ const styles = StyleSheet.create({
     flex: 1,
     position: 'relative',
     borderBottomWidth: 1,
-    borderBottomColor: '#C9DBE5',
-    height: 146,
+    borderBottomColor: line,
+    height: 122,
     paddingHorizontal: 2,
   },
   graphColumn: {
@@ -8438,7 +8740,7 @@ const styles = StyleSheet.create({
     width: 26,
     borderTopLeftRadius: 8,
     borderTopRightRadius: 8,
-    backgroundColor: '#7FBED0',
+    backgroundColor: navy,
   },
   lineGraphLayer: {
     position: 'absolute',
@@ -8486,7 +8788,7 @@ const styles = StyleSheet.create({
   graphMonth: {
     position: 'absolute',
     width: 32,
-    color: '#49677C',
+    color: mutedText,
     fontSize: 11,
     fontWeight: '900',
     textAlign: 'center',
@@ -8497,7 +8799,7 @@ const styles = StyleSheet.create({
     right: 0,
     top: 8,
     height: 1,
-    backgroundColor: '#E3ECF1',
+    backgroundColor: line,
   },
   graphGridLineMiddle: {
     position: 'absolute',
@@ -8505,7 +8807,7 @@ const styles = StyleSheet.create({
     right: 0,
     top: 56,
     height: 1,
-    backgroundColor: '#E3ECF1',
+    backgroundColor: line,
   },
   graphGridLineBottom: {
     position: 'absolute',
@@ -8513,10 +8815,10 @@ const styles = StyleSheet.create({
     right: 0,
     top: 104,
     height: 1,
-    backgroundColor: '#E3ECF1',
+    backgroundColor: line,
   },
   statsGuideText: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12,
     lineHeight: 18,
     fontWeight: '800',
@@ -8524,13 +8826,14 @@ const styles = StyleSheet.create({
   },
   recentCleanupCard: {
     minHeight: 88,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 12,
+    borderRadius: 20,
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 16,
     paddingVertical: 14,
     justifyContent: 'center',
+    ...gentleShadow,
   },
   recentCleanupTopRow: {
     flexDirection: 'row',
@@ -8587,7 +8890,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   carbonBasisLineDesc: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 10.5,
     lineHeight: 15,
     fontWeight: '800',
@@ -8636,19 +8939,20 @@ const styles = StyleSheet.create({
   },
   resultCategoryCard: {
     minHeight: 54,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     backgroundColor: pale,
     paddingHorizontal: 14,
     paddingVertical: 8,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 9,
+    ...gentleShadow,
   },
   resultCategoryMeta: {
     minWidth: 86,
-    color: '#49677C',
+    color: mutedText,
     textAlign: 'right',
     fontSize: 14.5,
     lineHeight: 18,
@@ -8656,15 +8960,16 @@ const styles = StyleSheet.create({
   },
   reviewSummaryCard: {
     minHeight: 72,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     backgroundColor: pale,
     paddingHorizontal: 16,
     paddingVertical: 13,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
+    ...gentleShadow,
   },
   reviewRedNumber: {
     color: '#C13A3A',
@@ -8700,7 +9005,7 @@ const styles = StyleSheet.create({
   },
   detailSubMeta: {
     marginTop: -4,
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12.5,
     lineHeight: 18,
     fontWeight: '900',
@@ -8716,7 +9021,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
   },
   itemPreviewText: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 16,
     fontWeight: '900',
     textAlign: 'center',
@@ -8736,7 +9041,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   detailInfoText: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12.5,
     lineHeight: 19,
     fontWeight: '800',
@@ -8754,7 +9059,11 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   deleteStatusRowDone: {
-    borderColor: '#7BC79B',
+    borderColor: navy,
+  },
+  deleteStatusServiceIcon: {
+    width: 30,
+    height: 30,
   },
   deleteStatusText: {
     color: text,
@@ -8839,7 +9148,7 @@ const styles = StyleSheet.create({
     minHeight: 58,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: '#D3E0E7',
+    borderColor: line,
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 14,
     flexDirection: 'row',
@@ -8847,7 +9156,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   cleanupCountLabel: {
-    color: '#49677C',
+    color: text,
     fontSize: 14,
     fontWeight: '900',
   },
@@ -8874,7 +9183,7 @@ const styles = StyleSheet.create({
   cleanupDriveBarTrack: {
     height: 18,
     borderRadius: 18,
-    backgroundColor: '#DDE9EF',
+    backgroundColor: line,
     overflow: 'hidden',
     position: 'relative',
   },
@@ -8882,17 +9191,24 @@ const styles = StyleSheet.create({
     height: '100%',
     borderTopLeftRadius: 18,
     borderBottomLeftRadius: 18,
+    borderTopRightRadius: 0,
+    borderBottomRightRadius: 0,
     backgroundColor: navy,
   },
   cleanupDriveReclaimedBar: {
     position: 'absolute',
     top: 0,
     bottom: 0,
-    backgroundColor: '#E34242',
+    minWidth: 10,
+    borderTopLeftRadius: 0,
+    borderBottomLeftRadius: 0,
+    borderTopRightRadius: 18,
+    borderBottomRightRadius: 18,
+    backgroundColor: navy,
   },
   cleanupDriveTotalLabel: {
     marginTop: -8,
-    color: '#49677C',
+    color: mutedText,
     textAlign: 'right',
     fontSize: 11,
     fontWeight: '900',
@@ -8919,12 +9235,13 @@ const styles = StyleSheet.create({
   },
   segment: {
     height: 42,
-    borderRadius: 21,
-    borderWidth: 1,
+    borderRadius: 18,
+    borderWidth: 0,
     borderColor: line,
     padding: 3,
     flexDirection: 'row',
-    backgroundColor: '#F5FAFC',
+    backgroundColor: '#FFFFFF',
+    ...gentleShadow,
   },
   segmentItem: {
     flex: 1,
@@ -8936,9 +9253,9 @@ const styles = StyleSheet.create({
     backgroundColor: navy,
   },
   segmentSubActive: {
-    backgroundColor: '#DDF4F9',
-    borderWidth: 1,
-    borderColor: '#9AC6CF',
+    backgroundColor: '#E9FFF0',
+    borderWidth: 0,
+    borderColor: '#CDEFD8',
   },
   segmentText: {
     color: text,
@@ -8952,11 +9269,12 @@ const styles = StyleSheet.create({
     height: 48,
     marginTop: -10,
     flexDirection: 'row',
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     overflow: 'hidden',
     backgroundColor: '#FFFFFF',
+    ...gentleShadow,
   },
   storagePrimaryTab: {
     flex: 1,
@@ -8978,16 +9296,17 @@ const styles = StyleSheet.create({
   },
   storageSummaryBar: {
     minHeight: 50,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
-    backgroundColor: '#DDF4F9',
+    borderRadius: 18,
+    backgroundColor: pale,
     paddingHorizontal: 16,
     paddingVertical: 10,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 10,
+    ...gentleShadow,
   },
   storageSummaryText: {
     color: text,
@@ -9000,21 +9319,31 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   storagePathCard: {
-    minHeight: 44,
-    borderWidth: 1,
+    minHeight: 42,
+    borderTopWidth: 1,
     borderColor: line,
-    borderRadius: 10,
-    backgroundColor: pale,
-    paddingHorizontal: 12,
-    justifyContent: 'center',
+    borderRadius: 0,
+    backgroundColor: 'transparent',
+    paddingHorizontal: 2,
+    paddingTop: 12,
+    paddingBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  storageLooseList: {
+    gap: 10,
+    paddingBottom: 90,
   },
   folderListBox: {
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 12,
-    backgroundColor: '#F5FAFC',
+    borderRadius: 20,
+    backgroundColor: '#FFFFFF',
     padding: 7,
     gap: 7,
+    ...softShadow,
   },
   folderListScroll: {
     maxHeight: 268,
@@ -9024,11 +9353,10 @@ const styles = StyleSheet.create({
     paddingBottom: 2,
   },
   storagePagerCard: {
-    minHeight: 44,
+    minHeight: 42,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: 7,
   },
   storageBreadcrumbRow: {
     flexDirection: 'row',
@@ -9037,12 +9365,12 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   storageBreadcrumbText: {
-    color: '#49677C',
+    color: text,
     fontSize: 14,
     fontWeight: '900',
   },
   storageBreadcrumbCurrent: {
-    color: text,
+    color: navy,
     fontSize: 16,
   },
   storageBreadcrumbDivider: {
@@ -9050,17 +9378,23 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '900',
   },
+  storagePathCountText: {
+    color: mutedText,
+    fontSize: 12,
+    fontWeight: '900',
+  },
   storageItemCard: {
     minHeight: 78,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 20,
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 14,
     paddingVertical: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
+    ...gentleShadow,
   },
   storageItemCardCompact: {
     minHeight: 56,
@@ -9068,12 +9402,13 @@ const styles = StyleSheet.create({
   },
   storageListBox: {
     height: 302,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 12,
-    backgroundColor: '#F5FAFC',
+    borderRadius: 20,
+    backgroundColor: '#FFFFFF',
     padding: 7,
     gap: 7,
+    ...softShadow,
   },
   storageListScroll: {
     flex: 1,
@@ -9116,7 +9451,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   storagePagerGlyphDisabled: {
-    color: '#8FA2B0',
+    color: mutedText,
   },
   storageDriveItemPressArea: {
     flex: 1,
@@ -9141,7 +9476,7 @@ const styles = StyleSheet.create({
     marginTop: -2,
   },
   storageCompactMeta: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 11.5,
     lineHeight: 15,
     fontWeight: '800',
@@ -9149,7 +9484,7 @@ const styles = StyleSheet.create({
   },
   storageRightSize: {
     minWidth: 48,
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12,
     fontWeight: '900',
     textAlign: 'right',
@@ -9168,8 +9503,8 @@ const styles = StyleSheet.create({
     height: 24,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#8EC8DA',
-    backgroundColor: '#EAF7F2',
+    borderColor: line,
+    backgroundColor: '#E9FFF0',
     paddingHorizontal: 9,
     justifyContent: 'center',
   },
@@ -9207,7 +9542,7 @@ const styles = StyleSheet.create({
     borderRadius: 52,
     borderWidth: 1.5,
     borderColor: line,
-    backgroundColor: '#DDF4F9',
+    backgroundColor: pale,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 8,
@@ -9225,7 +9560,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   permissionRevokedDesc: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12.5,
     lineHeight: 18,
     fontWeight: '900',
@@ -9238,7 +9573,7 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     zIndex: 42,
-    backgroundColor: 'rgba(11, 42, 74, 0.20)',
+    backgroundColor: 'rgba(32, 33, 36, 0.12)',
     justifyContent: 'flex-end',
   },
   storageDeleteSheet: {
@@ -9251,9 +9586,9 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     paddingBottom: 18,
     gap: 13,
-    shadowColor: '#0B2A4A',
-    shadowOpacity: 0.16,
-    shadowRadius: 16,
+    shadowColor: '#000000',
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
     shadowOffset: { width: 0, height: -6 },
     elevation: 16,
   },
@@ -9288,7 +9623,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   storageDeleteWarningText: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12,
     lineHeight: 18,
     fontWeight: '900',
@@ -9308,6 +9643,24 @@ const styles = StyleSheet.create({
     backgroundColor: '#E4312B',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  storageRestoreInfoBox: {
+    minHeight: 90,
+    borderRadius: 18,
+    backgroundColor: pale,
+    padding: 16,
+    justifyContent: 'center',
+    gap: 6,
+  },
+  storageRestoreButton: {
+    height: 50,
+    borderRadius: 10,
+    backgroundColor: '#6FCF85',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  restoreButtonDisabled: {
+    opacity: 0.45,
   },
   fileOutlineIcon: {
     width: 30,
@@ -9329,7 +9682,7 @@ const styles = StyleSheet.create({
     borderLeftWidth: 2,
     borderBottomWidth: 2,
     borderColor: navy,
-    backgroundColor: '#DDF4F9',
+    backgroundColor: pale,
     transform: [{ rotate: '45deg' }],
   },
   fileDocLineWide: {
@@ -9385,7 +9738,61 @@ const styles = StyleSheet.create({
     borderRadius: 1,
     borderWidth: 1.5,
     borderColor: navy,
-    backgroundColor: '#DDF4F9',
+    backgroundColor: pale,
+  },
+  trashOutlineIcon: {
+    width: 30,
+    height: 34,
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+  },
+  trashOutlineIconCompact: {
+    transform: [{ scale: 0.92 }],
+  },
+  trashLid: {
+    position: 'absolute',
+    top: 8,
+    width: 23,
+    height: 3,
+    borderRadius: 3,
+    backgroundColor: navy,
+  },
+  trashHandle: {
+    position: 'absolute',
+    top: 4,
+    width: 10,
+    height: 5,
+    borderTopWidth: 2,
+    borderLeftWidth: 2,
+    borderRightWidth: 2,
+    borderColor: navy,
+    borderTopLeftRadius: 4,
+    borderTopRightRadius: 4,
+  },
+  trashBody: {
+    width: 22,
+    height: 23,
+    borderWidth: 2,
+    borderTopWidth: 0,
+    borderColor: navy,
+    borderBottomLeftRadius: 6,
+    borderBottomRightRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 4,
+  },
+  trashLine: {
+    width: 2,
+    height: 13,
+    borderRadius: 2,
+    backgroundColor: navy,
+  },
+  trashDangerBorder: {
+    borderColor: '#D65353',
+  },
+  trashDangerFill: {
+    backgroundColor: '#D65353',
   },
   folderTypeIcon: {
     backgroundColor: '#FFF4CC',
@@ -9396,7 +9803,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
   },
   storageHintText: {
-    color: '#7B8FA0',
+    color: mutedText,
     fontSize: 10.5,
     fontWeight: '800',
   },
@@ -9410,7 +9817,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: navy,
     borderRadius: 14,
-    backgroundColor: '#F7FBFF',
+    backgroundColor: '#FFFFFF',
     padding: 14,
     gap: 10,
   },
@@ -9423,8 +9830,8 @@ const styles = StyleSheet.create({
     minHeight: 34,
     borderRadius: 17,
     borderWidth: 1,
-    borderColor: '#8EC8DA',
-    backgroundColor: '#DDF4F9',
+    borderColor: line,
+    backgroundColor: pale,
     paddingHorizontal: 12,
     justifyContent: 'center',
   },
@@ -9446,9 +9853,9 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     paddingBottom: 24,
     gap: 14,
-    shadowColor: '#0B2A4A',
-    shadowOpacity: 0.16,
-    shadowRadius: 16,
+    shadowColor: '#000000',
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
     shadowOffset: { width: 0, height: -6 },
     elevation: 16,
   },
@@ -9538,7 +9945,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   profileConnectionText: {
-    color: '#315A73',
+    color: mutedText,
     fontSize: 12,
     lineHeight: 18,
     fontWeight: '900',
@@ -9549,7 +9956,7 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     borderWidth: 1,
     borderColor: line,
-    backgroundColor: '#F7FCFE',
+    backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 10,
@@ -9577,15 +9984,16 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   groupCard: {
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     backgroundColor: '#FFFFFF',
     overflow: 'hidden',
+    ...gentleShadow,
   },
   thinDivider: {
     height: 1,
-    backgroundColor: '#D8E5EC',
+    backgroundColor: line,
     marginHorizontal: 16,
   },
   settingPlainRow: {
@@ -9628,8 +10036,8 @@ const styles = StyleSheet.create({
     height: 25,
     borderRadius: 13,
     borderWidth: 1,
-    borderColor: '#9AC6CF',
-    backgroundColor: '#EAF7F2',
+    borderColor: line,
+    backgroundColor: '#E9FFF0',
     paddingHorizontal: 12,
     alignItems: 'center',
     justifyContent: 'center',
@@ -9644,7 +10052,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: line,
     borderRadius: 10,
-    backgroundColor: '#DDF4FB',
+    backgroundColor: pale,
     paddingHorizontal: 16,
     paddingVertical: 14,
     justifyContent: 'center',
@@ -9656,7 +10064,7 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   scopeDesc: {
-    color: '#315A73',
+    color: mutedText,
     fontSize: 12,
     lineHeight: 18,
     fontWeight: '900',
@@ -9670,13 +10078,19 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     gap: 10,
   },
+  keywordConditionSummary: {
+    color: mutedText,
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '800',
+  },
   rowBetween: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
   },
   versionText: {
-    color: '#46677D',
+    color: mutedText,
     fontSize: 11,
     fontWeight: '900',
     textAlign: 'center',
@@ -9730,7 +10144,7 @@ const styles = StyleSheet.create({
     left: 0,
     zIndex: 30,
     justifyContent: 'flex-end',
-    backgroundColor: 'rgba(11, 42, 74, 0.18)',
+    backgroundColor: 'rgba(32, 33, 36, 0.10)',
   },
   deleteConfirmOverlay: {
     position: 'absolute',
@@ -9739,7 +10153,7 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     zIndex: 40,
-    backgroundColor: 'rgba(11, 42, 74, 0.20)',
+    backgroundColor: 'rgba(32, 33, 36, 0.12)',
     justifyContent: 'flex-end',
   },
   deleteApprovalPanel: {
@@ -9753,9 +10167,9 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     paddingBottom: 18,
     gap: 12,
-    shadowColor: '#0B2A4A',
-    shadowOpacity: 0.18,
-    shadowRadius: 16,
+    shadowColor: '#000000',
+    shadowOpacity: 0.15,
+    shadowRadius: 18,
     shadowOffset: { width: 0, height: 8 },
     elevation: 16,
   },
@@ -9766,7 +10180,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   deleteApprovalDesc: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 13,
     lineHeight: 19,
     fontWeight: '900',
@@ -9786,7 +10200,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   deleteApprovalInfoText: {
-    color: '#49677C',
+    color: mutedText,
     fontSize: 12.5,
     lineHeight: 18,
     fontWeight: '800',
@@ -9798,7 +10212,7 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     zIndex: 45,
-    backgroundColor: 'rgba(11, 42, 74, 0.18)',
+    backgroundColor: 'rgba(32, 33, 36, 0.10)',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 28,
@@ -9812,9 +10226,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     paddingVertical: 18,
     gap: 10,
-    shadowColor: '#0B2A4A',
-    shadowOpacity: 0.16,
-    shadowRadius: 14,
+    shadowColor: '#000000',
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
     shadowOffset: { width: 0, height: 8 },
     elevation: 18,
   },
@@ -9842,9 +10256,9 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     paddingBottom: 18,
     gap: 13,
-    shadowColor: '#0B2A4A',
-    shadowOpacity: 0.16,
-    shadowRadius: 16,
+    shadowColor: '#000000',
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
     elevation: 10,
   },
   keywordSheet: {
@@ -9857,9 +10271,9 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     paddingBottom: 14,
     gap: 9,
-    shadowColor: '#0B2A4A',
-    shadowOpacity: 0.16,
-    shadowRadius: 16,
+    shadowColor: '#000000',
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
     elevation: 10,
   },
   keywordChoiceSheet: {
@@ -9872,9 +10286,9 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     paddingBottom: 18,
     gap: 12,
-    shadowColor: '#0B2A4A',
-    shadowOpacity: 0.16,
-    shadowRadius: 16,
+    shadowColor: '#000000',
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
     elevation: 10,
   },
   keywordChoiceRow: {
@@ -9893,7 +10307,7 @@ const styles = StyleSheet.create({
     width: 52,
     height: 5,
     borderRadius: 3,
-    backgroundColor: '#C8D5DD',
+    backgroundColor: '#DFF6E6',
     alignSelf: 'center',
     marginBottom: 8,
   },
@@ -9912,7 +10326,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   modalClose: {
-    color: '#46677D',
+    color: mutedText,
     fontSize: 28,
     fontWeight: '900',
     lineHeight: 30,
@@ -9962,6 +10376,11 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '900',
   },
+  restoreText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '900',
+  },
   withdrawActionRow: {
     flexDirection: 'row',
     gap: 10,
@@ -9987,15 +10406,16 @@ const styles = StyleSheet.create({
   },
   toggleRow: {
     minHeight: 72,
-    borderWidth: 1,
+    borderWidth: 0,
     borderColor: line,
-    borderRadius: 10,
+    borderRadius: 18,
     paddingHorizontal: 14,
     paddingVertical: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     backgroundColor: '#FFFFFF',
+    ...gentleShadow,
   },
   toggleRowPlain: {
     borderWidth: 0,
@@ -10003,6 +10423,8 @@ const styles = StyleSheet.create({
     minHeight: 74,
     paddingHorizontal: 16,
     backgroundColor: '#FFFFFF',
+    shadowOpacity: 0,
+    elevation: 0,
   },
   toggleRowTint: {
     backgroundColor: pale,
@@ -10012,7 +10434,7 @@ const styles = StyleSheet.create({
     height: 28,
     borderRadius: 14,
     padding: 3,
-    backgroundColor: '#C8D5DD',
+    backgroundColor: '#DFF6E6',
   },
   toggleOn: {
     backgroundColor: navy,
@@ -10025,6 +10447,55 @@ const styles = StyleSheet.create({
   },
   toggleKnobOn: {
     transform: [{ translateX: 20 }],
+  },
+  floatingScanButton: {
+    position: 'absolute',
+    right: 18,
+    bottom: 78,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#DDF8E6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 80,
+    elevation: 9,
+    shadowColor: '#57C879',
+    shadowOpacity: 0.22,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+  },
+  floatingSmallButton: {
+    right: 22,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+  },
+  floatingTrashButton: {
+    borderWidth: 2,
+    borderColor: '#D65353',
+    backgroundColor: '#FFFFFF',
+    shadowColor: '#D65353',
+    shadowOpacity: 0.16,
+  },
+  floatingDeleteButton: {
+    borderWidth: 2,
+    borderColor: line,
+    backgroundColor: '#FFFFFF',
+    shadowColor: '#000000',
+    shadowOpacity: 0.09,
+  },
+  floatingRestoreButton: {
+    borderWidth: 2,
+    borderColor: line,
+    backgroundColor: '#FFFFFF',
+    shadowColor: '#000000',
+    shadowOpacity: 0.08,
+  },
+  floatingScanLogo: {
+    width: 38,
+    height: 38,
+    borderRadius: 11,
   },
   bottomNav: {
     height: 64,
@@ -10047,7 +10518,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   navLabel: {
-    color: '#315A73',
+    color: mutedText,
     fontSize: 10,
     fontWeight: '900',
   },
@@ -10071,7 +10542,7 @@ const styles = StyleSheet.create({
     width: 15.5,
     height: 4.6,
     borderRadius: 1,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
     transform: [{ rotate: '-43deg' }],
   },
   navHomeRoofRight: {
@@ -10081,7 +10552,7 @@ const styles = StyleSheet.create({
     width: 15.5,
     height: 4.6,
     borderRadius: 1,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
     transform: [{ rotate: '43deg' }],
   },
   navHomeLeftWall: {
@@ -10090,7 +10561,7 @@ const styles = StyleSheet.create({
     bottom: 2.5,
     width: 4.8,
     height: 12.5,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
   },
   navHomeRightWall: {
     position: 'absolute',
@@ -10098,7 +10569,7 @@ const styles = StyleSheet.create({
     bottom: 2.5,
     width: 4.8,
     height: 12.5,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
   },
   navHomeBase: {
     position: 'absolute',
@@ -10106,7 +10577,7 @@ const styles = StyleSheet.create({
     right: 3.5,
     bottom: 2.5,
     height: 4.8,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
   },
   navHomeDoorCut: {
     position: 'absolute',
@@ -10120,18 +10591,18 @@ const styles = StyleSheet.create({
     height: 21,
     borderRadius: 4,
     borderWidth: 2.2,
-    borderColor: '#2F6686',
+    borderColor: mutedText,
     backgroundColor: '#FFFFFF',
     overflow: 'hidden',
   },
   navLockerActive: {
     borderColor: navy,
-    backgroundColor: '#EAF7F2',
+    backgroundColor: '#E9FFF0',
   },
   navLockerDoor: {
     flex: 1,
     borderLeftWidth: 1.5,
-    borderLeftColor: '#B8D3DE',
+    borderLeftColor: line,
     alignItems: 'center',
     paddingTop: 4,
   },
@@ -10142,7 +10613,7 @@ const styles = StyleSheet.create({
     width: 8.5,
     height: 1.8,
     borderRadius: 1,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
     marginBottom: 2,
   },
   navLockerHandle: {
@@ -10152,13 +10623,13 @@ const styles = StyleSheet.create({
     width: 2.8,
     height: 5.4,
     borderRadius: 2,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
   },
   navHistoryWrap: {
     width: 22,
     height: 22,
     borderWidth: 2,
-    borderColor: '#2F6686',
+    borderColor: mutedText,
     borderRadius: 5,
     paddingHorizontal: 4,
     paddingVertical: 4,
@@ -10167,12 +10638,12 @@ const styles = StyleSheet.create({
   },
   navHistoryWrapActive: {
     borderColor: navy,
-    backgroundColor: '#EAF7F2',
+    backgroundColor: '#E9FFF0',
   },
   navHistoryLine: {
     height: 2,
     borderRadius: 2,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
   },
   navHistoryChart: {
     width: 23,
@@ -10186,13 +10657,13 @@ const styles = StyleSheet.create({
     bottom: 3,
     height: 2.2,
     borderRadius: 2,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
   },
   navHistorySegment: {
     position: 'absolute',
     height: 3,
     borderRadius: 3,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
   },
   navHistorySegmentOne: {
     left: 4,
@@ -10211,7 +10682,7 @@ const styles = StyleSheet.create({
     width: 4.6,
     height: 4.6,
     borderRadius: 3,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
   },
   navHistoryDotOne: {
     left: 2.5,
@@ -10239,7 +10710,7 @@ const styles = StyleSheet.create({
     height: 17.5,
     borderRadius: 9,
     borderWidth: 0,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 2,
@@ -10262,7 +10733,7 @@ const styles = StyleSheet.create({
     width: 5.4,
     height: 7.2,
     borderRadius: 1.4,
-    backgroundColor: '#2F6686',
+    backgroundColor: mutedText,
     zIndex: 1,
   },
   navGearTop: {
