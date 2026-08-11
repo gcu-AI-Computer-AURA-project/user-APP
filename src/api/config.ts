@@ -19,6 +19,9 @@ export const GOOGLE_OAUTH_REDIRECT_URI =
 export const GOOGLE_WEB_CLIENT_ID =
   process.env?.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID || DEFAULT_GOOGLE_WEB_CLIENT_ID;
 
+export const DEV_AURA_ACCESS_TOKEN =
+  process.env?.EXPO_PUBLIC_DEV_AURA_ACCESS_TOKEN?.trim() || '';
+
 export const API_ENDPOINTS = {
   auth: {
     googleLogin: '/api/auth/google/login',

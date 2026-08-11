@@ -22,11 +22,10 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import AntDesign from '@expo/vector-icons/AntDesign';
 import Feather from '@expo/vector-icons/Feather';
 import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
-import { GoogleSignin, isErrorWithCode, statusCodes } from '@react-native-google-signin/google-signin';
 import { LineChart } from 'react-native-chart-kit';
 import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
-import { GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
+import { DEV_AURA_ACCESS_TOKEN, GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
 import { userApi } from './src/api/user';
 import type { AuraPlatform, AuraServicePermissions, AuraUser } from './src/api/types';
 
@@ -80,6 +79,15 @@ type Screen =
   | 'notice';
 
 type MainTab = 'home' | 'storage' | 'trash' | 'history' | 'settings';
+
+type GoogleSignInModule = typeof import('@react-native-google-signin/google-signin');
+
+let googleSignInModulePromise: Promise<GoogleSignInModule> | null = null;
+
+const loadGoogleSignInModule = () => {
+  googleSignInModulePromise ??= import('@react-native-google-signin/google-signin');
+  return googleSignInModulePromise;
+};
 type FloatingButtonVariant = 'scan' | 'delete' | 'trash' | 'restore';
 type FloatingAction = { variant: Exclude<FloatingButtonVariant, 'scan'>; onPress: () => void; small?: boolean };
 type FontAwesome5Name = React.ComponentProps<typeof FontAwesome5>['name'];
@@ -901,6 +909,7 @@ export default function App() {
   const deleteConfirmMotion = useRef(new Animated.Value(1)).current;
   const cleanupReclaimedOpacity = useRef(new Animated.Value(1)).current;
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const devAccessTokenApplied = useRef(false);
   const screenRef = useRef<Screen>('initial');
   const scanSourceLabelRef = useRef('Gmail + Drive');
   const scanResultRef = useRef<ScanSummary>(emptyScanSummary);
@@ -925,18 +934,26 @@ export default function App() {
   });
 
   useEffect(() => {
-    GoogleSignin.configure({
-      webClientId: GOOGLE_WEB_CLIENT_ID,
-      offlineAccess: true,
-      forceCodeForRefreshToken: true,
-      scopes: [
-        'openid',
-        'email',
-        'profile',
-        'https://www.googleapis.com/auth/gmail.modify',
-        'https://www.googleapis.com/auth/drive',
-      ],
-    });
+    if (__DEV__ && DEV_AURA_ACCESS_TOKEN) return;
+
+    void loadGoogleSignInModule()
+      .then(({ GoogleSignin }) => {
+        GoogleSignin.configure({
+          webClientId: GOOGLE_WEB_CLIENT_ID,
+          offlineAccess: true,
+          forceCodeForRefreshToken: true,
+          scopes: [
+            'openid',
+            'email',
+            'profile',
+            'https://www.googleapis.com/auth/gmail.modify',
+            'https://www.googleapis.com/auth/drive',
+          ],
+        });
+      })
+      .catch(() => {
+        // Expo Go에는 Google Sign-In 네이티브 모듈이 포함되지 않는다.
+      });
   }, []);
 
   const go = (next: Screen) => {
@@ -1395,6 +1412,26 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (!__DEV__ || !DEV_AURA_ACCESS_TOKEN || devAccessTokenApplied.current) return;
+
+    devAccessTokenApplied.current = true;
+    setApiAccessToken(DEV_AURA_ACCESS_TOKEN);
+
+    void userApi
+      .getMe({ accessToken: DEV_AURA_ACCESS_TOKEN })
+      .then((user) => {
+        applyApiUser(user);
+        setPrivacyChecked(true);
+        setPrivacyDetailChecked(true);
+        replace('home');
+      })
+      .catch(() => {
+        setApiAccessToken(null);
+        showToast('개발용 AURA access token을 확인해주세요');
+      });
+  }, []);
+
   const syncUserPermissions = async (nextPermissions: Partial<AuraServicePermissions>) => {
     setPermissions((items) => ({ ...items, ...nextPermissions }));
   };
@@ -1459,12 +1496,19 @@ export default function App() {
     }
 
     setAuthLoading(true);
+    let isGoogleSignInError: GoogleSignInModule['isErrorWithCode'] | null = null;
+    let googleStatusCodes: GoogleSignInModule['statusCodes'] | null = null;
 
     try {
       if (!GOOGLE_WEB_CLIENT_ID) {
         showToast('Google Web Client ID is missing.');
         return;
       }
+
+      const googleSignInModule = await loadGoogleSignInModule();
+      const { GoogleSignin } = googleSignInModule;
+      isGoogleSignInError = googleSignInModule.isErrorWithCode;
+      googleStatusCodes = googleSignInModule.statusCodes;
 
       await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
       const googleSession = await GoogleSignin.signIn();
@@ -1505,12 +1549,14 @@ export default function App() {
 
       go('permissions');
     } catch (error) {
-      if (isErrorWithCode(error)) {
-        if (error.code === statusCodes.SIGN_IN_CANCELLED) {
+      if (isGoogleSignInError?.(error) && googleStatusCodes) {
+        const googleError = error as { code: string };
+
+        if (googleError.code === googleStatusCodes.SIGN_IN_CANCELLED) {
           return;
         }
 
-        if (error.code === statusCodes.PLAY_SERVICES_NOT_AVAILABLE) {
+        if (googleError.code === googleStatusCodes.PLAY_SERVICES_NOT_AVAILABLE) {
           showToast('Google Play Services is not available.');
           return;
         }
