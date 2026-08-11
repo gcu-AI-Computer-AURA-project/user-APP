@@ -25,7 +25,7 @@ import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
 import { LineChart } from 'react-native-chart-kit';
 import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
-import { GOOGLE_OAUTH_REDIRECT_URI } from './src/api/config';
+import { DEV_AURA_ACCESS_TOKEN, GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
 import { userApi } from './src/api/user';
 import type { AuraPlatform, AuraServicePermissions, AuraUser } from './src/api/types';
 
@@ -79,6 +79,15 @@ type Screen =
   | 'notice';
 
 type MainTab = 'home' | 'storage' | 'trash' | 'history' | 'settings';
+
+type GoogleSignInModule = typeof import('@react-native-google-signin/google-signin');
+
+let googleSignInModulePromise: Promise<GoogleSignInModule> | null = null;
+
+const loadGoogleSignInModule = () => {
+  googleSignInModulePromise ??= import('@react-native-google-signin/google-signin');
+  return googleSignInModulePromise;
+};
 type FloatingButtonVariant = 'scan' | 'delete' | 'trash' | 'restore';
 type FloatingAction = { variant: Exclude<FloatingButtonVariant, 'scan'>; onPress: () => void; small?: boolean };
 type FontAwesome5Name = React.ComponentProps<typeof FontAwesome5>['name'];
@@ -187,6 +196,17 @@ const getAuraPlatform = (): AuraPlatform => {
   if (Platform.OS === 'ios') return 'IOS';
   if (Platform.OS === 'android') return 'ANDROID';
   return 'WEB';
+};
+
+const extractServerAuthCode = (response: unknown) => {
+  if (!response || typeof response !== 'object') return null;
+
+  const data = response as {
+    serverAuthCode?: string | null;
+    data?: { serverAuthCode?: string | null };
+  };
+
+  return data.serverAuthCode ?? data.data?.serverAuthCode ?? null;
 };
 
 const getMainTabForScreen = (screen: Screen): MainTab | null => {
@@ -889,6 +909,7 @@ export default function App() {
   const deleteConfirmMotion = useRef(new Animated.Value(1)).current;
   const cleanupReclaimedOpacity = useRef(new Animated.Value(1)).current;
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const devAccessTokenApplied = useRef(false);
   const screenRef = useRef<Screen>('initial');
   const scanSourceLabelRef = useRef('Gmail + Drive');
   const scanResultRef = useRef<ScanSummary>(emptyScanSummary);
@@ -911,6 +932,29 @@ export default function App() {
     marketing: false,
     autoScan: true,
   });
+
+  useEffect(() => {
+    if (__DEV__ && DEV_AURA_ACCESS_TOKEN) return;
+
+    void loadGoogleSignInModule()
+      .then(({ GoogleSignin }) => {
+        GoogleSignin.configure({
+          webClientId: GOOGLE_WEB_CLIENT_ID,
+          offlineAccess: true,
+          forceCodeForRefreshToken: true,
+          scopes: [
+            'openid',
+            'email',
+            'profile',
+            'https://www.googleapis.com/auth/gmail.modify',
+            'https://www.googleapis.com/auth/drive',
+          ],
+        });
+      })
+      .catch(() => {
+        // Expo Go에는 Google Sign-In 네이티브 모듈이 포함되지 않는다.
+      });
+  }, []);
 
   const go = (next: Screen) => {
     transitionDirection.current = -1;
@@ -1368,6 +1412,26 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (!__DEV__ || !DEV_AURA_ACCESS_TOKEN || devAccessTokenApplied.current) return;
+
+    devAccessTokenApplied.current = true;
+    setApiAccessToken(DEV_AURA_ACCESS_TOKEN);
+
+    void userApi
+      .getMe({ accessToken: DEV_AURA_ACCESS_TOKEN })
+      .then((user) => {
+        applyApiUser(user);
+        setPrivacyChecked(true);
+        setPrivacyDetailChecked(true);
+        replace('home');
+      })
+      .catch(() => {
+        setApiAccessToken(null);
+        showToast('개발용 AURA access token을 확인해주세요');
+      });
+  }, []);
+
   const syncUserPermissions = async (nextPermissions: Partial<AuraServicePermissions>) => {
     setPermissions((items) => ({ ...items, ...nextPermissions }));
   };
@@ -1422,6 +1486,85 @@ export default function App() {
     } finally {
       setAuthLoading(false);
       go('permissions');
+    }
+  };
+
+  const handleNativeGoogleContinue = async () => {
+    if (!privacyChecked) {
+      showToast('Privacy consent is required.');
+      return;
+    }
+
+    setAuthLoading(true);
+    let isGoogleSignInError: GoogleSignInModule['isErrorWithCode'] | null = null;
+    let googleStatusCodes: GoogleSignInModule['statusCodes'] | null = null;
+
+    try {
+      if (!GOOGLE_WEB_CLIENT_ID) {
+        showToast('Google Web Client ID is missing.');
+        return;
+      }
+
+      const googleSignInModule = await loadGoogleSignInModule();
+      const { GoogleSignin } = googleSignInModule;
+      isGoogleSignInError = googleSignInModule.isErrorWithCode;
+      googleStatusCodes = googleSignInModule.statusCodes;
+
+      await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+      const googleSession = await GoogleSignin.signIn();
+      const serverAuthCode = extractServerAuthCode(googleSession);
+
+      if (!serverAuthCode) {
+        showToast('Google server auth code was not returned.');
+        return;
+      }
+
+      const session = await authApi.loginWithGoogle({
+        server_auth_code: serverAuthCode,
+        platform: getAuraPlatform(),
+      });
+
+      const nextAccessToken = session.accessToken ?? null;
+      setApiAccessToken(nextAccessToken);
+
+      if (session.user) {
+        applyApiUser(session.user);
+      } else if (nextAccessToken) {
+        const user = await userApi.getMe({ accessToken: nextAccessToken });
+        applyApiUser(user);
+      }
+
+      if (nextAccessToken && privacyChecked) {
+        await userApi.saveConsent(
+          {
+            is_privacy_agreed: true,
+            is_ai_analysis_agreed: true,
+            is_metadata_only_agreed: true,
+            is_user_approval_required_agreed: true,
+            consent_version: 'v1.0',
+          },
+          { accessToken: nextAccessToken }
+        );
+      }
+
+      go('permissions');
+    } catch (error) {
+      if (isGoogleSignInError?.(error) && googleStatusCodes) {
+        const googleError = error as { code: string };
+
+        if (googleError.code === googleStatusCodes.SIGN_IN_CANCELLED) {
+          return;
+        }
+
+        if (googleError.code === googleStatusCodes.PLAY_SERVICES_NOT_AVAILABLE) {
+          showToast('Google Play Services is not available.');
+          return;
+        }
+      }
+
+      showToast('Google login failed.');
+    } finally {
+      setAuthLoading(false);
     }
   };
 
@@ -2182,7 +2325,7 @@ export default function App() {
               <PrimaryButton
                 title={authLoading ? '\uB85C\uADF8\uC778 \uC5F0\uACB0 \uC911...' : '\uAD6C\uAE00 \uACC4\uC815\uC73C\uB85C \uACC4\uC18D'}
                 onPress={() => {
-                  void handleGoogleContinue();
+                  void handleNativeGoogleContinue();
                 }}
                 inline
               />

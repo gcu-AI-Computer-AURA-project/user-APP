@@ -67,8 +67,9 @@ export type AuthSession = AuthTokens & {
 };
 
 export type GoogleLoginRequest = {
-  authorization_code: string;
-  redirect_uri: string;
+  authorization_code?: string;
+  redirect_uri?: string;
+  server_auth_code?: string;
   platform: AuraPlatform;
 };
 

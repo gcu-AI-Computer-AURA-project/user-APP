@@ -1,7 +1,8 @@
 {
   "expo": {
     "name": "AURA",
-    "slug": "aura-app",
+    "owner": "gcu-aura-app",
+    "slug": "aura-user-app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/AURA-logo.png",
@@ -15,7 +16,7 @@
       "supportsTablet": true
     },
     "android": {
-      "package": "com.aura.ghostdata",
+      "package": "com.aura.userapp",
       "permissions": [
         "POST_NOTIFICATIONS"
       ],
@@ -28,9 +29,12 @@
     "web": {
       "favicon": "./assets/favicon.png"
     },
+    "plugins": [
+      "@react-native-google-signin/google-signin"
+    ],
     "extra": {
       "eas": {
-        "projectId": "e88777bf-f080-4aeb-b680-079cc88f2df8"
+        "projectId": "7f50cec4-99ec-438a-a8aa-de123995fa62"
       }
     }
   }
