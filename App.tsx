@@ -22,10 +22,11 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import AntDesign from '@expo/vector-icons/AntDesign';
 import Feather from '@expo/vector-icons/Feather';
 import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
+import { GoogleSignin, isErrorWithCode, statusCodes } from '@react-native-google-signin/google-signin';
 import { LineChart } from 'react-native-chart-kit';
 import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
-import { GOOGLE_OAUTH_REDIRECT_URI } from './src/api/config';
+import { GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
 import { userApi } from './src/api/user';
 import type { AuraPlatform, AuraServicePermissions, AuraUser } from './src/api/types';
 
@@ -187,6 +188,17 @@ const getAuraPlatform = (): AuraPlatform => {
   if (Platform.OS === 'ios') return 'IOS';
   if (Platform.OS === 'android') return 'ANDROID';
   return 'WEB';
+};
+
+const extractServerAuthCode = (response: unknown) => {
+  if (!response || typeof response !== 'object') return null;
+
+  const data = response as {
+    serverAuthCode?: string | null;
+    data?: { serverAuthCode?: string | null };
+  };
+
+  return data.serverAuthCode ?? data.data?.serverAuthCode ?? null;
 };
 
 const getMainTabForScreen = (screen: Screen): MainTab | null => {
@@ -912,6 +924,21 @@ export default function App() {
     autoScan: true,
   });
 
+  useEffect(() => {
+    GoogleSignin.configure({
+      webClientId: GOOGLE_WEB_CLIENT_ID,
+      offlineAccess: true,
+      forceCodeForRefreshToken: true,
+      scopes: [
+        'openid',
+        'email',
+        'profile',
+        'https://www.googleapis.com/auth/gmail.modify',
+        'https://www.googleapis.com/auth/drive',
+      ],
+    });
+  }, []);
+
   const go = (next: Screen) => {
     transitionDirection.current = -1;
     setHistory((items) => [...items, screen]);
@@ -1422,6 +1449,76 @@ export default function App() {
     } finally {
       setAuthLoading(false);
       go('permissions');
+    }
+  };
+
+  const handleNativeGoogleContinue = async () => {
+    if (!privacyChecked) {
+      showToast('Privacy consent is required.');
+      return;
+    }
+
+    setAuthLoading(true);
+
+    try {
+      if (!GOOGLE_WEB_CLIENT_ID) {
+        showToast('Google Web Client ID is missing.');
+        return;
+      }
+
+      await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+      const googleSession = await GoogleSignin.signIn();
+      const serverAuthCode = extractServerAuthCode(googleSession);
+
+      if (!serverAuthCode) {
+        showToast('Google server auth code was not returned.');
+        return;
+      }
+
+      const session = await authApi.loginWithGoogle({
+        server_auth_code: serverAuthCode,
+        platform: getAuraPlatform(),
+      });
+
+      const nextAccessToken = session.accessToken ?? null;
+      setApiAccessToken(nextAccessToken);
+
+      if (session.user) {
+        applyApiUser(session.user);
+      } else if (nextAccessToken) {
+        const user = await userApi.getMe({ accessToken: nextAccessToken });
+        applyApiUser(user);
+      }
+
+      if (nextAccessToken && privacyChecked) {
+        await userApi.saveConsent(
+          {
+            is_privacy_agreed: true,
+            is_ai_analysis_agreed: true,
+            is_metadata_only_agreed: true,
+            is_user_approval_required_agreed: true,
+            consent_version: 'v1.0',
+          },
+          { accessToken: nextAccessToken }
+        );
+      }
+
+      go('permissions');
+    } catch (error) {
+      if (isErrorWithCode(error)) {
+        if (error.code === statusCodes.SIGN_IN_CANCELLED) {
+          return;
+        }
+
+        if (error.code === statusCodes.PLAY_SERVICES_NOT_AVAILABLE) {
+          showToast('Google Play Services is not available.');
+          return;
+        }
+      }
+
+      showToast('Google login failed.');
+    } finally {
+      setAuthLoading(false);
     }
   };
 
@@ -2182,7 +2279,7 @@ export default function App() {
               <PrimaryButton
                 title={authLoading ? '\uB85C\uADF8\uC778 \uC5F0\uACB0 \uC911...' : '\uAD6C\uAE00 \uACC4\uC815\uC73C\uB85C \uACC4\uC18D'}
                 onPress={() => {
-                  void handleGoogleContinue();
+                  void handleNativeGoogleContinue();
                 }}
                 inline
               />
