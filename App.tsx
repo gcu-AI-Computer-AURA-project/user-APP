@@ -20,8 +20,9 @@ import {
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { Circle, Line, Path, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
+import { GOOGLE_OAUTH_REDIRECT_URI } from './src/api/config';
 import { userApi } from './src/api/user';
-import type { AuraServicePermissions, AuraUser } from './src/api/types';
+import type { AuraPlatform, AuraServicePermissions, AuraUser } from './src/api/types';
 
 type Screen =
   | 'initial'
@@ -157,6 +158,12 @@ const formatMonthLabel = (monthIndex: number) => {
 const formatMonthShortLabel = (monthIndex: number) => {
   const { year, month } = getMonthParts(monthIndex);
   return `${`${year}`.slice(2)}.${`${month}`.padStart(2, '0')}`;
+};
+
+const getAuraPlatform = (): AuraPlatform => {
+  if (Platform.OS === 'ios') return 'IOS';
+  if (Platform.OS === 'android') return 'ANDROID';
+  return 'WEB';
 };
 
 const getMainTabForScreen = (screen: Screen): MainTab | null => {
@@ -1299,15 +1306,6 @@ export default function App() {
 
   const syncUserPermissions = async (nextPermissions: Partial<AuraServicePermissions>) => {
     setPermissions((items) => ({ ...items, ...nextPermissions }));
-
-    if (!apiAccessToken) return;
-
-    try {
-      const user = await userApi.updatePermissions(nextPermissions, { accessToken: apiAccessToken });
-      applyApiUser(user);
-    } catch {
-      showToast('권한 상태를 서버에 저장하지 못했어요');
-    }
   };
 
   const handleGoogleContinue = async () => {
@@ -1319,8 +1317,18 @@ export default function App() {
     setAuthLoading(true);
 
     try {
+      const authorizationCode = '';
+
+      if (!authorizationCode) {
+        showToast('Google OAuth authorization_code와 redirect URI 연결이 필요해요');
+        go('permissions');
+        return;
+      }
+
       const session = await authApi.loginWithGoogle({
-        privacyConsentAgreed: privacyChecked,
+        authorization_code: authorizationCode,
+        redirect_uri: GOOGLE_OAUTH_REDIRECT_URI,
+        platform: getAuraPlatform(),
       });
 
       const nextAccessToken = session.accessToken ?? null;
@@ -1331,6 +1339,19 @@ export default function App() {
       } else if (nextAccessToken) {
         const user = await userApi.getMe({ accessToken: nextAccessToken });
         applyApiUser(user);
+      }
+
+      if (nextAccessToken && privacyChecked) {
+        await userApi.saveConsent(
+          {
+            is_privacy_agreed: true,
+            is_ai_analysis_agreed: true,
+            is_metadata_only_agreed: true,
+            is_user_approval_required_agreed: true,
+            consent_version: 'v1.0',
+          },
+          { accessToken: nextAccessToken }
+        );
       }
     } catch {
       showToast('API 서버 연결 실패: 시연 모드로 계속합니다');

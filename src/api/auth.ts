@@ -1,28 +1,38 @@
 import { apiRequest } from './client';
 import { API_ENDPOINTS } from './config';
-import type { ApiRequestOptions, AuthSession, GoogleLoginRequest } from './types';
+import type {
+  ApiRequestOptions,
+  ApiResponse,
+  AuthSession,
+  GoogleLoginRequest,
+  SwaggerGoogleLoginResponse,
+  SwaggerTokenRefreshResponse,
+} from './types';
+import { normalizeAuthSession, normalizeRefreshedSession } from './types';
 
 export const authApi = {
-  loginWithGoogle(payload: GoogleLoginRequest) {
-    return apiRequest<AuthSession>(API_ENDPOINTS.auth.googleLogin, {
-      method: 'POST',
-      body: payload,
-    });
+  async loginWithGoogle(payload: GoogleLoginRequest): Promise<AuthSession> {
+    const response = await apiRequest<ApiResponse<SwaggerGoogleLoginResponse>>(
+      API_ENDPOINTS.auth.googleLogin,
+      {
+        method: 'POST',
+        body: payload,
+      }
+    );
+
+    return normalizeAuthSession(response.data);
   },
 
-  getStatus(options?: ApiRequestOptions) {
-    return apiRequest<AuthSession>(API_ENDPOINTS.auth.status, {
-      method: 'GET',
-      accessToken: options?.accessToken,
-      signal: options?.signal,
-    });
-  },
+  async refresh(refreshToken: string): Promise<AuthSession> {
+    const response = await apiRequest<ApiResponse<SwaggerTokenRefreshResponse>>(
+      API_ENDPOINTS.auth.refresh,
+      {
+        method: 'POST',
+        body: { refresh_token: refreshToken },
+      }
+    );
 
-  refresh(refreshToken: string) {
-    return apiRequest<AuthSession>(API_ENDPOINTS.auth.refresh, {
-      method: 'POST',
-      body: { refreshToken },
-    });
+    return normalizeRefreshedSession(response.data);
   },
 
   logout(options?: ApiRequestOptions) {
@@ -33,4 +43,3 @@ export const authApi = {
     });
   },
 };
-
