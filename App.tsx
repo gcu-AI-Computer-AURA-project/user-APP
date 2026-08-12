@@ -26,6 +26,21 @@ import { LineChart } from 'react-native-chart-kit';
 import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
 import { DEV_AURA_ACCESS_TOKEN, GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
+import {
+  googleApi,
+  homeApi,
+  cleanupApi,
+  notificationApi,
+  scanApi,
+  statisticsApi,
+  storageApi,
+  type ApiCandidate,
+  type ApiHomeSummary,
+  type ApiMonthlyStatistic,
+  type ApiScanHistoryItem,
+  type ApiScanSetting,
+  type ApiStorageItem,
+} from './src/api/features';
 import { userApi } from './src/api/user';
 import type { AuraPlatform, AuraServicePermissions, AuraUser } from './src/api/types';
 
@@ -553,6 +568,131 @@ function formatDataSize(sizeMB: number) {
   return `${Math.round(sizeMB)}MB`;
 }
 
+function bytesToMB(bytes?: number | null) {
+  return Math.max(0, Number(bytes ?? 0) / 1024 / 1024);
+}
+
+function formatBytes(bytes?: number | null) {
+  return formatDataSize(bytesToMB(bytes));
+}
+
+function formatApiDate(value?: string | null) {
+  const pad = (target: number) => `${target}`.padStart(2, '0');
+  const toLabel = (date: Date) =>
+    `${date.getFullYear()}.${pad(date.getMonth() + 1)}.${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+
+  if (!value) return toLabel(new Date());
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return toLabel(date);
+}
+
+function formatApiDateOnly(value?: string | null) {
+  return formatScanDateOnly(formatApiDate(value));
+}
+
+function apiScanSourceLabel(source?: string | null) {
+  if (source === 'MAIL') return 'Gmail';
+  if (source === 'DRIVE_ALL' || source === 'DRIVE_FOLDER') return 'Drive';
+  if (source === 'MAIL_AND_DRIVE') return 'Gmail + Drive';
+  return 'Gmail + Drive';
+}
+
+function apiCategoryDesc(category?: string, fallback?: string) {
+  if (category === 'PROMOTION_MAIL') return '광고·프로모션 메일';
+  if (category === 'OLD_MAIL') return '오래된 메일';
+  if (category === 'DUPLICATE_FILE') return '중복 파일';
+  if (category === 'OLD_DRIVE_FILE') return '오래된 파일';
+  if (category === 'LARGE_FILE') return '대용량 파일';
+  if (category === 'LOW_VALUE_ATTACHMENT') return '대용량 첨부파일';
+  if (category === 'TEMP_OR_BACKUP') return '임시·백업 파일';
+  if (category === 'PROTECTED') return '보호 항목';
+  return fallback || '분석 후보';
+}
+
+function apiStorageItemToMail(item: ApiStorageItem): StorageMailItem {
+  const date = formatApiDateOnly(item.trashed_at || item.modified_time || item.last_opened_time);
+  return {
+    id: `api-storage-mail-${item.item_id ?? item.external_item_id ?? item.title}`,
+    title: item.title || item.external_item_id || 'Gmail 항목',
+    subtitle: item.title || '메일 항목',
+    meta: `받은날짜 ${date} · Gmail · ${formatBytes(item.size_bytes)}`,
+    badge: item.recoverable === false ? '만료 임박' : undefined,
+  };
+}
+
+function apiStorageItemToDrive(item: ApiStorageItem): StorageDriveItem {
+  const extension = (item.file_extension || item.mime_type || 'FILE').replace(/^\./, '').toUpperCase();
+  const date = formatApiDateOnly(item.modified_time || item.last_opened_time || item.trashed_at);
+  return {
+    id: `api-storage-drive-${item.item_id ?? item.external_item_id ?? item.title}`,
+    type: extension || 'FILE',
+    title: item.title || item.external_item_id || 'Drive 파일',
+    subtitle: `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · Drive`,
+    fullPath: driveRootPath,
+  };
+}
+
+function apiCandidateToScanItem(candidate: ApiCandidate): ScanListItem {
+  const sizeBytes = candidate.estimated_reclaim_bytes ?? candidate.size_bytes ?? candidate.attachment_size_bytes ?? 0;
+  const date =
+    candidate.received_at ||
+    candidate.last_opened_time ||
+    candidate.modified_time ||
+    candidate.created_time ||
+    undefined;
+  return {
+    id: `api-candidate-${candidate.candidate_id ?? candidate.item_id ?? candidate.external_item_id ?? candidate.title}`,
+    title: candidate.title || candidate.external_item_id || '분석 후보',
+    desc: apiCategoryDesc(candidate.category, candidate.snippet),
+    sizeMB: bytesToMB(sizeBytes),
+    dateLabel: formatApiDateOnly(date),
+    sortText: candidate.sender_domain || candidate.owner_email || candidate.title || '',
+    source: candidate.item_source === 'DRIVE' ? 'drive' : 'mail',
+    previewLabel: candidate.label_text || candidate.snippet,
+    detailTitle: candidate.title,
+    detailSubtitle: candidate.snippet || candidate.folder_path || candidate.mime_type,
+  };
+}
+
+function buildApiScanSummary(params: {
+  candidates?: ApiCandidate[];
+  storageMailItems?: ApiStorageItem[];
+  storageDriveItems?: ApiStorageItem[];
+  trashMailItems?: ApiStorageItem[];
+  estimatedBytes?: number;
+  candidateCount?: number;
+  carbonGrams?: number;
+  folderLabel?: string;
+}): ScanSummary {
+  const candidateItems = (params.candidates ?? []).map(apiCandidateToScanItem);
+  const mailItems = candidateItems.filter((item) => item.source === 'mail');
+  const driveItems = candidateItems.filter((item) => item.source === 'drive');
+  const largeItems = driveItems.filter((item) => item.sizeMB >= 500);
+  const protectedItems = candidateItems.filter((item) => item.desc?.includes('보호'));
+  const totalSizeMB =
+    params.estimatedBytes !== undefined
+      ? bytesToMB(params.estimatedBytes)
+      : sumScanItemSize(mailItems) + sumScanItemSize(driveItems);
+
+  return {
+    mailItems,
+    driveItems,
+    largeItems,
+    protectedItems,
+    storageMailItems: (params.storageMailItems ?? []).map(apiStorageItemToMail),
+    storageDriveItems: (params.storageDriveItems ?? []).map(apiStorageItemToDrive),
+    storageTrashItems: (params.trashMailItems ?? []).map(apiStorageItemToMail),
+    mailSizeLabel: formatDataSize(sumScanItemSize(mailItems)),
+    driveSizeLabel: formatDataSize(sumScanItemSize(driveItems)),
+    largeSizeLabel: formatDataSize(sumScanItemSize(largeItems)),
+    totalSizeLabel: formatDataSize(totalSizeMB),
+    carbonLabel: `약 ${(params.carbonGrams ?? Math.max(0, (totalSizeMB / 1024) * 0.19)).toFixed(1)}g CO₂`,
+    candidateCount: params.candidateCount ?? candidateItems.length,
+    folderLabel: params.folderLabel ?? '전체 Drive',
+  };
+}
+
 function formatScanDateOnly(dateLabel: string) {
   return dateLabel.split(/\s+/)[0] || dateLabel;
 }
@@ -890,6 +1030,11 @@ export default function App() {
   const [deleteJobStatus, setDeleteJobStatus] = useState<'idle' | 'running' | 'completed'>('idle');
   const [homeScanNotice, setHomeScanNotice] = useState<'none' | 'running' | 'cancelled' | 'completed'>('none');
   const [lastScan, setLastScan] = useState<ScanRecord | null>(null);
+  const [apiHomeSummary, setApiHomeSummary] = useState<ApiHomeSummary | null>(null);
+  const [apiStorageSummary, setApiStorageSummary] = useState<ScanSummary | null>(null);
+  const [apiScanHistoryItems, setApiScanHistoryItems] = useState<ApiScanHistoryItem[]>([]);
+  const [apiMonthlyStats, setApiMonthlyStats] = useState<ApiMonthlyStatistic[]>([]);
+  const [apiScanSetting, setApiScanSetting] = useState<ApiScanSetting | null>(null);
   const [hasCompletedScan, setHasCompletedScan] = useState(false);
   const [connectedDone, setConnectedDone] = useState(false);
   const [connectedStep, setConnectedStep] = useState(0);
@@ -913,6 +1058,8 @@ export default function App() {
   const screenRef = useRef<Screen>('initial');
   const scanSourceLabelRef = useRef('Gmail + Drive');
   const scanResultRef = useRef<ScanSummary>(emptyScanSummary);
+  const activeApiScanJobId = useRef<number | null>(null);
+  const activeApiCleanupJobId = useRef<number | null>(null);
   const [withdrawSheetVisible, setWithdrawSheetVisible] = useState(false);
   const [filterSheetVisible, setFilterSheetVisible] = useState(false);
   const [carbonHelpVisible, setCarbonHelpVisible] = useState(false);
@@ -1335,6 +1482,11 @@ export default function App() {
     setDeleteJobStatus('idle');
     setHomeScanNotice('none');
     setLastScan(null);
+    setApiHomeSummary(null);
+    setApiStorageSummary(null);
+    setApiScanHistoryItems([]);
+    setApiMonthlyStats([]);
+    setApiScanSetting(null);
     setHasCompletedScan(false);
     setConnectedDone(false);
     setConnectedStep(0);
@@ -1412,6 +1564,159 @@ export default function App() {
     }
   };
 
+  const applyApiScanSetting = (setting?: ApiScanSetting | null) => {
+    if (!setting) return;
+
+    setApiScanSetting(setting);
+    setScanSources({
+      gmail: setting.scan_source === 'MAIL' || setting.scan_source === 'MAIL_AND_DRIVE',
+      drive: setting.scan_source === 'DRIVE_ALL' || setting.scan_source === 'MAIL_AND_DRIVE',
+      folder: setting.scan_source === 'DRIVE_FOLDER',
+    });
+    setIncludeSubFolders(Boolean(setting.include_subfolders ?? true));
+    setIncludeMailAttachments(Boolean(setting.include_mail_attachment_size));
+    setSettingsToggles((items) => ({
+      ...items,
+      autoScan: Boolean(setting.apply_recent_conditions ?? items.autoScan),
+    }));
+
+    if (setting.last_opened_before_months) {
+      setLastOpenedBeforeMonths(setting.last_opened_before_months);
+    }
+    if (setting.last_modified_before_months) {
+      setLastModifiedBeforeMonths(setting.last_modified_before_months);
+    }
+    if (setting.include_keywords) {
+      setIncludeKeywords(setting.include_keywords);
+    }
+    if (setting.exclude_keywords) {
+      setExcludeKeywords(setting.exclude_keywords);
+    }
+    if (setting.file_extensions?.length) {
+      const selected = setting.file_extensions.reduce<Record<string, boolean>>((acc, extension) => {
+        acc[extension.replace(/^\./, '').toUpperCase()] = true;
+        return acc;
+      }, {});
+      setSelectedFileTypes((items) => ({ ...items, ...selected }));
+    }
+  };
+
+  const refreshAuraApis = async (token: string) => {
+    const options = { accessToken: token };
+    const [
+      homeResult,
+      googlePermissionsResult,
+      notificationSettingsResult,
+      scanSettingsResult,
+      runningScanResult,
+      scanHistoryResult,
+      statisticsSummaryResult,
+      monthlyStatsResult,
+      mailStorageResult,
+      driveStorageResult,
+      mailTrashResult,
+      driveTrashResult,
+    ] = await Promise.allSettled([
+      homeApi.getSummary(options),
+      googleApi.getPermissions(options),
+      notificationApi.getSettings(options),
+      scanApi.getSettings(options),
+      scanApi.getRunning(options),
+      scanApi.getHistory({ page: 0, size: 20 }, options),
+      statisticsApi.getSummary(options),
+      statisticsApi.getMonthly(undefined, options),
+      storageApi.getItems({ item_source: 'GMAIL', page: 0, size: 50 }, options),
+      storageApi.getItems({ item_source: 'DRIVE', page: 0, size: 50 }, options),
+      storageApi.getTrash({ item_source: 'GMAIL', page: 0, size: 50 }, options),
+      storageApi.getTrash({ item_source: 'DRIVE', page: 0, size: 50 }, options),
+    ]);
+
+    const homeSummary = homeResult.status === 'fulfilled' ? homeResult.value : null;
+    const scanHistory = scanHistoryResult.status === 'fulfilled' ? scanHistoryResult.value.content ?? [] : [];
+    const storageMail = mailStorageResult.status === 'fulfilled' ? mailStorageResult.value.content ?? [] : [];
+    const storageDrive = driveStorageResult.status === 'fulfilled' ? driveStorageResult.value.content ?? [] : [];
+    const trashMail = mailTrashResult.status === 'fulfilled' ? mailTrashResult.value.content ?? [] : [];
+    const trashDrive = driveTrashResult.status === 'fulfilled' ? driveTrashResult.value.content ?? [] : [];
+    const latestHistory = scanHistory[0];
+    const latestScan = homeSummary?.latest_scan;
+    const latestCleanup = homeSummary?.latest_cleanup;
+    const estimatedBytes = latestScan?.estimated_reclaim_bytes ?? latestHistory?.estimated_reclaim_bytes ?? homeSummary?.storage_summary?.estimated_reclaim_bytes;
+    const candidateCount = latestScan?.candidate_count ?? latestHistory?.candidate_count;
+    const completedAt = latestScan?.completed_at ?? latestHistory?.created_at ?? latestScan?.started_at;
+    const source = latestScan?.scan_source ?? latestHistory?.scan_source;
+    const apiSummary = buildApiScanSummary({
+      storageMailItems: storageMail,
+      storageDriveItems: storageDrive,
+      trashMailItems: [...trashMail, ...trashDrive],
+      estimatedBytes,
+      candidateCount,
+      carbonGrams: latestCleanup?.estimated_carbon_grams ?? latestHistory?.estimated_carbon_grams ?? homeSummary?.storage_summary?.total_estimated_carbon_grams,
+    });
+
+    setApiHomeSummary(homeSummary);
+    setApiStorageSummary(apiSummary);
+    setApiScanHistoryItems(scanHistory);
+
+    if (homeSummary?.permissions) {
+      setPermissions((items) => ({
+        ...items,
+        gmail: homeSummary.permissions?.gmail_status === 'CONNECTED',
+        drive: homeSummary.permissions?.drive_status === 'CONNECTED',
+      }));
+    }
+
+    if (googlePermissionsResult.status === 'fulfilled') {
+      const nextPermissions = googlePermissionsResult.value.permissions ?? [];
+      const gmail = nextPermissions.find((permission) => permission.service_type === 'GMAIL');
+      const drive = nextPermissions.find((permission) => permission.service_type === 'DRIVE');
+      setPermissions((items) => ({
+        ...items,
+        gmail: gmail ? gmail.permission_status === 'CONNECTED' : items.gmail,
+        drive: drive ? drive.permission_status === 'CONNECTED' : items.drive,
+      }));
+    }
+
+    if (notificationSettingsResult.status === 'fulfilled') {
+      setSettingsToggles((items) => ({
+        ...items,
+        scanComplete: Boolean(notificationSettingsResult.value.is_scan_complete_enabled),
+        aiNudge: Boolean(notificationSettingsResult.value.is_scan_recommend_enabled),
+      }));
+      setPermissions((items) => ({
+        ...items,
+        alarm: Boolean(notificationSettingsResult.value.is_scan_complete_enabled || notificationSettingsResult.value.is_scan_recommend_enabled),
+      }));
+    }
+
+    if (scanSettingsResult.status === 'fulfilled') {
+      applyApiScanSetting(scanSettingsResult.value);
+    }
+
+    if (monthlyStatsResult.status === 'fulfilled') {
+      setApiMonthlyStats(monthlyStatsResult.value.months ?? []);
+    }
+
+    if (runningScanResult.status === 'fulfilled' && runningScanResult.value.scan_job) {
+      setHomeScanNotice('running');
+      setScanProgress(Math.round(runningScanResult.value.scan_job.progress_percent ?? 0));
+      scanSourceLabelRef.current = apiScanSourceLabel(runningScanResult.value.scan_job.scan_source);
+    }
+
+    if (latestScan || latestHistory || storageMail.length || storageDrive.length) {
+      setLastScan({
+        dateLabel: formatApiDate(completedAt ?? latestCleanup?.completed_at),
+        sourceLabel: apiScanSourceLabel(source),
+        conditionLabel: apiScanSetting ? getPeriodLabel() : 'Swagger API 기준',
+        result: apiSummary,
+      });
+      setHasCompletedScan(Boolean(latestScan || latestHistory));
+    }
+
+    if (statisticsSummaryResult.status === 'rejected') {
+      // 통계 API가 아직 토큰/데이터 문제로 실패해도 기존 화면을 유지한다.
+    }
+  };
+
   useEffect(() => {
     if (!__DEV__ || !DEV_AURA_ACCESS_TOKEN || devAccessTokenApplied.current) return;
 
@@ -1424,6 +1729,7 @@ export default function App() {
         applyApiUser(user);
         setPrivacyChecked(true);
         setPrivacyDetailChecked(true);
+        void refreshAuraApis(DEV_AURA_ACCESS_TOKEN);
         replace('home');
       })
       .catch(() => {
@@ -1480,6 +1786,9 @@ export default function App() {
           },
           { accessToken: nextAccessToken }
         );
+      }
+      if (nextAccessToken) {
+        void refreshAuraApis(nextAccessToken);
       }
     } catch {
       showToast('API 서버 연결 실패: 시연 모드로 계속합니다');
@@ -1545,6 +1854,9 @@ export default function App() {
           },
           { accessToken: nextAccessToken }
         );
+      }
+      if (nextAccessToken) {
+        void refreshAuraApis(nextAccessToken);
       }
 
       go('permissions');
@@ -1654,6 +1966,20 @@ export default function App() {
     void requestPushPermission();
   };
 
+  useEffect(() => {
+    if (!apiAccessToken) return;
+
+    void notificationApi
+      .saveSettings(
+        {
+          is_scan_complete_enabled: settingsToggles.scanComplete,
+          is_scan_recommend_enabled: settingsToggles.aiNudge,
+        },
+        { accessToken: apiAccessToken }
+      )
+      .catch(() => undefined);
+  }, [apiAccessToken, settingsToggles.scanComplete, settingsToggles.aiNudge]);
+
   const completeLoginPermissionSetup = () => {
     void syncUserPermissions({ gmail: true, drive: true, alarm: permissions.alarm });
     if (!permissions.alarm) {
@@ -1721,6 +2047,41 @@ export default function App() {
     }
   };
 
+  const getApiScanSource = () => {
+    if (scanSources.gmail && (scanSources.drive || scanSources.folder)) return 'MAIL_AND_DRIVE' as const;
+    if (scanSources.gmail) return 'MAIL' as const;
+    if (scanSources.folder) return 'DRIVE_FOLDER' as const;
+    if (scanSources.drive) return 'DRIVE_ALL' as const;
+    return 'MAIL_AND_DRIVE' as const;
+  };
+
+  const getApiScanSettingsPayload = () => ({
+    scan_source: getApiScanSource(),
+    drive_folder_id: selectedDriveFolders[0] || undefined,
+    include_subfolders: includeSubFolders,
+    last_opened_before_months: lastOpenedBeforeMonths,
+    last_modified_before_months: lastModifiedBeforeMonths,
+    exclude_recent_days: 0,
+    include_keywords: includeKeywords,
+    exclude_keywords: excludeKeywords,
+    file_extensions: Object.entries(selectedFileTypes)
+      .filter(([, selected]) => selected)
+      .map(([extension]) => extension.toUpperCase()),
+    include_mail_attachment_size: includeMailAttachments,
+    apply_recent_conditions: settingsToggles.autoScan,
+  });
+
+  const saveApiScanSettings = async () => {
+    if (!apiAccessToken) return;
+
+    try {
+      const saved = await scanApi.saveSettings(getApiScanSettingsPayload(), { accessToken: apiAccessToken });
+      applyApiScanSetting(saved);
+    } catch {
+      showToast('스캔 조건은 화면에만 적용됐어요');
+    }
+  };
+
   const startScan = () => {
     if (!scanSources.gmail && !scanSources.drive && !scanSources.folder) {
       showPermissionToast();
@@ -1733,12 +2094,37 @@ export default function App() {
     }
     scanSourceLabelRef.current = getSimpleScanSourceLabel();
     scanResultRef.current = getLiveScanResult();
+    if (apiAccessToken) {
+      void scanApi
+        .create(
+          {
+            use_saved_settings: hasCompletedScan && settingsToggles.autoScan,
+            settings_override: hasCompletedScan && settingsToggles.autoScan ? undefined : getApiScanSettingsPayload(),
+          },
+          { accessToken: apiAccessToken }
+        )
+        .then((job) => {
+          activeApiScanJobId.current = job.scan_job_id ?? null;
+          if (job.scan_source) {
+            scanSourceLabelRef.current = apiScanSourceLabel(job.scan_source);
+          }
+          if (job.progress_percent !== undefined) {
+            setScanProgress(Math.round(job.progress_percent));
+          }
+        })
+        .catch(() => {
+          showToast('백엔드 스캔 시작 실패: 시연 모드로 진행해요');
+        });
+    }
     setScanProgress(0);
     setHomeScanNotice('running');
     go('scanProgress');
   };
 
   const cancelScan = () => {
+    if (apiAccessToken && activeApiScanJobId.current) {
+      void scanApi.cancel(activeApiScanJobId.current, { accessToken: apiAccessToken }).catch(() => undefined);
+    }
     setHomeScanNotice('cancelled');
     setScanProgress(0);
     replace('home');
@@ -1840,6 +2226,38 @@ export default function App() {
   };
 
   const startDeleteJob = () => {
+    if (apiAccessToken && activeApiScanJobId.current) {
+      void scanApi
+        .getSelectedCandidates(activeApiScanJobId.current, { accessToken: apiAccessToken })
+        .then((selected) => {
+          const candidates = (selected.items ?? [])
+            .filter((item) => item.candidate_id !== undefined)
+            .map((item) => ({
+              candidate_id: Number(item.candidate_id),
+              selection_version: Number(item.selection_version ?? 0),
+            }));
+
+          if (!candidates.length || !activeApiScanJobId.current) return null;
+
+          return cleanupApi.create(
+            {
+              scan_job_id: activeApiScanJobId.current,
+              action_type: 'MOVE_TO_TRASH',
+              candidates,
+              approval_confirmed: true,
+            },
+            { accessToken: apiAccessToken }
+          );
+        })
+        .then((job) => {
+          if (!job?.cleanup_job_id) return;
+          activeApiCleanupJobId.current = job.cleanup_job_id;
+          return cleanupApi.start(job.cleanup_job_id, { accessToken: apiAccessToken });
+        })
+        .catch(() => {
+          showToast('백엔드 휴지통 이동 요청 실패: 시연 모드로 진행해요');
+        });
+    }
     setDeleteProgress(0);
     setDeleteJobStatus('running');
     go('deleteProcessing');
@@ -2007,6 +2425,41 @@ export default function App() {
         if (next >= 100) {
           clearInterval(timer);
           setTimeout(() => {
+            const apiScanJobId = activeApiScanJobId.current;
+            if (apiAccessToken && apiScanJobId) {
+              void Promise.allSettled([
+                scanApi.getAnalysisSummary(apiScanJobId, { accessToken: apiAccessToken }),
+                scanApi.getCandidates(apiScanJobId, { include_protected: true, page: 0, size: 100 }, { accessToken: apiAccessToken }),
+              ]).then(([summaryResult, candidatesResult]) => {
+                const apiSummary = summaryResult.status === 'fulfilled' ? summaryResult.value : null;
+                const apiCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value.content ?? [] : [];
+                const nextSummary = buildApiScanSummary({
+                  candidates: apiCandidates,
+                  storageMailItems: apiStorageSummary?.storageMailItems.map((item) => ({
+                    title: item.subtitle,
+                    size_bytes: Math.round(extractStorageSizeMB(item.meta) * 1024 * 1024),
+                    modified_time: item.meta,
+                  })) ?? [],
+                  storageDriveItems: apiStorageSummary?.storageDriveItems.map((item) => ({
+                    title: item.title,
+                    file_extension: item.type,
+                    size_bytes: Math.round(extractStorageSizeMB(item.subtitle) * 1024 * 1024),
+                    modified_time: item.subtitle,
+                  })) ?? [],
+                  estimatedBytes: apiSummary?.total_estimated_reclaim_bytes,
+                  candidateCount: apiSummary?.total_candidate_count,
+                });
+                scanResultRef.current = nextSummary;
+                setApiStorageSummary(nextSummary);
+                setLastScan({
+                  dateLabel: formatScanDate(new Date()),
+                  sourceLabel: scanSourceLabelRef.current,
+                  conditionLabel: getPeriodLabel(),
+                  result: nextSummary,
+                });
+                void refreshAuraApis(apiAccessToken);
+              });
+            }
             setHomeScanNotice('completed');
             setLastScan({
               dateLabel: formatScanDate(new Date()),
@@ -2040,6 +2493,26 @@ export default function App() {
           clearInterval(timer);
           setDeleteJobStatus('completed');
           setTimeout(() => {
+            if (apiAccessToken && activeApiCleanupJobId.current) {
+              void cleanupApi
+                .getResult(activeApiCleanupJobId.current, { accessToken: apiAccessToken })
+                .then((result) => {
+                  if (result.reclaimed_bytes !== undefined || result.estimated_carbon_grams !== undefined) {
+                    setApiHomeSummary((summary) => ({
+                      ...(summary ?? {}),
+                      latest_cleanup: {
+                        cleanup_job_id: result.cleanup_job_id,
+                        cleaned_item_count: result.cleaned_item_count,
+                        reclaimed_bytes: result.reclaimed_bytes,
+                        estimated_carbon_grams: result.estimated_carbon_grams,
+                        completed_at: result.completed_at,
+                      },
+                    }));
+                  }
+                  void refreshAuraApis(apiAccessToken);
+                })
+                .catch(() => undefined);
+            }
             setHomeScanNotice('none');
             if (screenRef.current === 'deleteProcessing') {
               replace('cleanupComplete');
@@ -2251,6 +2724,16 @@ export default function App() {
     ];
     const isDriveSearching = Boolean(driveFolderSearch.trim());
     const activeScanResult = lastScan?.result ?? scanResultRef.current;
+    const storageBackedScan =
+      lastScan ??
+      (apiStorageSummary
+        ? {
+            dateLabel: formatApiDate(apiHomeSummary?.latest_scan?.completed_at ?? apiHomeSummary?.latest_scan?.started_at),
+            sourceLabel: apiScanSourceLabel(apiHomeSummary?.latest_scan?.scan_source),
+            conditionLabel: apiScanSetting ? getPeriodLabel() : 'Swagger API 기준',
+            result: apiStorageSummary,
+          }
+        : null);
     const promoMailItems = activeScanResult.mailItems.filter((item) => item.desc?.includes('광고') || item.desc?.includes('프로모션'));
     const oldMailItems = activeScanResult.mailItems.filter((item) => !promoMailItems.some((mail) => mail.id === item.id));
     const largeDriveIds = new Set(activeScanResult.largeItems.map((item) => item.id));
@@ -2281,8 +2764,12 @@ export default function App() {
     const selectedCandidateCount = selectedMailItems.length + selectedDriveItems.length;
     const selectedTotalSizeMB = sumScanItemSize(selectedMailItems) + sumScanItemSize(selectedDriveItems);
     const selectedTotalSizeLabel = formatDataSize(selectedTotalSizeMB);
-    const remainingAfterCleanup = activeScanResult.totalSizeLabel === '0MB' ? '2.6GB' : '4.7GB';
-    const homeRemainingDriveLabel = '2.6GB';
+    const remainingAfterCleanup = apiHomeSummary?.storage_summary?.latest_remaining_drive_bytes
+      ? formatBytes(apiHomeSummary.storage_summary.latest_remaining_drive_bytes)
+      : activeScanResult.totalSizeLabel === '0MB' ? '2.6GB' : '4.7GB';
+    const homeRemainingDriveLabel = apiHomeSummary?.storage_summary?.latest_remaining_drive_bytes
+      ? formatBytes(apiHomeSummary.storage_summary.latest_remaining_drive_bytes)
+      : '2.6GB';
     const homeDriveTotalGB = 15;
     const homeDriveRemainingGB = 2.6;
     const homeDriveUsagePercent = Math.round(((homeDriveTotalGB - homeDriveRemainingGB) / homeDriveTotalGB) * 100);
@@ -2682,6 +3169,7 @@ export default function App() {
               title={scanSourceEditOnly ? '조건 적용하기' : '다음'}
               onPress={() => {
                 if (scanSourceEditOnly) {
+                  void saveApiScanSettings();
                   resetSettingsScanFlowNavigation();
                   setScanSourceEditOnly(false);
                   replace('defaultScan');
@@ -2769,6 +3257,7 @@ export default function App() {
               onPress={
                 periodEditOnly
                   ? () => {
+                      void saveApiScanSettings();
                       resetSettingsScanFlowNavigation();
                       setPeriodEditOnly(false);
                       replace('defaultScan');
@@ -3180,7 +3669,8 @@ export default function App() {
         return (
           <StorageScreen
             mode={screen}
-            scan={lastScan}
+            scan={storageBackedScan}
+            apiAccessToken={apiAccessToken}
             permissions={permissions}
             checked={checked}
             toggle={toggleCheck}
@@ -5148,6 +5638,7 @@ function CarbonStatsGraph({ sizeLabel }: { sizeLabel: string }) {
 function StorageScreen({
   mode,
   scan,
+  apiAccessToken,
   permissions,
   checked,
   toggle,
@@ -5172,6 +5663,7 @@ function StorageScreen({
 }: {
   mode: 'storageMail' | 'storageDrive' | 'storageTrash' | 'storageDriveTrash';
   scan: ScanRecord | null;
+  apiAccessToken: string | null;
   permissions: { gmail: boolean; drive: boolean; alarm: boolean };
   checked: Record<string, boolean>;
   toggle: (key: string) => void;
@@ -5437,6 +5929,18 @@ function StorageScreen({
     if (id.startsWith('trash-drive-moved-')) return `storageDrive:${id.replace('trash-drive-moved-', '')}`;
     return null;
   };
+  const getApiStorageActionItems = () =>
+    selectedItems
+      .filter((item) => !item.id.startsWith('storage-folder-') && !item.id.startsWith('trash-drive-folder-'))
+      .map((item) => ({
+        item_source: isDrive ? ('DRIVE' as const) : ('GMAIL' as const),
+        external_item_id: item.id
+          .replace(/^api-storage-(?:mail|drive)-/, '')
+          .replace(/^trash-drive-file-/, '')
+          .replace(/^trash-mail-moved-/, '')
+          .replace(/^trash-drive-moved-/, '')
+          .replace(/^storage-/, ''),
+      }));
   const confirmStorageDelete = () => {
     if (!deleteConfirmChecked) {
       showToast('삭제 확인 체크가 필요합니다');
@@ -5446,6 +5950,12 @@ function StorageScreen({
     const selectedKeys = selectedItems.map((item) => itemStorageKey(item.id));
     closeDeleteSheet();
     if (permanent) {
+      const apiItems = getApiStorageActionItems();
+      if (apiAccessToken && apiItems.length) {
+        void storageApi.permanentDelete(apiItems, { accessToken: apiAccessToken }).catch(() => {
+          showToast('백엔드 영구 삭제 요청 실패: 화면에서만 반영했어요');
+        });
+      }
       setStorageDeletedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
       clearSelectionPrefix(prefix);
       setSelectionMode(false);
@@ -5468,8 +5978,14 @@ function StorageScreen({
     const movedSourceKeys = selectedItems
       .map((item) => getMovedTrashOriginalKey(item.id))
       .filter((key): key is string => Boolean(key));
+    const apiItems = getApiStorageActionItems();
 
     closeRestoreSheet();
+    if (apiAccessToken && apiItems.length) {
+      void storageApi.restore(apiItems, { accessToken: apiAccessToken }).catch(() => {
+        showToast('백엔드 복구 요청 실패: 화면에서만 반영했어요');
+      });
+    }
     setStorageRestoredKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
     if (movedSourceKeys.length) {
       setStorageTrashMovedKeys((items) => items.filter((key) => !movedSourceKeys.includes(key)));

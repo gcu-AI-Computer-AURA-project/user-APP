@@ -6,6 +6,7 @@ type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
 type RequestConfig = ApiRequestOptions & {
   method?: HttpMethod;
   body?: unknown;
+  query?: Record<string, string | number | boolean | null | undefined>;
 };
 
 export class ApiError extends Error {
@@ -45,7 +46,15 @@ const parseResponse = async (response: Response) => {
 };
 
 export async function apiRequest<T>(path: string, config: RequestConfig = {}): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  const url = new URL(`${API_BASE_URL}${path}`);
+
+  Object.entries(config.query ?? {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value));
+    }
+  });
+
+  const response = await fetch(url.toString(), {
     method: config.method ?? 'GET',
     headers: buildHeaders(config.accessToken),
     body: config.body === undefined ? undefined : JSON.stringify(config.body),
@@ -65,4 +74,3 @@ export async function apiRequest<T>(path: string, config: RequestConfig = {}): P
 
   return data as T;
 }
-
