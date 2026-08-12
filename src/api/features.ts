@@ -1,0 +1,581 @@
+import { apiRequest } from './client';
+import { API_ENDPOINTS } from './config';
+import type { ApiRequestOptions } from './types';
+
+export type ApiPage<T> = {
+  content?: T[];
+  page?: number;
+  size?: number;
+  total_elements?: number;
+  total_pages?: number;
+};
+
+export type ApiPermissionStatus =
+  | 'CONNECTED'
+  | 'DENIED'
+  | 'EXPIRED'
+  | 'RECONNECT_REQUIRED'
+  | 'DISCONNECTED';
+
+export type ApiScanSource = 'MAIL' | 'DRIVE_ALL' | 'DRIVE_FOLDER' | 'MAIL_AND_DRIVE';
+export type ApiJobStatus = 'PENDING' | 'SCANNING' | 'ANALYZING' | 'COMPLETED' | 'FAILED' | 'CANCELED' | 'PARTIAL_FAILED';
+export type ApiItemSource = 'GMAIL' | 'DRIVE';
+export type ApiCandidateCategory =
+  | 'PROMOTION_MAIL'
+  | 'OLD_MAIL'
+  | 'DUPLICATE_FILE'
+  | 'OLD_DRIVE_FILE'
+  | 'LARGE_FILE'
+  | 'LOW_VALUE_ATTACHMENT'
+  | 'TEMP_OR_BACKUP'
+  | 'PROTECTED';
+
+export type ApiStorageSummary = {
+  estimated_reclaim_bytes?: number;
+  latest_remaining_drive_bytes?: number;
+  total_reclaimed_bytes?: number;
+  total_estimated_carbon_grams?: number;
+};
+
+export type ApiLatestScan = {
+  scan_job_id?: number;
+  job_status?: ApiJobStatus;
+  scan_source?: ApiScanSource;
+  candidate_count?: number;
+  protected_count?: number;
+  estimated_reclaim_bytes?: number;
+  started_at?: string;
+  completed_at?: string;
+};
+
+export type ApiHomeSummary = {
+  storage_summary?: ApiStorageSummary;
+  latest_scan?: ApiLatestScan;
+  latest_cleanup?: {
+    cleanup_job_id?: number;
+    cleaned_item_count?: number;
+    reclaimed_bytes?: number;
+    estimated_carbon_grams?: number;
+    completed_at?: string;
+  };
+  permissions?: {
+    gmail_status?: ApiPermissionStatus;
+    drive_status?: ApiPermissionStatus;
+  };
+  has_running_scan?: boolean;
+};
+
+export type ApiPermissionResponse = {
+  permissions?: Array<{
+    service_type?: 'GMAIL' | 'DRIVE';
+    permission_status?: ApiPermissionStatus;
+    granted_scopes?: string[];
+    last_checked_at?: string;
+  }>;
+};
+
+export type ApiNotificationSetting = {
+  is_scan_complete_enabled?: boolean;
+  is_scan_recommend_enabled?: boolean;
+  updated_at?: string;
+};
+
+export type ApiScanSetting = {
+  setting_id?: number;
+  scan_source?: ApiScanSource;
+  drive_folder_id?: string;
+  include_subfolders?: boolean;
+  last_opened_before_months?: number;
+  last_modified_before_months?: number;
+  created_before_months?: number;
+  exclude_recent_days?: number;
+  include_keywords?: string[];
+  exclude_keywords?: string[];
+  file_extensions?: string[];
+  include_mail_attachment_size?: boolean;
+  apply_recent_conditions?: boolean;
+  updated_at?: string;
+};
+
+export type ApiScanSettingRequest = Omit<ApiScanSetting, 'setting_id' | 'updated_at'> & {
+  scan_source: ApiScanSource;
+  include_subfolders: boolean;
+  exclude_recent_days: number;
+  include_mail_attachment_size: boolean;
+  apply_recent_conditions: boolean;
+};
+
+export type ApiDriveFolder = {
+  folder_id?: string;
+  name?: string;
+  parent_id?: string;
+  modified_time?: string;
+};
+
+export type ApiDriveFolderResponse = {
+  folders?: ApiDriveFolder[];
+  next_page_token?: string;
+};
+
+export type ApiScanCreateRequest = {
+  use_saved_settings: boolean;
+  settings_override?: Partial<ApiScanSettingRequest>;
+};
+
+export type ApiScanJob = ApiLatestScan & {
+  condition_snapshot?: Record<string, unknown>;
+  progress_percent?: number;
+  mail_scanned_count?: number;
+  drive_scanned_count?: number;
+  estimated_remaining_seconds?: number;
+  error_message?: string;
+  created_at?: string;
+};
+
+export type ApiAnalysisSummary = {
+  scan_job_id?: number;
+  total_candidate_count?: number;
+  total_estimated_reclaim_bytes?: number;
+  protected_count?: number;
+  categories?: Array<{
+    category?: ApiCandidateCategory;
+    display_name?: string;
+    item_count?: number;
+    estimated_reclaim_bytes?: number;
+    selected_count?: number;
+  }>;
+};
+
+export type ApiCandidate = {
+  candidate_id?: number;
+  item_id?: number;
+  item_source?: ApiItemSource;
+  external_item_id?: string;
+  title?: string;
+  sender_domain?: string;
+  label_text?: string;
+  snippet?: string;
+  mime_type?: string;
+  file_extension?: string;
+  size_bytes?: number;
+  attachment_size_bytes?: number;
+  received_at?: string;
+  created_time?: string;
+  modified_time?: string;
+  last_opened_time?: string;
+  folder_path?: string;
+  has_attachment?: boolean;
+  is_starred?: boolean;
+  is_important?: boolean;
+  is_shared?: boolean;
+  owner_email?: string;
+  md5_checksum?: string;
+  category?: ApiCandidateCategory;
+  risk_level?: 'LOW' | 'MEDIUM' | 'HIGH';
+  priority_score?: number;
+  ghost_score?: number;
+  is_protected?: boolean;
+  selection_status?: 'NONE' | 'SELECTED' | 'DESELECTED';
+  selection_version?: number;
+  estimated_reclaim_bytes?: number;
+  semantic_tags?: string[];
+};
+
+export type ApiSelectedCandidates = {
+  scan_job_id?: number;
+  selected_summary?: {
+    mail_count?: number;
+    drive_count?: number;
+    total_count?: number;
+    mail_estimated_reclaim_bytes?: number;
+    drive_estimated_reclaim_bytes?: number;
+    total_estimated_reclaim_bytes?: number;
+  };
+  protected_summary?: {
+    protected_count?: number;
+    protected_conditions?: string[];
+  };
+  items?: ApiCandidate[];
+};
+
+export type ApiStorageItem = {
+  item_id?: number;
+  item_source?: ApiItemSource;
+  external_item_id?: string;
+  title?: string;
+  size_bytes?: number;
+  mime_type?: string;
+  file_extension?: string;
+  modified_time?: string;
+  last_opened_time?: string;
+  is_shared?: boolean;
+  is_trashed?: boolean;
+  trashed_at?: string;
+  recoverable?: boolean;
+};
+
+export type ApiScanHistoryItem = {
+  scan_job_id?: number;
+  job_status?: ApiJobStatus;
+  scan_source?: ApiScanSource;
+  candidate_count?: number;
+  estimated_reclaim_bytes?: number;
+  cleanup_done?: boolean;
+  reclaimed_bytes?: number;
+  estimated_carbon_grams?: number;
+  created_at?: string;
+};
+
+export type ApiStatisticsSummary = {
+  total_scan_count?: number;
+  total_cleanup_count?: number;
+  total_trashed_item_count?: number;
+  total_permanently_deleted_item_count?: number;
+  total_reclaimed_bytes?: number;
+  total_estimated_carbon_grams?: number;
+  latest_cleanup_at?: string;
+};
+
+export type ApiMonthlyStatistic = {
+  stat_year_month?: string;
+  scan_count?: number;
+  cleanup_count?: number;
+  trashed_item_count?: number;
+  permanently_deleted_item_count?: number;
+  reclaimed_bytes?: number;
+  estimated_carbon_grams?: number;
+};
+
+export type ApiCleanupHistoryItem = {
+  history_id?: number;
+  cleanup_job_id?: number;
+  scan_job_id?: number;
+  action_type?: string;
+  cleaned_item_count?: number;
+  reclaimed_bytes?: number;
+  estimated_carbon_grams?: number;
+  completed_at?: string;
+};
+
+export type ApiCleanupJobCreateRequest = {
+  scan_job_id: number;
+  action_type: 'MOVE_TO_TRASH' | 'RESTORE_FROM_TRASH' | 'PERMANENT_DELETE' | 'EMPTY_TRASH';
+  candidates: Array<{ candidate_id: number; selection_version: number }>;
+  approval_confirmed: boolean;
+};
+
+export type ApiCleanupJob = {
+  cleanup_job_id?: number;
+  job_status?: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'PARTIAL_FAILED' | 'CANCELED';
+  action_type?: string;
+  selected_mail_count?: number;
+  selected_drive_count?: number;
+  total_selected_bytes?: number;
+  approved_at?: string;
+  cleaned_item_count?: number;
+  reclaimed_bytes?: number;
+  remaining_drive_bytes?: number;
+  estimated_carbon_grams?: number;
+  completed_at?: string;
+};
+
+type ApiEnvelope<T> = {
+  success?: boolean;
+  data?: T;
+  message?: string;
+};
+
+const unwrap = <T>(response: ApiEnvelope<T>) => response.data as T;
+
+export const homeApi = {
+  async getSummary(options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiHomeSummary>>(API_ENDPOINTS.home.summary, {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+};
+
+export const googleApi = {
+  async getPermissions(options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiPermissionResponse>>(API_ENDPOINTS.google.permissions, {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async recheckPermissions(options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiPermissionResponse>>(API_ENDPOINTS.google.recheck, {
+        method: 'POST',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async disconnect(options?: ApiRequestOptions) {
+    return apiRequest<unknown>(API_ENDPOINTS.google.disconnect, {
+      method: 'DELETE',
+      accessToken: options?.accessToken,
+      signal: options?.signal,
+    });
+  },
+};
+
+export const notificationApi = {
+  async getSettings(options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiNotificationSetting>>(API_ENDPOINTS.notifications.settings, {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async saveSettings(payload: Required<Pick<ApiNotificationSetting, 'is_scan_complete_enabled' | 'is_scan_recommend_enabled'>>, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiNotificationSetting>>(API_ENDPOINTS.notifications.settings, {
+        method: 'PUT',
+        body: payload,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+};
+
+export const scanApi = {
+  async getSettings(options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiScanSetting>>(API_ENDPOINTS.scan.settings, {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async saveSettings(payload: ApiScanSettingRequest, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiScanSetting>>(API_ENDPOINTS.scan.settings, {
+        method: 'PUT',
+        body: payload,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getDriveFolders(query?: { parent_id?: string; page_token?: string; size?: number }, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiDriveFolderResponse>>(API_ENDPOINTS.scan.driveFolders, {
+        method: 'GET',
+        query,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async create(payload: ApiScanCreateRequest, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiScanJob>>(API_ENDPOINTS.scan.create, {
+        method: 'POST',
+        body: payload,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getRunning(options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<{ scan_job?: ApiScanJob }>>(API_ENDPOINTS.scan.running, {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getHistory(query?: { page?: number; size?: number; status?: string }, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiPage<ApiScanHistoryItem>>>(API_ENDPOINTS.scan.history, {
+        method: 'GET',
+        query,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getDetail(scanJobId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiScanJob>>(API_ENDPOINTS.scan.detail(scanJobId), {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async cancel(scanJobId: string | number, options?: ApiRequestOptions) {
+    return apiRequest<unknown>(API_ENDPOINTS.scan.cancel(scanJobId), {
+      method: 'POST',
+      accessToken: options?.accessToken,
+      signal: options?.signal,
+    });
+  },
+  async getAnalysisSummary(scanJobId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiAnalysisSummary>>(API_ENDPOINTS.scan.analysisSummary(scanJobId), {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getCandidates(
+    scanJobId: string | number,
+    query?: {
+      category?: ApiCandidateCategory;
+      item_source?: ApiItemSource;
+      selection_status?: 'NONE' | 'SELECTED' | 'DESELECTED';
+      include_protected?: boolean;
+      page?: number;
+      size?: number;
+      sort?: string;
+    },
+    options?: ApiRequestOptions
+  ) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiPage<ApiCandidate>>>(API_ENDPOINTS.scan.candidates(scanJobId), {
+        method: 'GET',
+        query,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getSelectedCandidates(scanJobId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiSelectedCandidates>>(API_ENDPOINTS.scan.selectedCandidates(scanJobId), {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+};
+
+export const cleanupApi = {
+  async create(payload: ApiCleanupJobCreateRequest, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.cleanup.create, {
+        method: 'POST',
+        body: payload,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async start(cleanupJobId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.cleanup.start(cleanupJobId), {
+        method: 'POST',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getResult(cleanupJobId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.cleanup.result(cleanupJobId), {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+};
+
+export const storageApi = {
+  async getItems(query: { item_source: ApiItemSource; trashed?: boolean; sort?: string; page?: number; size?: number }, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiPage<ApiStorageItem>>>(API_ENDPOINTS.storage.items, {
+        method: 'GET',
+        query,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getTrash(query?: { item_source?: ApiItemSource; page?: number; size?: number }, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiPage<ApiStorageItem>>>(API_ENDPOINTS.storage.trash, {
+        method: 'GET',
+        query,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async restore(items: Array<{ item_source: ApiItemSource; external_item_id: string }>, options?: ApiRequestOptions) {
+    return apiRequest<unknown>(API_ENDPOINTS.storage.restore, {
+      method: 'POST',
+      body: { items, approval_confirmed: true },
+      accessToken: options?.accessToken,
+      signal: options?.signal,
+    });
+  },
+  async permanentDelete(items: Array<{ item_source: ApiItemSource; external_item_id: string }>, options?: ApiRequestOptions) {
+    return apiRequest<unknown>(API_ENDPOINTS.storage.permanentDelete, {
+      method: 'POST',
+      body: { items, approval_confirmed: true, confirmation_text: 'DELETE' },
+      accessToken: options?.accessToken,
+      signal: options?.signal,
+    });
+  },
+};
+
+export const statisticsApi = {
+  async getSummary(options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiStatisticsSummary>>(API_ENDPOINTS.statistics.summary, {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getMonthly(query?: { from?: string; to?: string }, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<{ months?: ApiMonthlyStatistic[] }>>(API_ENDPOINTS.statistics.monthly, {
+        method: 'GET',
+        query,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getCleanupHistories(query?: { page?: number; size?: number }, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiPage<ApiCleanupHistoryItem>>>(API_ENDPOINTS.statistics.cleanupHistories, {
+        method: 'GET',
+        query,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getCarbonFormula(options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<{ formula_version?: string; description?: string; unit?: string; last_updated_at?: string }>>(
+        API_ENDPOINTS.statistics.carbonFormula,
+        {
+          method: 'GET',
+          accessToken: options?.accessToken,
+          signal: options?.signal,
+        }
+      )
+    );
+  },
+};
