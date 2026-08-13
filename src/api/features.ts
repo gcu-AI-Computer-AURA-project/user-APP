@@ -74,10 +74,24 @@ export type ApiPermissionResponse = {
   }>;
 };
 
+export type ApiReconnectUrlRequest = {
+  service_types: Array<'GMAIL' | 'DRIVE'>;
+  redirect_uri: string;
+};
+
+export type ApiReconnectUrlResponse = {
+  auth_url?: string;
+};
+
 export type ApiNotificationSetting = {
   is_scan_complete_enabled?: boolean;
   is_scan_recommend_enabled?: boolean;
   updated_at?: string;
+};
+
+export type ApiFcmTokenRequest = {
+  fcm_token: string;
+  device_identifier?: string;
 };
 
 export type ApiScanSetting = {
@@ -181,6 +195,56 @@ export type ApiCandidate = {
   semantic_tags?: string[];
 };
 
+export type ApiCandidateSelectionStatus = 'NONE' | 'SELECTED' | 'DESELECTED';
+
+export type ApiCandidateSelectionRequest = {
+  selection_status: ApiCandidateSelectionStatus;
+  selection_version: number;
+};
+
+export type ApiBulkCandidateSelectionRequest = {
+  category?: ApiCandidateCategory;
+  item_source?: ApiItemSource;
+  candidate_ids?: number[];
+  selection_status: ApiCandidateSelectionStatus;
+  exclude_protected: boolean;
+};
+
+export type ApiCandidateSelectionResponse = {
+  candidate_id?: number;
+  selection_status?: ApiCandidateSelectionStatus;
+  selection_version?: number;
+  updated_at?: string;
+};
+
+export type ApiCandidateBulkSelectionResponse = {
+  updated_count?: number;
+  selected_count?: number;
+  selected_estimated_reclaim_bytes?: number;
+};
+
+export type ApiCandidateDetail = {
+  candidate_id?: number;
+  scan_job_id?: number;
+  item?: ApiCandidate;
+  analysis?: {
+    category?: ApiCandidateCategory;
+    risk_level?: 'LOW' | 'MEDIUM' | 'HIGH';
+    priority_score?: number;
+    ghost_score?: number;
+    is_protected?: boolean;
+    estimated_reclaim_bytes?: number;
+    ai_provider?: string;
+    ai_model_name?: string;
+    ai_confidence_score?: number;
+    semantic_tags?: string[];
+    matched_conditions?: Record<string, unknown>;
+    analyzed_at?: string;
+  };
+  selection_status?: ApiCandidateSelectionStatus;
+  selection_version?: number;
+};
+
 export type ApiSelectedCandidates = {
   scan_job_id?: number;
   selected_summary?: {
@@ -212,6 +276,15 @@ export type ApiStorageItem = {
   is_trashed?: boolean;
   trashed_at?: string;
   recoverable?: boolean;
+};
+
+export type ApiStorageDetail = ApiStorageItem & {
+  sender_email?: string;
+  owner_email?: string;
+  folder_path?: string;
+  web_view_link?: string;
+  snippet?: string;
+  metadata?: Record<string, unknown>;
 };
 
 export type ApiScanHistoryItem = {
@@ -267,6 +340,7 @@ export type ApiCleanupJobCreateRequest = {
 export type ApiCleanupJob = {
   cleanup_job_id?: number;
   job_status?: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'PARTIAL_FAILED' | 'CANCELED';
+  progress_percent?: number;
   action_type?: string;
   selected_mail_count?: number;
   selected_drive_count?: number;
@@ -277,6 +351,42 @@ export type ApiCleanupJob = {
   remaining_drive_bytes?: number;
   estimated_carbon_grams?: number;
   completed_at?: string;
+};
+
+export type ApiCleanupJobItem = {
+  cleanup_item_id?: number;
+  item_source?: ApiItemSource;
+  external_item_id?: string;
+  snapshot_item_key?: string;
+  snapshot_title?: string;
+  snapshot_size_bytes?: number;
+  process_status?: 'PENDING' | 'SUCCESS' | 'FAILED' | 'SKIPPED';
+  failure_reason?: string;
+  processed_at?: string;
+};
+
+export type ApiCleanupJobItemList = {
+  items?: ApiCleanupJobItem[];
+};
+
+export type ApiStorageActionItem = {
+  item_source: ApiItemSource;
+  external_item_id: string;
+  item_id?: number;
+  snapshot_title?: string;
+  snapshot_size_bytes?: number;
+};
+
+export type ApiAnnouncement = {
+  announcement_id?: string | number;
+  title?: string;
+  category?: 'POLICY' | 'SERVICE' | 'FEATURE' | string;
+  content?: string;
+  summary?: string;
+  published_at?: string;
+  read_at?: string;
+  is_pinned?: boolean;
+  is_read?: boolean;
 };
 
 type ApiEnvelope<T> = {
@@ -318,12 +428,44 @@ export const googleApi = {
       })
     );
   },
+  async createReconnectUrl(payload: ApiReconnectUrlRequest, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiReconnectUrlResponse>>(API_ENDPOINTS.google.reconnectUrl, {
+        method: 'POST',
+        body: payload,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
   async disconnect(options?: ApiRequestOptions) {
     return apiRequest<unknown>(API_ENDPOINTS.google.disconnect, {
       method: 'DELETE',
       accessToken: options?.accessToken,
       signal: options?.signal,
     });
+  },
+};
+
+export const candidateApi = {
+  async getDetail(candidateId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCandidateDetail>>(API_ENDPOINTS.candidates.detail(candidateId), {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async updateSelection(candidateId: string | number, payload: ApiCandidateSelectionRequest, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCandidateSelectionResponse>>(API_ENDPOINTS.candidates.selection(candidateId), {
+        method: 'PATCH',
+        body: payload,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
   },
 };
 
@@ -341,6 +483,16 @@ export const notificationApi = {
     return unwrap(
       await apiRequest<ApiEnvelope<ApiNotificationSetting>>(API_ENDPOINTS.notifications.settings, {
         method: 'PUT',
+        body: payload,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async registerFcmToken(payload: ApiFcmTokenRequest, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<{ fcm_token_id?: number; is_active?: boolean; updated_at?: string }>>(API_ENDPOINTS.notifications.fcmToken, {
+        method: 'POST',
         body: payload,
         accessToken: options?.accessToken,
         signal: options?.signal,
@@ -464,6 +616,16 @@ export const scanApi = {
       })
     );
   },
+  async updateCandidateSelections(scanJobId: string | number, payload: ApiBulkCandidateSelectionRequest, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCandidateBulkSelectionResponse>>(API_ENDPOINTS.scan.bulkSelection(scanJobId), {
+        method: 'PATCH',
+        body: payload,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
 };
 
 export const cleanupApi = {
@@ -486,10 +648,37 @@ export const cleanupApi = {
       })
     );
   },
+  async getDetail(cleanupJobId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.cleanup.detail(cleanupJobId), {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
   async getResult(cleanupJobId: string | number, options?: ApiRequestOptions) {
     return unwrap(
       await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.cleanup.result(cleanupJobId), {
         method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getItems(cleanupJobId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCleanupJobItemList>>(API_ENDPOINTS.cleanup.items(cleanupJobId), {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async retryFailed(cleanupJobId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.cleanup.retryFailed(cleanupJobId), {
+        method: 'POST',
         accessToken: options?.accessToken,
         signal: options?.signal,
       })
@@ -518,18 +707,70 @@ export const storageApi = {
       })
     );
   },
-  async restore(items: Array<{ item_source: ApiItemSource; external_item_id: string }>, options?: ApiRequestOptions) {
-    return apiRequest<unknown>(API_ENDPOINTS.storage.restore, {
-      method: 'POST',
-      body: { items, approval_confirmed: true },
-      accessToken: options?.accessToken,
-      signal: options?.signal,
-    });
+  async getItemDetail(itemId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiStorageDetail>>(API_ENDPOINTS.storage.itemDetail(itemId), {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
   },
-  async permanentDelete(items: Array<{ item_source: ApiItemSource; external_item_id: string }>, options?: ApiRequestOptions) {
-    return apiRequest<unknown>(API_ENDPOINTS.storage.permanentDelete, {
+  async getLiveDetail(query: { item_source: ApiItemSource; external_item_id: string }, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiStorageDetail>>(API_ENDPOINTS.storage.liveDetail, {
+        method: 'GET',
+        query,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async restore(items: ApiStorageActionItem[], options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.storage.restore, {
+        method: 'POST',
+        body: { items, approval_confirmed: true },
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async permanentDelete(items: ApiStorageActionItem[], options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.storage.permanentDelete, {
+        method: 'POST',
+        body: { items, approval_confirmed: true, confirmation_text: 'DELETE' },
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+};
+
+export const announcementApi = {
+  async getList(query?: { category?: 'POLICY' | 'SERVICE' | 'FEATURE'; page?: number; size?: number }, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiPage<ApiAnnouncement>>>(API_ENDPOINTS.announcements.list, {
+        method: 'GET',
+        query,
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async getDetail(announcementId: string | number, options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiAnnouncement>>(API_ENDPOINTS.announcements.detail(announcementId), {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async markRead(announcementId: string | number, options?: ApiRequestOptions) {
+    return apiRequest<unknown>(API_ENDPOINTS.announcements.read(announcementId), {
       method: 'POST',
-      body: { items, approval_confirmed: true, confirmation_text: 'DELETE' },
       accessToken: options?.accessToken,
       signal: options?.signal,
     });

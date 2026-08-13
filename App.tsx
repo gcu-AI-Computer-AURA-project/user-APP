@@ -7,6 +7,7 @@ import {
   Easing,
   Image,
   KeyboardAvoidingView,
+  Linking,
   PanResponder,
   PermissionsAndroid,
   Platform,
@@ -23,10 +24,15 @@ import AntDesign from '@expo/vector-icons/AntDesign';
 import Feather from '@expo/vector-icons/Feather';
 import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
 import { LineChart } from 'react-native-chart-kit';
+import Constants from 'expo-constants';
+import * as Device from 'expo-device';
+import * as Notifications from 'expo-notifications';
 import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
 import { DEV_AURA_ACCESS_TOKEN, GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
 import {
+  announcementApi,
+  candidateApi,
   googleApi,
   homeApi,
   cleanupApi,
@@ -34,14 +40,21 @@ import {
   scanApi,
   statisticsApi,
   storageApi,
+  type ApiAnnouncement,
   type ApiCandidate,
+  type ApiCandidateDetail,
+  type ApiCandidateSelectionStatus,
+  type ApiCleanupJob,
+  type ApiDriveFolder,
   type ApiHomeSummary,
   type ApiMonthlyStatistic,
   type ApiScanHistoryItem,
+  type ApiScanJob,
   type ApiScanSetting,
+  type ApiStorageDetail,
   type ApiStorageItem,
 } from './src/api/features';
-import { userApi } from './src/api/user';
+import { userApi, type ApiPrivacyData } from './src/api/user';
 import type { AuraPlatform, AuraServicePermissions, AuraUser } from './src/api/types';
 
 type Screen =
@@ -112,6 +125,9 @@ type SettingsTogglesState = { scanComplete: boolean; aiNudge: boolean; marketing
 type MonthRange = { from: number; to: number };
 type ScanListItem = {
   id: string;
+  candidateId?: number;
+  selectionVersion?: number;
+  selectionStatus?: ApiCandidateSelectionStatus;
   title: string;
   desc?: string;
   sizeMB: number;
@@ -122,10 +138,25 @@ type ScanListItem = {
   detailTitle?: string;
   detailSubtitle?: string;
 };
-type StorageMailItem = { id: string; title: string; subtitle: string; meta: string; badge?: string };
-type StorageDriveItem = { id: string; type: string; title: string; subtitle: string; fullPath?: string };
-type StorageDetailItem = { title: string; meta: string; source: 'mail' | 'drive' };
+type StorageApiFields = {
+  itemId?: number;
+  externalItemId?: string;
+  snapshotTitle?: string;
+  snapshotSizeBytes?: number;
+  itemSource?: 'GMAIL' | 'DRIVE';
+};
+type StorageMailItem = StorageApiFields & { id: string; title: string; subtitle: string; meta: string; badge?: string };
+type StorageDriveItem = StorageApiFields & { id: string; type: string; title: string; subtitle: string; fullPath?: string };
+type StorageDetailItem = StorageApiFields & { title: string; meta: string; source: 'mail' | 'drive' };
+type StorageServerPageState = {
+  items: ApiStorageItem[];
+  page: number;
+  size: number;
+  totalElements: number;
+  totalPages: number;
+};
 type StorageDriveMoveTargets = Record<string, string>;
+type DriveFolderOption = { id?: string; name: string; meta?: string; parentId?: string };
 type ScanSummary = {
   mailItems: ScanListItem[];
   driveItems: ScanListItem[];
@@ -211,6 +242,34 @@ const getAuraPlatform = (): AuraPlatform => {
   if (Platform.OS === 'ios') return 'IOS';
   if (Platform.OS === 'android') return 'ANDROID';
   return 'WEB';
+};
+
+const getAuraDeviceId = () => {
+  const constants = Constants as unknown as {
+    sessionId?: string;
+    installationId?: string;
+    expoConfig?: { slug?: string; version?: string };
+  };
+
+  return constants.installationId ?? constants.sessionId ?? `${Platform.OS}-${constants.expoConfig?.slug ?? 'aura'}`;
+};
+
+const getAuraAppVersion = () => {
+  const constants = Constants as unknown as { expoConfig?: { version?: string } };
+  return constants.expoConfig?.version;
+};
+
+const getErrorMessage = (error: unknown, fallback: string) => {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === 'object' && error && 'message' in error) return String((error as { message?: unknown }).message);
+  return fallback;
+};
+
+const formatUnknownValue = (value: unknown): string => {
+  if (value === null || value === undefined || value === '') return '-';
+  if (Array.isArray(value)) return value.length ? `${value.length}개` : '0개';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
 };
 
 const extractServerAuthCode = (response: unknown) => {
@@ -383,7 +442,7 @@ const auraDriveFiles: AuraDriveFile[] = [
   { id: 'drive-contract', folderPath: '내 Drive › 문서 보관함 › 계약서', type: 'DOCX', title: '계약서_보관.docx', sizeMB: 2, modifiedAt: '2023.10.12', reason: '제외 키워드 보호' },
 ];
 
-const driveFolderOptions = [
+const driveFolderOptions: DriveFolderOption[] = [
   { name: '내 Drive › 학술제 자료', meta: '파일 1개 · 하위 폴더 1개 · 184MB' },
   { name: '내 Drive › 학술제 자료 › 발표자료', meta: '파일 2개 · 730MB' },
   { name: '내 Drive › 디자인 백업', meta: '하위 폴더 2개 · 856MB' },
@@ -408,29 +467,29 @@ const getDriveAncestorFolders = (path: string) => {
   return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join(' › '));
 };
 const getDriveFolderName = (path: string) => splitDrivePath(path).at(-1) ?? path;
-const getDirectDriveFolders = (parentPath: string) => {
+const getDirectDriveFolders = (parentPath: string, options: DriveFolderOption[] = driveFolderOptions) => {
   const parentParts = splitDrivePath(parentPath);
-  return driveFolderOptions.filter((folder) => {
+  return options.filter((folder) => {
     const parts = splitDrivePath(folder.name);
     return parts.length === parentParts.length + 1 && parentParts.every((part, index) => parts[index] === part);
   });
 };
-const getVisibleDriveFolders = (currentPath: string, search: string) => {
+const getVisibleDriveFolders = (currentPath: string, search: string, options: DriveFolderOption[] = driveFolderOptions) => {
   const query = search.trim().toLowerCase();
   if (query) {
-    return driveFolderOptions.filter((folder) => folder.name.toLowerCase().includes(query));
+    return options.filter((folder) => folder.name.toLowerCase().includes(query));
   }
 
-  return getDirectDriveFolders(currentPath);
+  return getDirectDriveFolders(currentPath, options);
 };
-const hasDriveFolderChildren = (path: string) => getDirectDriveFolders(path).length > 0;
-const getDriveDescendantFolders = (path: string) => driveFolderOptions.filter((folder) => folder.name.startsWith(`${path} ›`));
-const getDriveFolderSelectionGroup = (path: string) => [path, ...getDriveDescendantFolders(path).map((folder) => folder.name)];
+const hasDriveFolderChildren = (path: string, options: DriveFolderOption[] = driveFolderOptions) => getDirectDriveFolders(path, options).length > 0;
+const getDriveDescendantFolders = (path: string, options: DriveFolderOption[] = driveFolderOptions) => options.filter((folder) => folder.name.startsWith(`${path} ›`));
+const getDriveFolderSelectionGroup = (path: string, options: DriveFolderOption[] = driveFolderOptions) => [path, ...getDriveDescendantFolders(path, options).map((folder) => folder.name)];
 const getDirectDriveFiles = (folderPath: string) => auraDriveFiles.filter((file) => file.folderPath === folderPath);
 const getDriveFileSelectionGroup = (folderPath: string) =>
   auraDriveFiles.filter((file) => file.folderPath === folderPath || file.folderPath.startsWith(`${folderPath} ›`));
-const getDriveFolderSelected = (path: string, selectedFolders: string[], selectedFiles: string[]) => {
-  const folderGroup = getDriveFolderSelectionGroup(path);
+const getDriveFolderSelected = (path: string, selectedFolders: string[], selectedFiles: string[], options: DriveFolderOption[] = driveFolderOptions) => {
+  const folderGroup = getDriveFolderSelectionGroup(path, options);
   const fileGroup = getDriveFileSelectionGroup(path).map((file) => file.id);
   const hasSelectableChildren = folderGroup.length + fileGroup.length > 0;
 
@@ -614,6 +673,11 @@ function apiStorageItemToMail(item: ApiStorageItem): StorageMailItem {
   const date = formatApiDateOnly(item.trashed_at || item.modified_time || item.last_opened_time);
   return {
     id: `api-storage-mail-${item.item_id ?? item.external_item_id ?? item.title}`,
+    itemId: item.item_id,
+    externalItemId: item.external_item_id,
+    snapshotTitle: item.title,
+    snapshotSizeBytes: item.size_bytes,
+    itemSource: item.item_source ?? 'GMAIL',
     title: item.title || item.external_item_id || 'Gmail 항목',
     subtitle: item.title || '메일 항목',
     meta: `받은날짜 ${date} · Gmail · ${formatBytes(item.size_bytes)}`,
@@ -626,10 +690,38 @@ function apiStorageItemToDrive(item: ApiStorageItem): StorageDriveItem {
   const date = formatApiDateOnly(item.modified_time || item.last_opened_time || item.trashed_at);
   return {
     id: `api-storage-drive-${item.item_id ?? item.external_item_id ?? item.title}`,
+    itemId: item.item_id,
+    externalItemId: item.external_item_id,
+    snapshotTitle: item.title,
+    snapshotSizeBytes: item.size_bytes,
+    itemSource: item.item_source ?? 'DRIVE',
     type: extension || 'FILE',
     title: item.title || item.external_item_id || 'Drive 파일',
     subtitle: `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · Drive`,
     fullPath: driveRootPath,
+  };
+}
+
+function apiStorageItemToTrash(item: ApiStorageItem): StorageMailItem {
+  const source = item.item_source ?? 'GMAIL';
+  const extension = (item.file_extension || item.mime_type || 'FILE').replace(/^\./, '').toUpperCase();
+  const date = formatApiDateOnly(item.trashed_at || item.modified_time || item.last_opened_time);
+  const idSeed = item.item_id ?? item.external_item_id ?? item.title;
+
+  return {
+    id: source === 'DRIVE' ? `trash-drive-api-${idSeed}` : `trash-mail-api-${idSeed}`,
+    itemId: item.item_id,
+    externalItemId: item.external_item_id,
+    snapshotTitle: item.title,
+    snapshotSizeBytes: item.size_bytes,
+    itemSource: source,
+    title: item.title || item.external_item_id || (source === 'DRIVE' ? 'Drive 파일' : 'Gmail 항목'),
+    subtitle: item.title || (source === 'DRIVE' ? 'Drive 파일' : '메일 항목'),
+    meta:
+      source === 'DRIVE'
+        ? `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 휴지통 ${date} · 내 Drive`
+        : `받은날짜 ${date} · Gmail · ${formatBytes(item.size_bytes)}`,
+    badge: item.recoverable === false ? '복구 불가' : undefined,
   };
 }
 
@@ -643,6 +735,9 @@ function apiCandidateToScanItem(candidate: ApiCandidate): ScanListItem {
     undefined;
   return {
     id: `api-candidate-${candidate.candidate_id ?? candidate.item_id ?? candidate.external_item_id ?? candidate.title}`,
+    candidateId: candidate.candidate_id,
+    selectionVersion: candidate.selection_version,
+    selectionStatus: candidate.selection_status,
     title: candidate.title || candidate.external_item_id || '분석 후보',
     desc: apiCategoryDesc(candidate.category, candidate.snippet),
     sizeMB: bytesToMB(sizeBytes),
@@ -682,7 +777,7 @@ function buildApiScanSummary(params: {
     protectedItems,
     storageMailItems: (params.storageMailItems ?? []).map(apiStorageItemToMail),
     storageDriveItems: (params.storageDriveItems ?? []).map(apiStorageItemToDrive),
-    storageTrashItems: (params.trashMailItems ?? []).map(apiStorageItemToMail),
+    storageTrashItems: (params.trashMailItems ?? []).map(apiStorageItemToTrash),
     mailSizeLabel: formatDataSize(sumScanItemSize(mailItems)),
     driveSizeLabel: formatDataSize(sumScanItemSize(driveItems)),
     largeSizeLabel: formatDataSize(sumScanItemSize(largeItems)),
@@ -1007,6 +1102,10 @@ export default function App() {
   const [scanSources, setScanSources] = useState({ gmail: true, drive: false, folder: false });
   const [driveFolderSearch, setDriveFolderSearch] = useState('');
   const [driveCurrentFolder, setDriveCurrentFolder] = useState(driveRootPath);
+  const [apiDriveFolderOptions, setApiDriveFolderOptions] = useState<DriveFolderOption[]>([]);
+  const [apiDriveFolderIdsByPath, setApiDriveFolderIdsByPath] = useState<Record<string, string>>({});
+  const [driveFolderLoading, setDriveFolderLoading] = useState(false);
+  const [driveFolderError, setDriveFolderError] = useState('');
   const [storageDriveFolder, setStorageDriveFolder] = useState(driveRootPath);
   const [storageTrashMovedKeys, setStorageTrashMovedKeys] = useState<string[]>([]);
   const [storageDeletedKeys, setStorageDeletedKeys] = useState<string[]>([]);
@@ -1026,15 +1125,26 @@ export default function App() {
   const [scanSourceEditOnly, setScanSourceEditOnly] = useState(false);
   const [checked, setChecked] = useState<Record<string, boolean>>({});
   const [scanProgress, setScanProgress] = useState(0);
+  const [scanStatusText, setScanStatusText] = useState('메일 및 드라이브 데이터 수집중');
   const [deleteProgress, setDeleteProgress] = useState(0);
-  const [deleteJobStatus, setDeleteJobStatus] = useState<'idle' | 'running' | 'completed'>('idle');
+  const [deleteJobStatus, setDeleteJobStatus] = useState<'idle' | 'running' | 'completed' | 'failed'>('idle');
+  const [deleteStatusText, setDeleteStatusText] = useState('선택 항목을 휴지통으로 이동 중');
   const [homeScanNotice, setHomeScanNotice] = useState<'none' | 'running' | 'cancelled' | 'completed'>('none');
+  const [apiScanJobId, setApiScanJobId] = useState<number | null>(null);
+  const [apiCleanupJobId, setApiCleanupJobId] = useState<number | null>(null);
   const [lastScan, setLastScan] = useState<ScanRecord | null>(null);
   const [apiHomeSummary, setApiHomeSummary] = useState<ApiHomeSummary | null>(null);
   const [apiStorageSummary, setApiStorageSummary] = useState<ScanSummary | null>(null);
   const [apiScanHistoryItems, setApiScanHistoryItems] = useState<ApiScanHistoryItem[]>([]);
   const [apiMonthlyStats, setApiMonthlyStats] = useState<ApiMonthlyStatistic[]>([]);
   const [apiScanSetting, setApiScanSetting] = useState<ApiScanSetting | null>(null);
+  const [apiAnnouncements, setApiAnnouncements] = useState<ApiAnnouncement[]>([]);
+  const [announcementLoading, setAnnouncementLoading] = useState(false);
+  const [announcementError, setAnnouncementError] = useState('');
+  const [privacyData, setPrivacyData] = useState<ApiPrivacyData | null>(null);
+  const [privacyDataLoading, setPrivacyDataLoading] = useState(false);
+  const [privacyDataError, setPrivacyDataError] = useState('');
+  const [withdrawSubmitting, setWithdrawSubmitting] = useState(false);
   const [hasCompletedScan, setHasCompletedScan] = useState(false);
   const [connectedDone, setConnectedDone] = useState(false);
   const [connectedStep, setConnectedStep] = useState(0);
@@ -1060,6 +1170,8 @@ export default function App() {
   const scanResultRef = useRef<ScanSummary>(emptyScanSummary);
   const activeApiScanJobId = useRef<number | null>(null);
   const activeApiCleanupJobId = useRef<number | null>(null);
+  const fcmRegistrationInFlight = useRef(false);
+  const registeredFcmTokenRef = useRef('');
   const [withdrawSheetVisible, setWithdrawSheetVisible] = useState(false);
   const [filterSheetVisible, setFilterSheetVisible] = useState(false);
   const [carbonHelpVisible, setCarbonHelpVisible] = useState(false);
@@ -1462,6 +1574,10 @@ export default function App() {
     setScanSources({ gmail: true, drive: false, folder: false });
     setDriveFolderSearch('');
     setDriveCurrentFolder(driveRootPath);
+    setApiDriveFolderOptions([]);
+    setApiDriveFolderIdsByPath({});
+    setDriveFolderLoading(false);
+    setDriveFolderError('');
     setStorageDriveFolder(driveRootPath);
     setStorageTrashMovedKeys([]);
     setStorageDeletedKeys([]);
@@ -1478,15 +1594,27 @@ export default function App() {
     setScanSourceEditOnly(false);
     setChecked({});
     setScanProgress(0);
+    setScanStatusText('메일 및 드라이브 데이터 수집중');
     setDeleteProgress(0);
     setDeleteJobStatus('idle');
+    setDeleteStatusText('선택 항목을 휴지통으로 이동 중');
     setHomeScanNotice('none');
+    setApiScanJobId(null);
+    setApiCleanupJobId(null);
     setLastScan(null);
     setApiHomeSummary(null);
     setApiStorageSummary(null);
     setApiScanHistoryItems([]);
     setApiMonthlyStats([]);
     setApiScanSetting(null);
+    setApiAnnouncements([]);
+    setAnnouncementLoading(false);
+    setAnnouncementError('');
+    setPrivacyData(null);
+    setPrivacyDataLoading(false);
+    setPrivacyDataError('');
+    setWithdrawSubmitting(false);
+    registeredFcmTokenRef.current = '';
     setHasCompletedScan(false);
     setConnectedDone(false);
     setConnectedStep(0);
@@ -1601,6 +1729,216 @@ export default function App() {
     }
   };
 
+  const getActiveDriveFolderOptions = () => (apiDriveFolderOptions.length ? apiDriveFolderOptions : driveFolderOptions);
+
+  const getSelectedDriveFolderId = () =>
+    selectedDriveFolders.map((folderPath) => apiDriveFolderIdsByPath[folderPath]).find(Boolean) ?? selectedDriveFolders[0];
+
+  const mergeDriveFolderOptions = (incoming: DriveFolderOption[]) => {
+    if (!incoming.length) return;
+
+    setApiDriveFolderOptions((items) => {
+      const merged = new Map(items.map((item) => [item.name, item]));
+      incoming.forEach((item) => {
+        merged.set(item.name, { ...merged.get(item.name), ...item });
+      });
+      return Array.from(merged.values());
+    });
+    setApiDriveFolderIdsByPath((items) => {
+      const next = { ...items };
+      incoming.forEach((item) => {
+        if (item.id) {
+          next[item.name] = item.id;
+        }
+      });
+      return next;
+    });
+  };
+
+  const loadApiDriveFolders = async (parentPath = driveCurrentFolder) => {
+    if (!apiAccessToken) return;
+
+    const parentId = parentPath === driveRootPath ? undefined : apiDriveFolderIdsByPath[parentPath];
+    if (parentPath !== driveRootPath && !parentId) return;
+
+    setDriveFolderLoading(true);
+    setDriveFolderError('');
+
+    try {
+      const response = await scanApi.getDriveFolders({ parent_id: parentId, size: 50 }, { accessToken: apiAccessToken });
+      const folders = (response.folders ?? []).filter((folder): folder is ApiDriveFolder & { name: string } => Boolean(folder.name));
+      const nextFolders = folders.map((folder) => {
+        const path = parentPath === driveRootPath ? `${driveRootPath} › ${folder.name}` : `${parentPath} › ${folder.name}`;
+        return {
+          id: folder.folder_id,
+          parentId: folder.parent_id,
+          name: path,
+          meta: folder.modified_time ? `수정 ${formatApiDateOnly(folder.modified_time)}` : 'Google Drive 폴더',
+        };
+      });
+      mergeDriveFolderOptions(nextFolders);
+    } catch {
+      setDriveFolderError('Drive 폴더를 불러오지 못했어요. Google Drive 권한을 다시 연결하거나 재시도해주세요.');
+    } finally {
+      setDriveFolderLoading(false);
+    }
+  };
+
+  const refreshGooglePermissions = async () => {
+    if (!apiAccessToken) {
+      showToast('로그인 후 권한 상태를 확인할 수 있어요');
+      return;
+    }
+
+    try {
+      const response = await googleApi.recheckPermissions({ accessToken: apiAccessToken });
+      const nextPermissions = response.permissions ?? [];
+      const gmail = nextPermissions.find((permission) => permission.service_type === 'GMAIL');
+      const drive = nextPermissions.find((permission) => permission.service_type === 'DRIVE');
+      setPermissions((items) => ({
+        ...items,
+        gmail: gmail ? gmail.permission_status === 'CONNECTED' : items.gmail,
+        drive: drive ? drive.permission_status === 'CONNECTED' : items.drive,
+      }));
+      showToast('Google 권한 상태를 다시 확인했어요');
+    } catch {
+      showToast('Google 권한 상태 확인에 실패했어요');
+    }
+  };
+
+  const requestGoogleReconnect = async (serviceTypes: Array<'GMAIL' | 'DRIVE'>) => {
+    if (!apiAccessToken) {
+      go(serviceTypes[0] === 'GMAIL' ? 'gmailPermission' : 'drivePermission');
+      return;
+    }
+
+    try {
+      const response = await googleApi.createReconnectUrl(
+        {
+          service_types: serviceTypes,
+          redirect_uri: GOOGLE_OAUTH_REDIRECT_URI,
+        },
+        { accessToken: apiAccessToken }
+      );
+
+      if (!response.auth_url) {
+        showToast('Google 권한 요청 URL이 내려오지 않았어요');
+        return;
+      }
+
+      await Linking.openURL(response.auth_url);
+      void refreshGooglePermissions();
+    } catch {
+      showToast('Google 권한 재연결을 시작하지 못했어요');
+    }
+  };
+
+  const registerFcmTokenWithServer = async () => {
+    if (!apiAccessToken || !permissions.alarm || Platform.OS === 'web' || fcmRegistrationInFlight.current) return;
+
+    fcmRegistrationInFlight.current = true;
+    try {
+      if (!Device.isDevice) return;
+
+      if (Platform.OS === 'android') {
+        await Notifications.setNotificationChannelAsync('aura-default', {
+          name: 'AURA',
+          importance: Notifications.AndroidImportance.DEFAULT,
+        });
+      }
+
+      let permission = await Notifications.getPermissionsAsync();
+      if (permission.status !== 'granted') {
+        permission = await Notifications.requestPermissionsAsync();
+      }
+      if (permission.status !== 'granted') return;
+
+      const devicePushToken = await Notifications.getDevicePushTokenAsync();
+      const token =
+        typeof devicePushToken.data === 'string'
+          ? devicePushToken.data
+          : JSON.stringify(devicePushToken.data);
+
+      if (!token || registeredFcmTokenRef.current === token) return;
+
+      await notificationApi.registerFcmToken(
+        {
+          fcm_token: token,
+          device_identifier: `${getAuraPlatform()}:${getAuraDeviceId()}:${getAuraAppVersion() ?? '1.0.0'}`,
+        },
+        { accessToken: apiAccessToken }
+      );
+      registeredFcmTokenRef.current = token;
+    } catch {
+      // 토큰 등록 실패가 알림 설정 저장 자체를 막지는 않게 한다.
+    } finally {
+      fcmRegistrationInFlight.current = false;
+    }
+  };
+
+  const loadAnnouncements = async () => {
+    setAnnouncementLoading(true);
+    setAnnouncementError('');
+    try {
+      const response = await announcementApi.getList({ page: 0, size: 20 }, { accessToken: apiAccessToken });
+      setApiAnnouncements(response.content ?? []);
+    } catch (error) {
+      setAnnouncementError(getErrorMessage(error, '공지사항을 불러오지 못했어요'));
+    } finally {
+      setAnnouncementLoading(false);
+    }
+  };
+
+  const loadPrivacyData = async () => {
+    if (!apiAccessToken) {
+      setPrivacyData(null);
+      setPrivacyDataError('로그인 후 개인정보 데이터를 확인할 수 있어요');
+      return;
+    }
+
+    setPrivacyDataLoading(true);
+    setPrivacyDataError('');
+    try {
+      const data = await userApi.getPrivacyData({ accessToken: apiAccessToken });
+      setPrivacyData(data ?? null);
+    } catch (error) {
+      setPrivacyDataError(getErrorMessage(error, '개인정보 데이터를 불러오지 못했어요'));
+    } finally {
+      setPrivacyDataLoading(false);
+    }
+  };
+
+  const confirmWithdraw = async () => {
+    if (!checked.withdrawConfirm) {
+      showToast('탈퇴 확인 체크가 필요합니다');
+      return;
+    }
+
+    if (!apiAccessToken) {
+      resetToFreshStart();
+      return;
+    }
+
+    setWithdrawSubmitting(true);
+    try {
+      await userApi.withdraw(
+        {
+          reason: 'User requested withdrawal in app',
+          scan_data_policy: 'DELETE',
+          history_data_policy: 'DELETE',
+          withdrawal_confirmed: true,
+        },
+        { accessToken: apiAccessToken }
+      );
+      closeWithdrawSheet();
+      resetToFreshStart();
+    } catch (error) {
+      showToast(getErrorMessage(error, '서비스 탈퇴 요청에 실패했어요'), undefined, 3200);
+    } finally {
+      setWithdrawSubmitting(false);
+    }
+  };
+
   const refreshAuraApis = async (token: string) => {
     const options = { accessToken: token };
     const [
@@ -1699,6 +2037,8 @@ export default function App() {
     if (runningScanResult.status === 'fulfilled' && runningScanResult.value.scan_job) {
       setHomeScanNotice('running');
       setScanProgress(Math.round(runningScanResult.value.scan_job.progress_percent ?? 0));
+      setApiScanJobId(runningScanResult.value.scan_job.scan_job_id ?? null);
+      activeApiScanJobId.current = runningScanResult.value.scan_job.scan_job_id ?? null;
       scanSourceLabelRef.current = apiScanSourceLabel(runningScanResult.value.scan_job.scan_source);
     }
 
@@ -1980,6 +2320,23 @@ export default function App() {
       .catch(() => undefined);
   }, [apiAccessToken, settingsToggles.scanComplete, settingsToggles.aiNudge]);
 
+  useEffect(() => {
+    if (!apiAccessToken || !permissions.alarm || (!settingsToggles.scanComplete && !settingsToggles.aiNudge)) return;
+    void registerFcmTokenWithServer();
+  }, [apiAccessToken, permissions.alarm, settingsToggles.scanComplete, settingsToggles.aiNudge]);
+
+  useEffect(() => {
+    if (screen === 'notice') {
+      void loadAnnouncements();
+    }
+  }, [screen, apiAccessToken]);
+
+  useEffect(() => {
+    if (screen === 'privacyData') {
+      void loadPrivacyData();
+    }
+  }, [screen, apiAccessToken]);
+
   const completeLoginPermissionSetup = () => {
     void syncUserPermissions({ gmail: true, drive: true, alarm: permissions.alarm });
     if (!permissions.alarm) {
@@ -2012,6 +2369,77 @@ export default function App() {
     setPermissionToast('');
     setToastTarget(null);
     replace('candidateSummary');
+  };
+
+  const getCurrentScanResult = () => lastScan?.result ?? scanResultRef.current;
+
+  const getCandidateItemsForPrefix = (prefix: string) => {
+    const result = getCurrentScanResult();
+    if (prefix === 'mail') return result.mailItems;
+    if (prefix === 'drive' || prefix === 'large') return [...result.driveItems, ...result.largeItems];
+    return [];
+  };
+
+  const getCandidateItemByKey = (key: string) => {
+    const [prefix, ...idParts] = key.split(':');
+    const id = idParts.join(':');
+    return getCandidateItemsForPrefix(prefix).find((item) => item.id === id);
+  };
+
+  const getSelectedApiCandidatePayloads = () => {
+    const result = getCurrentScanResult();
+    return [...result.mailItems, ...result.driveItems]
+      .filter((item) => checked[`${item.source === 'mail' ? 'mail' : 'drive'}:${item.id}`] ?? isDefaultCandidateSelected(item.source === 'mail' ? 'mail' : 'drive', item.id))
+      .filter((item) => item.candidateId !== undefined)
+      .map((item) => ({
+        candidate_id: Number(item.candidateId),
+        selection_version: Number(item.selectionVersion ?? 0),
+      }));
+  };
+
+  const syncCandidateSelection = (key: string, selected: boolean) => {
+    if (!apiAccessToken || !activeApiScanJobId.current) return;
+
+    const item = getCandidateItemByKey(key);
+    if (!item?.candidateId) return;
+
+    void candidateApi
+      .updateSelection(
+        item.candidateId,
+        {
+          selection_status: selected ? 'SELECTED' : 'DESELECTED',
+          selection_version: Number(item.selectionVersion ?? 0),
+        },
+        { accessToken: apiAccessToken }
+      )
+      .catch(() => {
+        showToast('후보 선택 상태 저장에 실패했어요', undefined, 2400);
+      });
+  };
+
+  const syncCandidateSelections = (prefix: string, keys: string[], selected: boolean) => {
+    if (!apiAccessToken || !activeApiScanJobId.current) return;
+
+    const candidateIds = keys
+      .map((id) => getCandidateItemByKey(`${prefix}:${id}`))
+      .filter((item): item is ScanListItem & { candidateId: number } => Boolean(item?.candidateId))
+      .map((item) => Number(item.candidateId));
+
+    if (!candidateIds.length) return;
+
+    void scanApi
+      .updateCandidateSelections(
+        activeApiScanJobId.current,
+        {
+          candidate_ids: candidateIds,
+          selection_status: selected ? 'SELECTED' : 'DESELECTED',
+          exclude_protected: true,
+        },
+        { accessToken: apiAccessToken }
+      )
+      .catch(() => {
+        showToast('후보 선택 상태 저장에 실패했어요', undefined, 2400);
+      });
   };
 
   const notifyScanComplete = () => {
@@ -2057,7 +2485,7 @@ export default function App() {
 
   const getApiScanSettingsPayload = () => ({
     scan_source: getApiScanSource(),
-    drive_folder_id: selectedDriveFolders[0] || undefined,
+    drive_folder_id: getSelectedDriveFolderId() || undefined,
     include_subfolders: includeSubFolders,
     last_opened_before_months: lastOpenedBeforeMonths,
     last_modified_before_months: lastModifiedBeforeMonths,
@@ -2094,6 +2522,13 @@ export default function App() {
     }
     scanSourceLabelRef.current = getSimpleScanSourceLabel();
     scanResultRef.current = getLiveScanResult();
+    setScanProgress(0);
+    setScanStatusText('스캔 작업을 요청 중이에요');
+    setApiScanJobId(null);
+    activeApiScanJobId.current = null;
+    setHomeScanNotice('running');
+    go('scanProgress');
+
     if (apiAccessToken) {
       void scanApi
         .create(
@@ -2104,21 +2539,30 @@ export default function App() {
           { accessToken: apiAccessToken }
         )
         .then((job) => {
-          activeApiScanJobId.current = job.scan_job_id ?? null;
+          if (!job.scan_job_id) {
+            throw new Error('scan_job_id missing');
+          }
+          activeApiScanJobId.current = job.scan_job_id;
+          setApiScanJobId(job.scan_job_id);
           if (job.scan_source) {
             scanSourceLabelRef.current = apiScanSourceLabel(job.scan_source);
           }
           if (job.progress_percent !== undefined) {
             setScanProgress(Math.round(job.progress_percent));
           }
+          setScanStatusText('서버 스캔 작업을 확인 중이에요');
         })
         .catch(() => {
-          showToast('백엔드 스캔 시작 실패: 시연 모드로 진행해요');
+          setHomeScanNotice('none');
+          setScanProgress(0);
+          setScanStatusText('스캔 시작에 실패했어요');
+          if (screenRef.current === 'scanProgress') {
+            replace('home');
+          }
+          showToast('백엔드 스캔 시작 실패: 권한 또는 서버 상태를 확인해주세요', undefined, 3200);
         });
+      return;
     }
-    setScanProgress(0);
-    setHomeScanNotice('running');
-    go('scanProgress');
   };
 
   const cancelScan = () => {
@@ -2127,6 +2571,8 @@ export default function App() {
     }
     setHomeScanNotice('cancelled');
     setScanProgress(0);
+    setApiScanJobId(null);
+    activeApiScanJobId.current = null;
     replace('home');
   };
 
@@ -2154,13 +2600,14 @@ export default function App() {
   const toggleAllDriveFolders = () => {
     const targetFolder = driveCurrentFolder;
     const isSelectedByParent = getDriveAncestorFolders(targetFolder).some((ancestor) => selectedDriveFolders.includes(ancestor));
+    const driveFolderSource = getActiveDriveFolderOptions();
 
     if (isSelectedByParent) {
       showToast('먼저 상위 폴더를 해제해주세요');
       return;
     }
 
-    const allFolderGroups = getDriveFolderSelectionGroup(targetFolder);
+    const allFolderGroups = getDriveFolderSelectionGroup(targetFolder, driveFolderSource);
     const allFileIds = getDriveFileSelectionGroup(targetFolder).map((file) => file.id);
 
     if (!allFolderGroups.length && !allFileIds.length) {
@@ -2227,18 +2674,33 @@ export default function App() {
 
   const startDeleteJob = () => {
     if (apiAccessToken && activeApiScanJobId.current) {
+      const candidates = getSelectedApiCandidatePayloads();
+
+      if (!candidates.length) {
+        showToast('서버에 전달할 선택 후보가 없어요');
+        return;
+      }
+
+      setDeleteProgress(0);
+      setDeleteStatusText('정리 작업을 요청 중이에요');
+      setDeleteJobStatus('running');
+      setApiCleanupJobId(null);
+      activeApiCleanupJobId.current = null;
+      go('deleteProcessing');
+
       void scanApi
-        .getSelectedCandidates(activeApiScanJobId.current, { accessToken: apiAccessToken })
-        .then((selected) => {
-          const candidates = (selected.items ?? [])
-            .filter((item) => item.candidate_id !== undefined)
-            .map((item) => ({
-              candidate_id: Number(item.candidate_id),
-              selection_version: Number(item.selection_version ?? 0),
-            }));
-
-          if (!candidates.length || !activeApiScanJobId.current) return null;
-
+        .updateCandidateSelections(
+          activeApiScanJobId.current,
+          {
+            candidate_ids: candidates.map((candidate) => candidate.candidate_id),
+            selection_status: 'SELECTED',
+            exclude_protected: true,
+          },
+          { accessToken: apiAccessToken }
+        )
+        .catch(() => undefined)
+        .then(() => {
+          if (!activeApiScanJobId.current) return null;
           return cleanupApi.create(
             {
               scan_job_id: activeApiScanJobId.current,
@@ -2252,13 +2714,20 @@ export default function App() {
         .then((job) => {
           if (!job?.cleanup_job_id) return;
           activeApiCleanupJobId.current = job.cleanup_job_id;
-          return cleanupApi.start(job.cleanup_job_id, { accessToken: apiAccessToken });
+          setApiCleanupJobId(job.cleanup_job_id);
         })
         .catch(() => {
-          showToast('백엔드 휴지통 이동 요청 실패: 시연 모드로 진행해요');
+          setDeleteJobStatus('failed');
+          setDeleteStatusText('정리 요청에 실패했어요');
+          if (screenRef.current === 'deleteProcessing') {
+            replace('selectedReview');
+          }
+          showToast('백엔드 휴지통 이동 요청 실패: 권한 또는 서버 상태를 확인해주세요', undefined, 3200);
         });
+      return;
     }
     setDeleteProgress(0);
+    setDeleteStatusText('선택 항목을 휴지통으로 이동 중');
     setDeleteJobStatus('running');
     go('deleteProcessing');
   };
@@ -2417,11 +2886,150 @@ export default function App() {
   }, [screen, connectedDone, skipConnectedAnimation]);
 
   useEffect(() => {
+    if (screen !== 'scanFlowFolder' || !apiAccessToken || !permissions.drive) return;
+
+    void loadApiDriveFolders(driveCurrentFolder);
+  }, [apiAccessToken, driveCurrentFolder, permissions.drive, screen]);
+
+  useEffect(() => {
     if (homeScanNotice !== 'running') return;
+
+    if (apiAccessToken && apiScanJobId) {
+      let cancelled = false;
+      let timer: ReturnType<typeof setInterval> | null = null;
+
+      const completeApiScan = async (job: ApiScanJob) => {
+        try {
+          const [summaryResult, candidatesResult] = await Promise.allSettled([
+            scanApi.getAnalysisSummary(apiScanJobId, { accessToken: apiAccessToken }),
+            scanApi.getCandidates(apiScanJobId, { include_protected: true, page: 0, size: 100 }, { accessToken: apiAccessToken }),
+          ]);
+
+          if (cancelled) return;
+
+          const apiSummary = summaryResult.status === 'fulfilled' ? summaryResult.value : null;
+          const apiCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value.content ?? [] : [];
+          const nextSummary = buildApiScanSummary({
+            candidates: apiCandidates,
+            storageMailItems: apiStorageSummary?.storageMailItems.map((item) => ({
+              title: item.subtitle,
+              size_bytes: item.snapshotSizeBytes ?? Math.round(extractStorageSizeMB(item.meta) * 1024 * 1024),
+              modified_time: item.meta,
+            })) ?? [],
+            storageDriveItems: apiStorageSummary?.storageDriveItems.map((item) => ({
+              title: item.title,
+              file_extension: item.type,
+              size_bytes: item.snapshotSizeBytes ?? Math.round(extractStorageSizeMB(item.subtitle) * 1024 * 1024),
+              modified_time: item.subtitle,
+            })) ?? [],
+            estimatedBytes: apiSummary?.total_estimated_reclaim_bytes ?? job.estimated_reclaim_bytes,
+            candidateCount: apiSummary?.total_candidate_count ?? job.candidate_count,
+          });
+          scanResultRef.current = nextSummary;
+          setChecked((items) => {
+            const next = { ...items };
+            [...nextSummary.mailItems, ...nextSummary.driveItems].forEach((item) => {
+              if (!item.selectionStatus) return;
+              next[`${item.source === 'mail' ? 'mail' : 'drive'}:${item.id}`] = item.selectionStatus !== 'DESELECTED';
+            });
+            return next;
+          });
+          setApiStorageSummary(nextSummary);
+          setLastScan({
+            dateLabel: formatScanDate(new Date()),
+            sourceLabel: scanSourceLabelRef.current,
+            conditionLabel: getPeriodLabel(),
+            result: nextSummary,
+          });
+          setHomeScanNotice('completed');
+          setHasCompletedScan(true);
+
+          if (job.job_status === 'PARTIAL_FAILED') {
+            showToast('일부 분석에 실패했어요. 후보를 확인해주세요', undefined, 3600);
+          }
+          if (permissions.alarm && settingsToggles.scanComplete) {
+            notifyScanComplete();
+          }
+          if (screenRef.current === 'scanProgress') {
+            replace('candidateSummary');
+          }
+          void refreshAuraApis(apiAccessToken);
+        } catch {
+          setHomeScanNotice('none');
+          setScanStatusText('스캔 결과를 불러오지 못했어요');
+          showToast('스캔 결과 조회에 실패했어요. 잠시 후 다시 확인해주세요', undefined, 3200);
+          if (screenRef.current === 'scanProgress') {
+            replace('home');
+          }
+        }
+      };
+
+      const pollScanJob = async () => {
+        try {
+          const job = await scanApi.getDetail(apiScanJobId, { accessToken: apiAccessToken });
+          if (cancelled) return;
+
+          const progress = Math.max(0, Math.min(100, Math.round(job.progress_percent ?? 0)));
+          setScanProgress(progress);
+
+          if (job.job_status === 'PENDING') {
+            setScanStatusText('스캔 작업 대기 중');
+            return;
+          }
+          if (job.job_status === 'SCANNING') {
+            setScanStatusText('메일 및 드라이브 데이터 수집중');
+            return;
+          }
+          if (job.job_status === 'ANALYZING') {
+            setScanStatusText('수집 데이터 AI 분석중');
+            return;
+          }
+          if (job.job_status === 'COMPLETED' || job.job_status === 'PARTIAL_FAILED') {
+            if (timer) {
+              clearInterval(timer);
+              timer = null;
+            }
+            setScanProgress(100);
+            setScanStatusText(job.job_status === 'PARTIAL_FAILED' ? '일부 분석 실패, 결과 정리 중' : '분석 완료, 결과 정리 중');
+            await completeApiScan(job);
+            return;
+          }
+          if (job.job_status === 'FAILED' || job.job_status === 'CANCELED') {
+            if (timer) {
+              clearInterval(timer);
+              timer = null;
+            }
+            setHomeScanNotice(job.job_status === 'CANCELED' ? 'cancelled' : 'none');
+            setScanStatusText(job.error_message || '스캔이 완료되지 못했어요');
+            showToast(job.error_message || '스캔이 실패했어요. 권한 또는 서버 상태를 확인해주세요', undefined, 3600);
+            if (screenRef.current === 'scanProgress') {
+              replace('home');
+            }
+          }
+        } catch {
+          if (cancelled) return;
+          setScanStatusText('스캔 상태 확인 중 오류가 발생했어요');
+          showToast('스캔 상태 확인에 실패했어요', undefined, 2400);
+        }
+      };
+
+      void pollScanJob();
+      timer = setInterval(() => {
+        void pollScanJob();
+      }, 2500);
+
+      return () => {
+        cancelled = true;
+        if (timer) {
+          clearInterval(timer);
+        }
+      };
+    }
 
     const timer = setInterval(() => {
       setScanProgress((value) => {
         const next = Math.min(100, value + 4);
+        setScanStatusText(next < 50 ? '메일 및 드라이브 데이터 수집중' : '수집 데이터 AI 분석중');
         if (next >= 100) {
           clearInterval(timer);
           setTimeout(() => {
@@ -2486,6 +3094,122 @@ export default function App() {
   useEffect(() => {
     if (deleteJobStatus !== 'running') return;
 
+    if (apiAccessToken && apiCleanupJobId) {
+      let cancelled = false;
+      let timer: ReturnType<typeof setInterval> | null = null;
+
+      const applyCleanupResult = (result: ApiCleanupJob) => {
+        if (result.reclaimed_bytes !== undefined || result.estimated_carbon_grams !== undefined) {
+          setApiHomeSummary((summary) => ({
+            ...(summary ?? {}),
+            latest_cleanup: {
+              cleanup_job_id: result.cleanup_job_id,
+              cleaned_item_count: result.cleaned_item_count,
+              reclaimed_bytes: result.reclaimed_bytes,
+              estimated_carbon_grams: result.estimated_carbon_grams,
+              completed_at: result.completed_at,
+            },
+          }));
+        }
+      };
+
+      const finishCleanup = async (job: ApiCleanupJob) => {
+        let failedItemCount = 0;
+        try {
+          const result = await cleanupApi.getResult(apiCleanupJobId, { accessToken: apiAccessToken });
+          if (cancelled) return;
+          applyCleanupResult({ ...job, ...result });
+        } catch {
+          if (cancelled) return;
+          applyCleanupResult(job);
+        }
+
+        if (job.job_status === 'PARTIAL_FAILED') {
+          try {
+            const cleanupItems = await cleanupApi.getItems(apiCleanupJobId, { accessToken: apiAccessToken });
+            failedItemCount = cleanupItems.items?.filter((item) => item.process_status === 'FAILED').length ?? 0;
+          } catch {
+            failedItemCount = 0;
+          }
+        }
+
+        setDeleteProgress(100);
+        setDeleteJobStatus('completed');
+        setHomeScanNotice('none');
+        if (job.job_status === 'PARTIAL_FAILED') {
+          setDeleteStatusText(failedItemCount ? `일부 항목 ${failedItemCount}개 이동 실패` : '일부 항목 이동 실패');
+          showToast('일부 항목 이동에 실패했어요. 결과를 확인해주세요', undefined, 3600);
+        }
+        void refreshAuraApis(apiAccessToken);
+        if (screenRef.current === 'deleteProcessing') {
+          replace('cleanupComplete');
+        } else {
+          showToast('휴지통 이동이 완료됐어요. 눌러서 결과를 확인하세요', 'cleanupComplete', 3600);
+        }
+      };
+
+      const pollCleanupJob = async () => {
+        try {
+          const job = await cleanupApi.getDetail(apiCleanupJobId, { accessToken: apiAccessToken });
+          if (cancelled) return;
+
+          if (job.progress_percent !== undefined) {
+            setDeleteProgress(Math.max(0, Math.min(100, Math.round(job.progress_percent))));
+          } else if (job.job_status === 'PENDING') {
+            setDeleteProgress((value) => Math.max(value, 10));
+          } else if (job.job_status === 'PROCESSING') {
+            setDeleteProgress((value) => Math.min(90, Math.max(value + 8, 20)));
+          }
+
+          if (job.job_status === 'PENDING') {
+            setDeleteStatusText('정리 작업 대기 중');
+            return;
+          }
+          if (job.job_status === 'PROCESSING') {
+            setDeleteStatusText('선택 항목을 휴지통으로 이동 중');
+            return;
+          }
+          if (job.job_status === 'COMPLETED' || job.job_status === 'PARTIAL_FAILED') {
+            if (timer) {
+              clearInterval(timer);
+              timer = null;
+            }
+            setDeleteStatusText(job.job_status === 'PARTIAL_FAILED' ? '일부 실패, 결과 정리 중' : '정리 완료, 결과 정리 중');
+            await finishCleanup(job);
+            return;
+          }
+          if (job.job_status === 'FAILED' || job.job_status === 'CANCELED') {
+            if (timer) {
+              clearInterval(timer);
+              timer = null;
+            }
+            setDeleteJobStatus('failed');
+            setDeleteStatusText('정리 작업이 완료되지 못했어요');
+            showToast('휴지통 이동이 실패했어요. 잠시 후 다시 시도해주세요', undefined, 3600);
+            if (screenRef.current === 'deleteProcessing') {
+              replace('selectedReview');
+            }
+          }
+        } catch {
+          if (cancelled) return;
+          setDeleteStatusText('정리 상태 확인 중 오류가 발생했어요');
+          showToast('정리 상태 확인에 실패했어요', undefined, 2400);
+        }
+      };
+
+      void pollCleanupJob();
+      timer = setInterval(() => {
+        void pollCleanupJob();
+      }, 2500);
+
+      return () => {
+        cancelled = true;
+        if (timer) {
+          clearInterval(timer);
+        }
+      };
+    }
+
     const timer = setInterval(() => {
       setDeleteProgress((value) => {
         const next = Math.min(100, value + 4);
@@ -2538,18 +3262,22 @@ export default function App() {
 
   const toggleCheck = (key: string) => {
     const defaultSelected = isDefaultSelectionForKey(key);
-    setChecked((items) => ({ ...items, [key]: !(items[key] ?? defaultSelected) }));
+    const nextSelected = !(checked[key] ?? defaultSelected);
+    setChecked((items) => ({ ...items, [key]: nextSelected }));
+    syncCandidateSelection(key, nextSelected);
   };
 
   const setAll = (prefix: string, keys: string[]) => {
     const allChecked = keys.every((key) => checked[`${prefix}:${key}`] ?? isDefaultSelectionForKey(`${prefix}:${key}`));
+    const nextSelected = !allChecked;
     setChecked((items) => {
       const next = { ...items };
       keys.forEach((key) => {
-        next[`${prefix}:${key}`] = !allChecked;
+        next[`${prefix}:${key}`] = nextSelected;
       });
       return next;
     });
+    syncCandidateSelections(prefix, keys, nextSelected);
   };
   const clearSelectionPrefix = (prefix: string) => {
     setChecked((items) => {
@@ -2679,6 +3407,7 @@ export default function App() {
 
   const toggleDriveFolder = (folder: string) => {
     const isSelectedByParent = getDriveAncestorFolders(folder).some((ancestor) => selectedDriveFolders.includes(ancestor));
+    const driveFolderSource = getActiveDriveFolderOptions();
 
     if (isSelectedByParent) {
       showToast('먼저 상위 폴더를 해제해주세요');
@@ -2686,7 +3415,7 @@ export default function App() {
     }
 
     setSelectedDriveFolders((items) => {
-      const folderGroup = getDriveFolderSelectionGroup(folder);
+      const folderGroup = getDriveFolderSelectionGroup(folder, driveFolderSource);
       const fileGroup = getDriveFileSelectionGroup(folder).map((file) => file.id);
       const isSelected = folderGroup.every((item) => items.includes(item)) && fileGroup.every((item) => selectedDriveFiles.includes(item));
       const next = isSelected
@@ -2704,9 +3433,10 @@ export default function App() {
   };
 
   const render = () => {
-    const visibleDriveFolders = getVisibleDriveFolders(driveCurrentFolder, driveFolderSearch);
+    const activeDriveFolderOptions = getActiveDriveFolderOptions();
+    const visibleDriveFolders = getVisibleDriveFolders(driveCurrentFolder, driveFolderSearch, activeDriveFolderOptions);
     const currentDriveSelectionFolder = driveCurrentFolder;
-    const currentDriveFolderGroups = getDriveFolderSelectionGroup(currentDriveSelectionFolder);
+    const currentDriveFolderGroups = getDriveFolderSelectionGroup(currentDriveSelectionFolder, activeDriveFolderOptions);
     const currentDriveFileIds = Array.from(new Set(getDriveFileSelectionGroup(currentDriveSelectionFolder).map((file) => file.id)));
     const drivePickerTotalItemCount = currentDriveFolderGroups.length + currentDriveFileIds.length;
     const allDriveFoldersSelected =
@@ -3205,6 +3935,16 @@ export default function App() {
                 </View>
               </View>
               <View style={styles.folderBreadcrumbRule} />
+              {driveFolderLoading ? <Text style={styles.infoDesc}>Drive 폴더를 불러오는 중이에요</Text> : null}
+              {driveFolderError ? (
+                <View style={styles.warningCard}>
+                  <Text style={styles.warningText}>{driveFolderError}</Text>
+                  <View style={styles.twoButtons}>
+                    <OutlineButton title="재시도" onPress={() => void loadApiDriveFolders(driveCurrentFolder)} half />
+                    <PrimaryButton title="권한 재연결" onPress={() => void requestGoogleReconnect(['DRIVE'])} half />
+                  </View>
+                </View>
+              ) : null}
               <ScrollView
                 style={styles.folderListScroll}
                 contentContainerStyle={styles.folderListContent}
@@ -3217,8 +3957,8 @@ export default function App() {
                       key={folder.name}
                       title={isDriveSearching ? folder.name : getDriveFolderName(folder.name)}
                       desc={folder.meta ? formatFolderMeta(folder.meta) : undefined}
-                      selected={getDriveFolderSelected(folder.name, selectedDriveFolders, selectedDriveFiles)}
-                      canOpen={hasDriveFolderChildren(folder.name)}
+                      selected={getDriveFolderSelected(folder.name, selectedDriveFolders, selectedDriveFiles, activeDriveFolderOptions)}
+                      canOpen={hasDriveFolderChildren(folder.name, activeDriveFolderOptions)}
                       onPress={() => toggleDriveFolder(folder.name)}
                       onOpen={() => {
                         setDriveFolderSearch('');
@@ -3312,7 +4052,7 @@ export default function App() {
               <Card tint style={styles.scanFullPanel}>
                 <Text style={styles.scanFullKicker}>AURA가 분석 중이에요</Text>
                 <ProgressCircle progress={scanProgress} />
-                <Text style={styles.scanFullStatusText}>{scanProgress < 50 ? '메일 및 드라이브 데이터 수집중' : '수집 데이터 AI 분석중'}</Text>
+                <Text style={styles.scanFullStatusText}>{scanStatusText}</Text>
                 <View style={styles.progressTrack}>
                   <View style={[styles.progressFill, { width: `${scanProgress}%` }]} />
                 </View>
@@ -3463,6 +4203,7 @@ export default function App() {
             title="메일 상세"
             item={selectedScanItem ?? activeScanResult.mailItems[0]}
             kind="mail"
+            apiAccessToken={apiAccessToken}
           />
         );
 
@@ -3472,6 +4213,7 @@ export default function App() {
             title="파일 상세"
             item={selectedScanItem ?? activeScanResult.driveItems[0] ?? activeScanResult.largeItems[0]}
             kind="drive"
+            apiAccessToken={apiAccessToken}
           />
         );
 
@@ -3569,6 +4311,7 @@ export default function App() {
               done={deleteProgress >= 100}
             />
             <Text style={styles.progressLabel}>전체 삭제 진행</Text>
+            <Text style={styles.infoDesc}>{deleteStatusText}</Text>
             <View style={styles.progressTrack}>
               <View style={[styles.progressFill, { width: `${deleteProgress}%` }]} />
             </View>
@@ -3700,7 +4443,7 @@ export default function App() {
 
       case 'storageDetail':
         return (
-          <StorageDetailScreen item={selectedStorageDetail} />
+          <StorageDetailScreen item={selectedStorageDetail} apiAccessToken={apiAccessToken} />
         );
 
       case 'settings':
@@ -3764,12 +4507,12 @@ export default function App() {
 
             <SectionTitle>연결된 서비스</SectionTitle>
             <View style={styles.groupCard}>
-              <ServiceLinkRow service="gmail" title="Gmail" connected={permissions.gmail} onPress={() => go('gmailPermission')} />
+              <ServiceLinkRow service="gmail" title="Gmail" connected={permissions.gmail} onPress={() => void requestGoogleReconnect(['GMAIL'])} />
               <View style={styles.thinDivider} />
-              <ServiceLinkRow service="drive" title="Google Drive" connected={permissions.drive} onPress={() => go('drivePermission')} />
+              <ServiceLinkRow service="drive" title="Google Drive" connected={permissions.drive} onPress={() => void requestGoogleReconnect(['DRIVE'])} />
             </View>
 
-            <OutlineButton title="Google 권한 다시 확인" onPress={() => showToast('아직 준비 중인 기능입니다')} />
+            <OutlineButton title="Google 권한 다시 확인" onPress={() => void refreshGooglePermissions()} />
             <OutlineButton title="이 계정 연결 해제" onPress={() => showToast('계정 연결 해제는 발표용 화면에서는 실행하지 않아요')} />
           </ScreenShell>
         );
@@ -3832,6 +4575,61 @@ export default function App() {
                 </View>
                 <Text style={styles.rowRight}>서비스 탈퇴 시까지</Text>
               </View>
+            </View>
+
+            <SectionTitle>서버 보관 데이터</SectionTitle>
+            <View style={styles.groupCard}>
+              {privacyDataLoading ? <Text style={styles.infoDesc}>개인정보 데이터를 불러오는 중...</Text> : null}
+              {privacyDataError ? <Text style={styles.warningText}>{privacyDataError}</Text> : null}
+              {!privacyDataLoading && !privacyDataError ? (
+                <>
+                  <View style={styles.settingPlainRow}>
+                    <View style={styles.infoMain}>
+                      <Text style={styles.infoTitle}>계정 이메일</Text>
+                    </View>
+                    <Text style={styles.rowRight}>{currentUser?.email ?? '-'}</Text>
+                  </View>
+                  <View style={styles.thinDivider} />
+                  <View style={styles.settingPlainRow}>
+                    <View style={styles.infoMain}>
+                      <Text style={styles.infoTitle}>분석 기록</Text>
+                    </View>
+                    <Text style={styles.rowRight}>{formatUnknownValue(privacyData?.managed_data_summary?.scan_job_count ?? apiScanHistoryItems.length)}</Text>
+                  </View>
+                  <View style={styles.thinDivider} />
+                  <View style={styles.settingPlainRow}>
+                    <View style={styles.infoMain}>
+                      <Text style={styles.infoTitle}>정리 기록</Text>
+                    </View>
+                    <Text style={styles.rowRight}>{formatUnknownValue(privacyData?.managed_data_summary?.cleanup_history_count)}</Text>
+                  </View>
+                  <View style={styles.thinDivider} />
+                  <View style={styles.settingPlainRow}>
+                    <View style={styles.infoMain}>
+                      <Text style={styles.infoTitle}>저장소 항목</Text>
+                    </View>
+                    <Text style={styles.rowRight}>{formatUnknownValue(privacyData?.managed_data_summary?.scanned_item_count)}</Text>
+                  </View>
+                  <View style={styles.thinDivider} />
+                  <View style={styles.settingPlainRow}>
+                    <View style={styles.infoMain}>
+                      <Text style={styles.infoTitle}>데이터 정책</Text>
+                    </View>
+                    <Text style={styles.rowRight}>
+                      {privacyData?.data_retention
+                        ? `스캔 ${privacyData.data_retention.scan_data_policy ?? '-'} / 기록 ${privacyData.data_retention.history_data_policy ?? '-'}`
+                        : '-'}
+                    </Text>
+                  </View>
+                  <View style={styles.thinDivider} />
+                  <View style={styles.settingPlainRow}>
+                    <View style={styles.infoMain}>
+                      <Text style={styles.infoTitle}>동의 버전</Text>
+                    </View>
+                    <Text style={styles.rowRight}>{privacyData?.consents?.consent_version ?? '-'}</Text>
+                  </View>
+                </>
+              ) : null}
             </View>
 
             <SectionTitle>분석 데이터</SectionTitle>
@@ -3942,14 +4740,10 @@ export default function App() {
                 <Pressable
                   style={[styles.dangerButton, !checked.withdrawConfirm && styles.dangerButtonDisabled, styles.halfButton]}
                   onPress={() => {
-                    if (!checked.withdrawConfirm) {
-                      showToast('탈퇴 확인 체크가 필요합니다');
-                      return;
-                    }
-                    resetToFreshStart();
+                    void confirmWithdraw();
                   }}
                 >
-                  <Text style={styles.dangerText}>서비스 탈퇴</Text>
+                  <Text style={styles.dangerText}>{withdrawSubmitting ? '요청 중...' : '서비스 탈퇴'}</Text>
                 </Pressable>
               </View>
             </View>
@@ -3959,8 +4753,34 @@ export default function App() {
       case 'notice':
         return (
           <ScreenShell title="공지사항">
-            <InfoRow title="AURA 1.0.0 안내" desc="학술제 발표용 프로토타입 화면이 업데이트됐어요." hideChevron />
-            <InfoRow title="Google 권한 안내" desc="원문 내용은 AI에게 전달되지 않도록 설계했어요." hideChevron />
+            {announcementLoading ? <Text style={styles.infoDesc}>공지사항을 불러오는 중...</Text> : null}
+            {announcementError ? <Text style={styles.warningText}>{announcementError}</Text> : null}
+            {(apiAnnouncements.length
+              ? apiAnnouncements
+              : [
+                  {
+                    announcement_id: 'local-aura-100',
+                    title: 'AURA 1.0.0 안내',
+                    summary: '학술제 발표용 프로토타입 화면이 업데이트됐어요.',
+                  },
+                  {
+                    announcement_id: 'local-google-permission',
+                    title: 'Google 권한 안내',
+                    summary: '원문 내용은 AI에게 전달되지 않도록 설계했어요.',
+                  },
+                ]).map((notice) => (
+              <InfoRow
+                key={notice.announcement_id}
+                title={notice.title ?? '공지사항'}
+                desc={notice.summary ?? notice.content ?? (notice.published_at ? formatApiDateOnly(notice.published_at) : undefined)}
+                hideChevron
+                onPress={() => {
+                  if (apiAccessToken && typeof notice.announcement_id === 'number') {
+                    void announcementApi.markRead(notice.announcement_id, { accessToken: apiAccessToken }).catch(() => undefined);
+                  }
+                }}
+              />
+            ))}
           </ScreenShell>
         );
     }
@@ -4181,15 +5001,10 @@ export default function App() {
                   <Pressable
                     style={[styles.sheetDangerButton, !checked.withdrawConfirm && styles.dangerButtonDisabled]}
                     onPress={() => {
-                      if (!checked.withdrawConfirm) {
-                        showToast('탈퇴 확인 체크가 필요합니다');
-                        return;
-                      }
-                      closeWithdrawSheet();
-                      resetToFreshStart();
+                      void confirmWithdraw();
                     }}
                   >
-                    <Text style={styles.dangerText}>서비스 탈퇴하기</Text>
+                    <Text style={styles.dangerText}>{withdrawSubmitting ? '요청 중...' : '서비스 탈퇴하기'}</Text>
                   </Pressable>
                 </View>
               </BottomSheetPanel>
@@ -5451,12 +6266,40 @@ function ScanItemDetailScreen({
   subtitle,
   item,
   kind,
+  apiAccessToken,
 }: {
   title: string;
   subtitle?: string;
   item?: ScanListItem;
   kind: 'mail' | 'drive';
+  apiAccessToken: string | null;
 }) {
+  const [apiDetail, setApiDetail] = useState<ApiCandidateDetail | null>(null);
+  const [detailError, setDetailError] = useState('');
+
+  useEffect(() => {
+    if (!apiAccessToken || !item?.candidateId) {
+      setApiDetail(null);
+      setDetailError('');
+      return;
+    }
+
+    let active = true;
+    setDetailError('');
+    void candidateApi
+      .getDetail(item.candidateId, { accessToken: apiAccessToken })
+      .then((detail) => {
+        if (active) setApiDetail(detail ?? null);
+      })
+      .catch((error) => {
+        if (active) setDetailError(getErrorMessage(error, '상세 정보를 불러오지 못했어요'));
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [apiAccessToken, item?.candidateId]);
+
   if (!item) {
     return (
       <ScreenShell title={title} subtitle={subtitle}>
@@ -5482,11 +6325,32 @@ function ScanItemDetailScreen({
           <View style={styles.thinDivider} />
           <Text style={styles.detailInfoTitle}>분석 메타데이터</Text>
           <Text style={styles.detailInfoText}>용량 {formatDataSize(item.sizeMB)} · 기준 날짜 {item.dateLabel}</Text>
+          {apiDetail ? (
+            <Text style={styles.detailInfoText}>
+              서버 후보 #{apiDetail.candidate_id ?? item.candidateId} · 선택 상태 {apiDetail.selection_status ?? item.selectionStatus ?? 'NONE'}
+              {apiDetail.analysis?.category ? ` · 분류 ${apiDetail.analysis.category}` : ''}
+            </Text>
+          ) : null}
+          {apiDetail?.analysis?.ai_confidence_score !== undefined ? (
+            <Text style={styles.detailInfoText}>AI 신뢰도 {Math.round(apiDetail.analysis.ai_confidence_score * 100)}%</Text>
+          ) : null}
+          {detailError ? <Text style={styles.warningText}>{detailError}</Text> : null}
         </View>
       ) : (
         <View style={styles.detailInfoBox}>
           <Text style={styles.detailInfoTitle}>파일 메타데이터</Text>
           <Text style={styles.detailInfoText}>용량 {formatDataSize(item.sizeMB)} · 기준 날짜 {item.dateLabel}</Text>
+          {apiDetail ? (
+            <Text style={styles.detailInfoText}>
+              서버 후보 #{apiDetail.candidate_id ?? item.candidateId} · 선택 상태 {apiDetail.selection_status ?? item.selectionStatus ?? 'NONE'}
+              {apiDetail.analysis?.category ? ` · 분류 ${apiDetail.analysis.category}` : ''}
+            </Text>
+          ) : null}
+          {apiDetail?.item?.folder_path ? <Text style={styles.detailInfoText}>Drive 경로 {apiDetail.item.folder_path}</Text> : null}
+          {apiDetail?.analysis?.ai_confidence_score !== undefined ? (
+            <Text style={styles.detailInfoText}>AI 신뢰도 {Math.round(apiDetail.analysis.ai_confidence_score * 100)}%</Text>
+          ) : null}
+          {detailError ? <Text style={styles.warningText}>{detailError}</Text> : null}
         </View>
       )}
     </ScreenShell>
@@ -5697,9 +6561,22 @@ function StorageScreen({
   const [storageDriveTrashFolder, setStorageDriveTrashFolder] = useState(driveRootPath);
   const [storagePage, setStoragePage] = useState(0);
   const prefix = mode === 'storageDriveTrash' ? 'storageDriveTrash' : isTrash ? 'storageTrash' : isDrive ? 'storageDrive' : 'storageMail';
+  const shouldUseServerPagination = Boolean(apiAccessToken);
+  const storageServerSource = isDrive ? ('DRIVE' as const) : ('GMAIL' as const);
+  const storageApiPageSize = 20;
+  const [serverPage, setServerPage] = useState<StorageServerPageState | null>(null);
+  const [serverPageLoading, setServerPageLoading] = useState(false);
+  const [serverPageError, setServerPageError] = useState('');
+  const serverPageRequestId = useRef(0);
   const summary = scan?.result ?? defaultStorageSummary;
-  const mailItems = summary.storageMailItems;
+  const serverMailItems = serverPage?.items.map(apiStorageItemToMail) ?? [];
+  const serverDriveItems = serverPage?.items.map(apiStorageItemToDrive) ?? [];
+  const serverTrashItems = serverPage?.items.map(apiStorageItemToTrash) ?? [];
+  const mailItems = shouldUseServerPagination && mode === 'storageMail' ? serverMailItems : summary.storageMailItems;
   const allStorageDriveItems = getAllStorageDriveItems();
+  const hasApiStorageDriveItems =
+    (shouldUseServerPagination && mode === 'storageDrive') ||
+    summary.storageDriveItems.some((item) => item.externalItemId || item.id.startsWith('api-storage-drive-'));
   const applyDriveMove = (item: StorageDriveItem): StorageDriveItem => {
     const targetFolder = storageDriveMoveTargets[item.id];
     if (!targetFolder) return item;
@@ -5711,7 +6588,11 @@ function StorageScreen({
       subtitle: item.type === 'F' ? `${fullPath} · 폴더` : `${meta} · ${targetFolder}`,
     };
   };
-  const storageDriveUniverse = allStorageDriveItems.map(applyDriveMove);
+  const storageDriveUniverse = (shouldUseServerPagination && mode === 'storageDrive'
+    ? serverDriveItems
+    : hasApiStorageDriveItems
+      ? summary.storageDriveItems
+      : allStorageDriveItems).map(applyDriveMove);
   const currentStorageDriveItems = storageDriveUniverse
     .filter((item) => {
       if (item.type === 'F') return getDriveParentPath(item.fullPath ?? '') === storageDriveFolder;
@@ -5732,6 +6613,11 @@ function StorageScreen({
         if (!item) return null;
         return {
           id: `trash-mail-moved-${item.id}`,
+          itemId: item.itemId,
+          externalItemId: item.externalItemId,
+          snapshotTitle: item.snapshotTitle,
+          snapshotSizeBytes: item.snapshotSizeBytes,
+          itemSource: item.itemSource,
           title: item.title,
           subtitle: item.subtitle,
           meta: item.meta,
@@ -5743,6 +6629,11 @@ function StorageScreen({
         if (!item) return null;
         return {
           id: `trash-drive-moved-${item.id}`,
+          itemId: item.itemId,
+          externalItemId: item.externalItemId,
+          snapshotTitle: item.snapshotTitle,
+          snapshotSizeBytes: item.snapshotSizeBytes,
+          itemSource: item.itemSource,
           title: item.title,
           subtitle: item.title,
           meta: item.subtitle,
@@ -5752,7 +6643,7 @@ function StorageScreen({
       return null;
     })
     .filter((item): item is StorageMailItem => Boolean(item));
-  const combinedTrashItems = [...summary.storageTrashItems, ...movedTrashItems];
+  const combinedTrashItems = [...(shouldUseServerPagination && isTrash ? serverTrashItems : summary.storageTrashItems), ...movedTrashItems];
   const rawTrashItems = isTrash
     ? combinedTrashItems.filter((item) => mode === 'storageDriveTrash' ? item.id.startsWith('trash-drive-') : !item.id.startsWith('trash-drive-'))
     : combinedTrashItems;
@@ -5774,6 +6665,11 @@ function StorageScreen({
           metaParts.some((part) => part === '폴더' || part === '?대뜑');
         return {
           id: item.id,
+          itemId: item.itemId,
+          externalItemId: item.externalItemId,
+          snapshotTitle: item.snapshotTitle,
+          snapshotSizeBytes: item.snapshotSizeBytes,
+          itemSource: item.itemSource,
           type: isFolder ? 'F' : metaParts[0] || 'DOC',
           title: item.title,
           subtitle: item.meta,
@@ -5782,22 +6678,29 @@ function StorageScreen({
       })
     : [];
   const movedDriveTrashItems = storageDriveTrashFolder === driveRootPath ? mappedSummaryDriveTrashItems : [];
-  const driveTrashUniverse = [...getAllStorageDriveTrashItems(), ...mappedSummaryDriveTrashItems]
+  const driveTrashUniverse = [...(shouldUseServerPagination ? [] : getAllStorageDriveTrashItems()), ...mappedSummaryDriveTrashItems]
     .filter((item) => !isHiddenFromCurrentList(item.id));
   const driveTrashItems: StorageDriveItem[] = mode === 'storageDriveTrash'
-    ? [...getStorageDriveTrashItemsForFolder(storageDriveTrashFolder), ...movedDriveTrashItems]
+    ? [...(shouldUseServerPagination ? [] : getStorageDriveTrashItemsForFolder(storageDriveTrashFolder)), ...movedDriveTrashItems]
         .filter((item) => !isHiddenFromCurrentList(item.id))
     : [];
   const activeItems = mode === 'storageDriveTrash' ? driveTrashItems : isTrash ? trashItems : isDrive ? visibleDriveItems : visibleMailItems;
   const mailPagedSourceItems = !isDrive ? (isTrash ? trashItems : visibleMailItems) : [];
   const mailPageSize = 20;
-  const mailPageCount = Math.max(1, Math.ceil(mailPagedSourceItems.length / mailPageSize));
+  const serverTotalElements = serverPage?.totalElements ?? activeItems.length;
+  const serverTotalPages = Math.max(1, serverPage?.totalPages ?? 1);
+  const mailPageCount = shouldUseServerPagination
+    ? serverTotalPages
+    : Math.max(1, Math.ceil(mailPagedSourceItems.length / mailPageSize));
   const safeStoragePage = Math.min(storagePage, mailPageCount - 1);
-  const mailPageStart = safeStoragePage * mailPageSize;
-  const mailPageEnd = Math.min(mailPageStart + mailPageSize, mailPagedSourceItems.length);
-  const mailPagedItems = mailPagedSourceItems.slice(mailPageStart, mailPageEnd);
-  const mailPageRangeStart = mailPagedSourceItems.length ? mailPageStart + 1 : 0;
-  const mailPageRangeEnd = mailPagedSourceItems.length ? mailPageEnd : 0;
+  const mailPageStart = shouldUseServerPagination ? safeStoragePage * storageApiPageSize : safeStoragePage * mailPageSize;
+  const mailPageEnd = shouldUseServerPagination
+    ? Math.min(mailPageStart + activeItems.length, serverTotalElements)
+    : Math.min(mailPageStart + mailPageSize, mailPagedSourceItems.length);
+  const mailPagedItems = shouldUseServerPagination ? mailPagedSourceItems : mailPagedSourceItems.slice(mailPageStart, mailPageEnd);
+  const pageRangeTotal = shouldUseServerPagination ? serverTotalElements : mailPagedSourceItems.length;
+  const mailPageRangeStart = pageRangeTotal ? mailPageStart + 1 : 0;
+  const mailPageRangeEnd = pageRangeTotal ? mailPageEnd : 0;
   const ids = activeItems.map((item) => item.id);
   const isItemChecked = (id: string) => checked[`${prefix}:${id}`] ?? false;
   const getStorageDriveSelectionIds = (item: StorageDriveItem) => {
@@ -5844,6 +6747,51 @@ function StorageScreen({
       ? driveTrashUniverse.filter((item) => !isHiddenFromCurrentList(item.id) && isItemChecked(item.id))
     : activeItems.filter((item) => isItemChecked(item.id));
   const selectedActiveItemCount = selectedItems.length;
+
+  const loadStorageServerPage = (page: number) => {
+    if (!apiAccessToken || !shouldUseServerPagination) return;
+
+    const requestId = serverPageRequestId.current + 1;
+    serverPageRequestId.current = requestId;
+    setServerPageLoading(true);
+    setServerPageError('');
+    const request = isTrash
+      ? storageApi.getTrash({ item_source: storageServerSource, page, size: storageApiPageSize }, { accessToken: apiAccessToken })
+      : storageApi.getItems({ item_source: storageServerSource, page, size: storageApiPageSize }, { accessToken: apiAccessToken });
+
+    void request
+      .then((result) => {
+        if (serverPageRequestId.current !== requestId) return;
+        setServerPage({
+          items: result.content ?? [],
+          page: result.page ?? page,
+          size: result.size ?? storageApiPageSize,
+          totalElements: result.total_elements ?? result.content?.length ?? 0,
+          totalPages: result.total_pages ?? 1,
+        });
+      })
+      .catch((error) => {
+        if (serverPageRequestId.current !== requestId) return;
+        setServerPageError(getErrorMessage(error, '저장소 목록을 불러오지 못했어요'));
+      })
+      .finally(() => {
+        if (serverPageRequestId.current !== requestId) return;
+        setServerPageLoading(false);
+      });
+  };
+
+  useEffect(() => {
+    serverPageRequestId.current += 1;
+    setServerPage(null);
+    setServerPageError('');
+    setServerPageLoading(false);
+  }, [apiAccessToken, mode]);
+
+  useEffect(() => {
+    if (!shouldUseServerPagination || !apiAccessToken) return;
+    loadStorageServerPage(storagePage);
+  }, [apiAccessToken, mode, shouldUseServerPagination, storagePage]);
+
   useEffect(() => {
     setStoragePage(0);
   }, [mode, storageDriveFolder, storageDriveTrashFolder]);
@@ -5864,8 +6812,28 @@ function StorageScreen({
     }
   }, [selectionMode, selectedActiveItemCount]);
 
-  const openMailStorageDetail = (item: StorageMailItem) => openStorageDetail({ title: item.subtitle, meta: item.meta, source: 'mail' });
-  const openDriveStorageDetail = (item: StorageDriveItem) => openStorageDetail({ title: item.title, meta: item.subtitle, source: 'drive' });
+  const openMailStorageDetail = (item: StorageMailItem) =>
+    openStorageDetail({
+      title: item.subtitle,
+      meta: item.meta,
+      source: 'mail',
+      itemId: item.itemId,
+      externalItemId: item.externalItemId,
+      snapshotTitle: item.snapshotTitle,
+      snapshotSizeBytes: item.snapshotSizeBytes,
+      itemSource: item.itemSource,
+    });
+  const openDriveStorageDetail = (item: StorageDriveItem) =>
+    openStorageDetail({
+      title: item.title,
+      meta: item.subtitle,
+      source: 'drive',
+      itemId: item.itemId,
+      externalItemId: item.externalItemId,
+      snapshotTitle: item.snapshotTitle,
+      snapshotSizeBytes: item.snapshotSizeBytes,
+      itemSource: item.itemSource,
+    });
   const openDriveStorageItem = (item: StorageDriveItem) => {
     if (item.type === 'F' && item.fullPath) {
       setStorageDriveFolder(item.fullPath);
@@ -5932,15 +6900,25 @@ function StorageScreen({
   const getApiStorageActionItems = () =>
     selectedItems
       .filter((item) => !item.id.startsWith('storage-folder-') && !item.id.startsWith('trash-drive-folder-'))
-      .map((item) => ({
-        item_source: isDrive ? ('DRIVE' as const) : ('GMAIL' as const),
-        external_item_id: item.id
+      .map((item) => {
+        const externalItemId =
+          item.externalItemId ??
+          item.id
           .replace(/^api-storage-(?:mail|drive)-/, '')
+          .replace(/^trash-(?:mail|drive)-api-/, '')
           .replace(/^trash-drive-file-/, '')
           .replace(/^trash-mail-moved-/, '')
           .replace(/^trash-drive-moved-/, '')
-          .replace(/^storage-/, ''),
-      }));
+          .replace(/^storage-/, '');
+
+        return {
+          item_source: item.itemSource ?? (isDrive ? ('DRIVE' as const) : ('GMAIL' as const)),
+          external_item_id: externalItemId,
+          ...(item.itemId !== undefined ? { item_id: item.itemId } : {}),
+          ...(item.snapshotTitle ? { snapshot_title: item.snapshotTitle } : {}),
+          ...(item.snapshotSizeBytes !== undefined ? { snapshot_size_bytes: item.snapshotSizeBytes } : {}),
+        };
+      });
   const confirmStorageDelete = () => {
     if (!deleteConfirmChecked) {
       showToast('삭제 확인 체크가 필요합니다');
@@ -5952,9 +6930,12 @@ function StorageScreen({
     if (permanent) {
       const apiItems = getApiStorageActionItems();
       if (apiAccessToken && apiItems.length) {
-        void storageApi.permanentDelete(apiItems, { accessToken: apiAccessToken }).catch(() => {
-          showToast('백엔드 영구 삭제 요청 실패: 화면에서만 반영했어요');
-        });
+        void storageApi
+          .permanentDelete(apiItems, { accessToken: apiAccessToken })
+          .then(() => loadStorageServerPage(safeStoragePage))
+          .catch(() => {
+            showToast('백엔드 영구 삭제 요청 실패: 화면에서만 반영했어요');
+          });
       }
       setStorageDeletedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
       clearSelectionPrefix(prefix);
@@ -5966,7 +6947,7 @@ function StorageScreen({
     setStorageTrashMovedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
     clearSelectionPrefix(prefix);
     setSelectionMode(false);
-    showToast('선택 항목을 휴지통으로 이동했어요');
+    showToast(apiAccessToken ? '저장소 직접 이동 API가 없어 화면에서만 반영했어요' : '선택 항목을 휴지통으로 이동했어요');
   };
   const confirmStorageRestore = () => {
     if (!restoreConfirmChecked) {
@@ -5982,9 +6963,12 @@ function StorageScreen({
 
     closeRestoreSheet();
     if (apiAccessToken && apiItems.length) {
-      void storageApi.restore(apiItems, { accessToken: apiAccessToken }).catch(() => {
-        showToast('백엔드 복구 요청 실패: 화면에서만 반영했어요');
-      });
+      void storageApi
+        .restore(apiItems, { accessToken: apiAccessToken })
+        .then(() => loadStorageServerPage(safeStoragePage))
+        .catch(() => {
+          showToast('백엔드 복구 요청 실패: 화면에서만 반영했어요');
+        });
     }
     setStorageRestoredKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
     if (movedSourceKeys.length) {
@@ -6049,11 +7033,34 @@ function StorageScreen({
                 ))}
               </View>
               <Text style={styles.storagePathCountText}>{activeItems.length}개</Text>
+              {shouldUseServerPagination ? (
+                <View style={styles.storagePagerRow}>
+                  <Text style={styles.storagePagerText}>
+                    {pageRangeTotal}개 중 {mailPageRangeStart}~{mailPageRangeEnd}개
+                  </Text>
+                  <View style={styles.storagePagerButtons}>
+                    <Pressable
+                      style={[styles.storagePagerButton, safeStoragePage <= 0 && styles.storagePagerButtonDisabled]}
+                      disabled={safeStoragePage <= 0}
+                      onPress={() => setStoragePage((page) => Math.max(0, page - 1))}
+                    >
+                      <Text style={[styles.storagePagerGlyph, safeStoragePage <= 0 && styles.storagePagerGlyphDisabled]}>‹</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.storagePagerButton, safeStoragePage >= mailPageCount - 1 && styles.storagePagerButtonDisabled]}
+                      disabled={safeStoragePage >= mailPageCount - 1}
+                      onPress={() => setStoragePage((page) => Math.min(mailPageCount - 1, page + 1))}
+                    >
+                      <Text style={[styles.storagePagerGlyph, safeStoragePage >= mailPageCount - 1 && styles.storagePagerGlyphDisabled]}>›</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              ) : null}
             </View>
           ) : (
             <View style={[styles.storagePathCard, styles.storagePagerCard]}>
               <Text style={styles.storagePagerText}>
-                메일 {mailPagedSourceItems.length}개 중 {mailPageRangeStart}~{mailPageRangeEnd}개
+                메일 {pageRangeTotal}개 중 {mailPageRangeStart}~{mailPageRangeEnd}개
               </Text>
               <View style={styles.storagePagerButtons}>
                 <Pressable
@@ -6073,6 +7080,16 @@ function StorageScreen({
               </View>
             </View>
           )}
+          {serverPageLoading ? <Text style={styles.infoDesc}>서버 목록을 불러오는 중...</Text> : null}
+          {serverPageError ? (
+            <View style={styles.warningCard}>
+              <Text style={styles.warningText}>{serverPageError}</Text>
+              <View style={styles.twoButtons}>
+                <OutlineButton title="재시도" onPress={() => loadStorageServerPage(safeStoragePage)} half />
+                <PrimaryButton title="권한 재연결" onPress={onReconnect} half />
+              </View>
+            </View>
+          ) : null}
           {activeItems.length > 0 && selectionMode ? (
             <Pressable style={styles.storageSelectAllRowInBox} onPress={toggleAllActiveStorageItems}>
               <CheckBox checked={allChecked} onPress={toggleAllActiveStorageItems} compact />
@@ -6812,7 +7829,49 @@ function CarbonSaveAnimation({ onDone, skip }: { onDone: () => void; skip?: bool
   );
 }
 
-function StorageDetailScreen({ item }: { item: StorageDetailItem | null }) {
+function StorageDetailScreen({ item, apiAccessToken }: { item: StorageDetailItem | null; apiAccessToken: string | null }) {
+  const [apiDetail, setApiDetail] = useState<ApiStorageDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
+
+  useEffect(() => {
+    if (!item || !apiAccessToken || (!item.itemId && !item.externalItemId)) {
+      setApiDetail(null);
+      setDetailError('');
+      setDetailLoading(false);
+      return;
+    }
+
+    let active = true;
+    setDetailLoading(true);
+    setDetailError('');
+
+    const request = item.itemId
+      ? storageApi.getItemDetail(item.itemId, { accessToken: apiAccessToken })
+      : storageApi.getLiveDetail(
+          {
+            item_source: item.itemSource ?? (item.source === 'drive' ? 'DRIVE' : 'GMAIL'),
+            external_item_id: item.externalItemId!,
+          },
+          { accessToken: apiAccessToken }
+        );
+
+    void request
+      .then((detail) => {
+        if (active) setApiDetail(detail ?? null);
+      })
+      .catch((error) => {
+        if (active) setDetailError(getErrorMessage(error, '저장소 상세 정보를 불러오지 못했어요'));
+      })
+      .finally(() => {
+        if (active) setDetailLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [apiAccessToken, item?.externalItemId, item?.itemId, item?.itemSource, item?.source]);
+
   if (!item) {
     return (
       <ScreenShell title="상세 보기">
@@ -6820,6 +7879,19 @@ function StorageDetailScreen({ item }: { item: StorageDetailItem | null }) {
       </ScreenShell>
     );
   }
+
+  const detailRows = [
+    ['서버 item_id', apiDetail?.item_id ?? item.itemId],
+    ['외부 항목 ID', apiDetail?.external_item_id ?? item.externalItemId],
+    ['항목 출처', apiDetail?.item_source ?? item.itemSource],
+    ['제목', apiDetail?.title ?? item.snapshotTitle],
+    ['용량', formatBytes(apiDetail?.size_bytes ?? item.snapshotSizeBytes)],
+    ['폴더', apiDetail?.folder_path],
+    ['보낸 사람', apiDetail?.sender_email],
+    ['소유자', apiDetail?.owner_email],
+    ['수정일', apiDetail?.modified_time ? formatApiDate(apiDetail.modified_time) : undefined],
+    ['휴지통 여부', apiDetail?.is_trashed === undefined ? undefined : apiDetail.is_trashed ? '예' : '아니오'],
+  ].filter(([, value]) => value !== undefined && value !== null && value !== '');
 
   return (
     <ScreenShell title="상세 보기">
@@ -6830,6 +7902,20 @@ function StorageDetailScreen({ item }: { item: StorageDetailItem | null }) {
       <View style={styles.detailInfoBox}>
         <Text style={styles.detailInfoTitle}>메타데이터</Text>
         <Text style={styles.detailInfoText}>{item.meta}</Text>
+      </View>
+      <View style={styles.detailInfoBox}>
+        <Text style={styles.detailInfoTitle}>서버 상세 정보</Text>
+        {detailLoading ? <Text style={styles.detailInfoText}>상세 정보를 불러오는 중...</Text> : null}
+        {detailRows.length ? (
+          detailRows.map(([label, value]) => (
+            <Text key={label} style={styles.detailInfoText}>
+              {label}: {formatUnknownValue(value)}
+            </Text>
+          ))
+        ) : !detailLoading ? (
+          <Text style={styles.detailInfoText}>서버 상세 정보가 아직 없어요.</Text>
+        ) : null}
+        {detailError ? <Text style={styles.warningText}>{detailError}</Text> : null}
       </View>
     </ScreenShell>
   );
