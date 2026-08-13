@@ -26,7 +26,6 @@ import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
 import { LineChart } from 'react-native-chart-kit';
 import Constants from 'expo-constants';
 import * as Device from 'expo-device';
-import * as Notifications from 'expo-notifications';
 import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
 import { DEV_AURA_ACCESS_TOKEN, GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
@@ -109,12 +108,19 @@ type Screen =
 type MainTab = 'home' | 'storage' | 'trash' | 'history' | 'settings';
 
 type GoogleSignInModule = typeof import('@react-native-google-signin/google-signin');
+type NotificationsModule = typeof import('expo-notifications');
 
 let googleSignInModulePromise: Promise<GoogleSignInModule> | null = null;
+let notificationsModulePromise: Promise<NotificationsModule> | null = null;
 
 const loadGoogleSignInModule = () => {
   googleSignInModulePromise ??= import('@react-native-google-signin/google-signin');
   return googleSignInModulePromise;
+};
+
+const loadNotificationsModule = () => {
+  notificationsModulePromise ??= import('expo-notifications');
+  return notificationsModulePromise;
 };
 type FloatingButtonVariant = 'scan' | 'delete' | 'trash' | 'restore';
 type FloatingAction = { variant: Exclude<FloatingButtonVariant, 'scan'>; onPress: () => void; small?: boolean };
@@ -257,6 +263,11 @@ const getAuraDeviceId = () => {
 const getAuraAppVersion = () => {
   const constants = Constants as unknown as { expoConfig?: { version?: string } };
   return constants.expoConfig?.version;
+};
+
+const isAndroidExpoGo = () => {
+  const constants = Constants as unknown as { appOwnership?: string | null };
+  return Platform.OS === 'android' && constants.appOwnership === 'expo';
 };
 
 const getErrorMessage = (error: unknown, fallback: string) => {
@@ -1834,11 +1845,21 @@ export default function App() {
   };
 
   const registerFcmTokenWithServer = async () => {
-    if (!apiAccessToken || !permissions.alarm || Platform.OS === 'web' || fcmRegistrationInFlight.current) return;
+    if (
+      !apiAccessToken ||
+      !permissions.alarm ||
+      Platform.OS === 'web' ||
+      isAndroidExpoGo() ||
+      fcmRegistrationInFlight.current
+    ) {
+      return;
+    }
 
     fcmRegistrationInFlight.current = true;
     try {
       if (!Device.isDevice) return;
+
+      const Notifications = await loadNotificationsModule();
 
       if (Platform.OS === 'android') {
         await Notifications.setNotificationChannelAsync('aura-default', {
