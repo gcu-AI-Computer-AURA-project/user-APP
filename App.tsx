@@ -1,5 +1,6 @@
 import React, { useContext, useEffect, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   Animated,
   BackHandler,
@@ -40,16 +41,20 @@ import {
   statisticsApi,
   storageApi,
   type ApiAnnouncement,
+  type ApiAnalysisSummary,
   type ApiCandidate,
   type ApiCandidateDetail,
   type ApiCandidateSelectionStatus,
+  type ApiCleanupHistoryItem,
   type ApiCleanupJob,
   type ApiDriveFolder,
   type ApiHomeSummary,
   type ApiMonthlyStatistic,
+  type ApiPage,
   type ApiScanHistoryItem,
   type ApiScanJob,
   type ApiScanSetting,
+  type ApiStatisticsSummary,
   type ApiStorageDetail,
   type ApiStorageItem,
 } from './src/api/features';
@@ -160,6 +165,11 @@ type StorageServerPageState = {
   size: number;
   totalElements: number;
   totalPages: number;
+};
+const storageServerPageCache: Record<string, StorageServerPageState> = {};
+
+const clearStorageServerPageCache = () => {
+  Object.keys(storageServerPageCache).forEach((key) => delete storageServerPageCache[key]);
 };
 type StorageDriveMoveTargets = Record<string, string>;
 type DriveFolderOption = { id?: string; name: string; meta?: string; parentId?: string };
@@ -696,9 +706,143 @@ function apiStorageItemToMail(item: ApiStorageItem): StorageMailItem {
   };
 }
 
+function getApiMetadataString(item: ApiStorageItem, key: string) {
+  const value = item.metadata?.[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function normalizeApiDrivePath(path?: string | null) {
+  const raw = path?.trim();
+  if (!raw || raw === '/' || raw === driveRootPath) return driveRootPath;
+  if (raw.startsWith(driveRootPath)) {
+    return raw.replace(/\s*>\s*/g, ' › ').replace(/\s*›\s*/g, ' › ');
+  }
+
+  const normalized = raw
+    .replace(/[\\/]+/g, ' › ')
+    .replace(/\s*>\s*/g, ' › ')
+    .replace(/\s*›\s*/g, ' › ')
+    .replace(/^내\s*Drive\s*›\s*/i, '')
+    .replace(/^Drive\s*›\s*/i, '')
+    .trim();
+
+  return normalized ? `${driveRootPath} › ${normalized}` : driveRootPath;
+}
+
+function isApiStorageFolder(item: ApiStorageItem) {
+  return item.is_folder === true || item.item_type === 'FOLDER' || item.mime_type === 'application/vnd.google-apps.folder';
+}
+
+function getApiStorageFolderPath(item: ApiStorageItem) {
+  return normalizeApiDrivePath(item.folder_path ?? getApiMetadataString(item, 'folder_path') ?? getApiMetadataString(item, 'path'));
+}
+
+function apiDriveFolderToStorageItem(folder: DriveFolderOption): StorageDriveItem {
+  const fullPath = normalizeApiDrivePath(folder.name);
+  const parts = fullPath.split('›').map((part) => part.trim()).filter(Boolean);
+  const title = parts[parts.length - 1] ?? folder.name ?? 'Drive';
+  const parentPath = normalizeApiDrivePath(folder.parentId);
+
+  return {
+    id: `api-storage-folder-${folder.id ?? fullPath}`,
+    externalItemId: folder.id,
+    itemSource: 'DRIVE',
+    type: 'F',
+    title,
+    subtitle: `${parentPath} · 폴더`,
+    fullPath,
+  };
+}
+
+function dedupeStorageDriveItems(items: StorageDriveItem[]) {
+  const map = new Map<string, StorageDriveItem>();
+  items.forEach((item) => {
+    map.set(item.externalItemId ?? item.fullPath ?? item.id, item);
+  });
+  return Array.from(map.values());
+}
+
+function isCompletedScanStatus(status?: string | null) {
+  return status === 'COMPLETED' || status === 'PARTIAL_FAILED';
+}
+
+async function fetchAllScanCandidates(scanJobId: number, accessToken: string) {
+  const collected: ApiCandidate[] = [];
+
+  for (let page = 0; page < 50; page += 1) {
+    const result = await scanApi.getCandidates(scanJobId, { include_protected: true, page, size: 200 }, { accessToken });
+    const content = result.content ?? [];
+    collected.push(...content);
+
+    if (result.total_pages !== undefined && page + 1 >= result.total_pages) break;
+    if (content.length < 200) break;
+  }
+
+  return collected;
+}
+
+function normalizeServerDrivePath(path?: string | null) {
+  const raw = path?.trim();
+  if (!raw || raw === '/' || raw === driveRootPath) return driveRootPath;
+
+  const parts = raw
+    .replace(/[\\/]+/g, '›')
+    .replace(/\s*>\s*/g, '›')
+    .replace(/\s*›\s*/g, '›')
+    .split('›')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .filter((part, index) => !(index === 0 && /^(내\s*)?drive$/i.test(part)));
+
+  return parts.length ? `${driveRootPath} › ${parts.join(' › ')}` : driveRootPath;
+}
+
+function apiDriveFolderToStorageItemFromApi(folder: DriveFolderOption): StorageDriveItem {
+  const fullPath = normalizeServerDrivePath(folder.name);
+  const parts = splitDrivePath(fullPath);
+  const title = parts[parts.length - 1] ?? folder.name ?? 'Drive';
+  const parentPath = normalizeServerDrivePath(folder.parentId);
+
+  return {
+    id: `api-storage-folder-${folder.id ?? fullPath}`,
+    externalItemId: folder.id,
+    itemSource: 'DRIVE',
+    type: 'F',
+    title,
+    subtitle: `${parentPath} · 폴더`,
+    fullPath,
+  };
+}
+
+function apiStorageItemToDriveFromApi(item: ApiStorageItem, folders: DriveFolderOption[] = []): StorageDriveItem {
+  const isFolder = isApiStorageFolder(item);
+  const extension = isFolder ? 'F' : (item.file_extension || item.mime_type || 'FILE').replace(/^\./, '').toUpperCase();
+  const date = formatApiDateOnly(item.modified_time || item.last_opened_time || item.trashed_at || item.created_time);
+  const metadataPath = item.folder_path ?? getApiMetadataString(item, 'folder_path') ?? getApiMetadataString(item, 'path');
+  const parentFolder = item.parent_folder_id ? folders.find((folder) => folder.id === item.parent_folder_id) : undefined;
+  const parentPath = normalizeServerDrivePath(metadataPath ?? parentFolder?.name ?? driveRootPath);
+  const title = item.title || item.external_item_id || (isFolder ? 'Drive 폴더' : 'Drive 파일');
+
+  return {
+    id: `api-storage-drive-${item.item_id ?? item.external_item_id ?? title}`,
+    itemId: item.item_id,
+    externalItemId: item.external_item_id,
+    snapshotTitle: title,
+    snapshotSizeBytes: item.size_bytes,
+    itemSource: item.item_source ?? 'DRIVE',
+    type: extension || 'FILE',
+    title,
+    subtitle: isFolder ? `${parentPath} · 폴더` : `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · Drive`,
+    fullPath: isFolder ? normalizeServerDrivePath(`${parentPath} › ${title}`) : parentPath,
+  };
+}
+
 function apiStorageItemToDrive(item: ApiStorageItem): StorageDriveItem {
-  const extension = (item.file_extension || item.mime_type || 'FILE').replace(/^\./, '').toUpperCase();
-  const date = formatApiDateOnly(item.modified_time || item.last_opened_time || item.trashed_at);
+  const isFolder = isApiStorageFolder(item);
+  const extension = isFolder ? 'F' : (item.file_extension || item.mime_type || 'FILE').replace(/^\./, '').toUpperCase();
+  const date = formatApiDateOnly(item.modified_time || item.last_opened_time || item.trashed_at || item.created_time);
+  const parentPath = getApiStorageFolderPath(item);
+  const title = item.title || item.external_item_id || (isFolder ? 'Drive 폴더' : 'Drive 파일');
   return {
     id: `api-storage-drive-${item.item_id ?? item.external_item_id ?? item.title}`,
     itemId: item.item_id,
@@ -709,7 +853,7 @@ function apiStorageItemToDrive(item: ApiStorageItem): StorageDriveItem {
     type: extension || 'FILE',
     title: item.title || item.external_item_id || 'Drive 파일',
     subtitle: `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · Drive`,
-    fullPath: driveRootPath,
+    fullPath: isFolder ? normalizeApiDrivePath(`${parentPath} › ${title}`) : parentPath,
   };
 }
 
@@ -775,7 +919,9 @@ function buildApiScanSummary(params: {
   const mailItems = candidateItems.filter((item) => item.source === 'mail');
   const driveItems = candidateItems.filter((item) => item.source === 'drive');
   const largeItems = driveItems.filter((item) => item.sizeMB >= 500);
-  const protectedItems = candidateItems.filter((item) => item.desc?.includes('보호'));
+  const protectedItems = (params.candidates ?? [])
+    .filter((candidate) => candidate.is_protected || candidate.category === 'PROTECTED')
+    .map(apiCandidateToScanItem);
   const totalSizeMB =
     params.estimatedBytes !== undefined
       ? bytesToMB(params.estimatedBytes)
@@ -1148,6 +1294,11 @@ export default function App() {
   const [apiStorageSummary, setApiStorageSummary] = useState<ScanSummary | null>(null);
   const [apiScanHistoryItems, setApiScanHistoryItems] = useState<ApiScanHistoryItem[]>([]);
   const [apiMonthlyStats, setApiMonthlyStats] = useState<ApiMonthlyStatistic[]>([]);
+  const [apiStatisticsSummary, setApiStatisticsSummary] = useState<ApiStatisticsSummary | null>(null);
+  const [apiCleanupHistoryItems, setApiCleanupHistoryItems] = useState<ApiCleanupHistoryItem[]>([]);
+  const [apiBootstrapLoading, setApiBootstrapLoading] = useState(false);
+  const [googlePermissionChecking, setGooglePermissionChecking] = useState(false);
+  const [candidateSummaryLoading, setCandidateSummaryLoading] = useState(false);
   const [apiScanSetting, setApiScanSetting] = useState<ApiScanSetting | null>(null);
   const [apiAnnouncements, setApiAnnouncements] = useState<ApiAnnouncement[]>([]);
   const [announcementLoading, setAnnouncementLoading] = useState(false);
@@ -1181,8 +1332,10 @@ export default function App() {
   const scanResultRef = useRef<ScanSummary>(emptyScanSummary);
   const activeApiScanJobId = useRef<number | null>(null);
   const activeApiCleanupJobId = useRef<number | null>(null);
+  const candidateSummaryLoadAttemptedScanId = useRef<number | null>(null);
   const fcmRegistrationInFlight = useRef(false);
   const registeredFcmTokenRef = useRef('');
+  const loadedDriveFolderPaths = useRef<Set<string>>(new Set());
   const [withdrawSheetVisible, setWithdrawSheetVisible] = useState(false);
   const [filterSheetVisible, setFilterSheetVisible] = useState(false);
   const [carbonHelpVisible, setCarbonHelpVisible] = useState(false);
@@ -1617,6 +1770,9 @@ export default function App() {
     setApiStorageSummary(null);
     setApiScanHistoryItems([]);
     setApiMonthlyStats([]);
+    setApiStatisticsSummary(null);
+    setApiCleanupHistoryItems([]);
+    setApiBootstrapLoading(false);
     setApiScanSetting(null);
     setApiAnnouncements([]);
     setAnnouncementLoading(false);
@@ -1740,7 +1896,7 @@ export default function App() {
     }
   };
 
-  const getActiveDriveFolderOptions = () => (apiDriveFolderOptions.length ? apiDriveFolderOptions : driveFolderOptions);
+  const getActiveDriveFolderOptions = () => (apiAccessToken ? apiDriveFolderOptions : driveFolderOptions);
 
   const getSelectedDriveFolderId = () =>
     selectedDriveFolders.map((folderPath) => apiDriveFolderIdsByPath[folderPath]).find(Boolean) ?? selectedDriveFolders[0];
@@ -1768,6 +1924,7 @@ export default function App() {
 
   const loadApiDriveFolders = async (parentPath = driveCurrentFolder) => {
     if (!apiAccessToken) return;
+    if (loadedDriveFolderPaths.current.has(parentPath)) return;
 
     const parentId = parentPath === driveRootPath ? undefined : apiDriveFolderIdsByPath[parentPath];
     if (parentPath !== driveRootPath && !parentId) return;
@@ -1779,15 +1936,16 @@ export default function App() {
       const response = await scanApi.getDriveFolders({ parent_id: parentId, size: 50 }, { accessToken: apiAccessToken });
       const folders = (response.folders ?? []).filter((folder): folder is ApiDriveFolder & { name: string } => Boolean(folder.name));
       const nextFolders = folders.map((folder) => {
-        const path = parentPath === driveRootPath ? `${driveRootPath} › ${folder.name}` : `${parentPath} › ${folder.name}`;
+        const path = normalizeServerDrivePath(parentPath === driveRootPath ? `${driveRootPath} › ${folder.name}` : `${parentPath} › ${folder.name}`);
         return {
           id: folder.folder_id,
-          parentId: folder.parent_id,
+          parentId: parentPath,
           name: path,
           meta: folder.modified_time ? `수정 ${formatApiDateOnly(folder.modified_time)}` : 'Google Drive 폴더',
         };
       });
       mergeDriveFolderOptions(nextFolders);
+      loadedDriveFolderPaths.current.add(parentPath);
     } catch {
       setDriveFolderError('Drive 폴더를 불러오지 못했어요. Google Drive 권한을 다시 연결하거나 재시도해주세요.');
     } finally {
@@ -1801,6 +1959,7 @@ export default function App() {
       return;
     }
 
+    setGooglePermissionChecking(true);
     try {
       const response = await googleApi.recheckPermissions({ accessToken: apiAccessToken });
       const nextPermissions = response.permissions ?? [];
@@ -1814,15 +1973,18 @@ export default function App() {
       showToast('Google 권한 상태를 다시 확인했어요');
     } catch {
       showToast('Google 권한 상태 확인에 실패했어요');
+    } finally {
+      setGooglePermissionChecking(false);
     }
   };
 
   const requestGoogleReconnect = async (serviceTypes: Array<'GMAIL' | 'DRIVE'>) => {
     if (!apiAccessToken) {
-      go(serviceTypes[0] === 'GMAIL' ? 'gmailPermission' : 'drivePermission');
+      showToast('로그인 후 Google 권한을 다시 연결할 수 있어요');
       return;
     }
 
+    setGooglePermissionChecking(true);
     try {
       const response = await googleApi.createReconnectUrl(
         {
@@ -1838,9 +2000,11 @@ export default function App() {
       }
 
       await Linking.openURL(response.auth_url);
-      void refreshGooglePermissions();
+      setTimeout(() => void refreshGooglePermissions(), 1200);
     } catch {
       showToast('Google 권한 재연결을 시작하지 못했어요');
+    } finally {
+      setGooglePermissionChecking(false);
     }
   };
 
@@ -1961,120 +2125,173 @@ export default function App() {
   };
 
   const refreshAuraApis = async (token: string) => {
+    setApiBootstrapLoading(true);
     const options = { accessToken: token };
-    const [
-      homeResult,
-      googlePermissionsResult,
-      notificationSettingsResult,
-      scanSettingsResult,
-      runningScanResult,
-      scanHistoryResult,
-      statisticsSummaryResult,
-      monthlyStatsResult,
-      mailStorageResult,
-      driveStorageResult,
-      mailTrashResult,
-      driveTrashResult,
-    ] = await Promise.allSettled([
-      homeApi.getSummary(options),
-      googleApi.getPermissions(options),
-      notificationApi.getSettings(options),
-      scanApi.getSettings(options),
-      scanApi.getRunning(options),
-      scanApi.getHistory({ page: 0, size: 20 }, options),
-      statisticsApi.getSummary(options),
-      statisticsApi.getMonthly(undefined, options),
-      storageApi.getItems({ item_source: 'GMAIL', page: 0, size: 50 }, options),
-      storageApi.getItems({ item_source: 'DRIVE', page: 0, size: 50 }, options),
-      storageApi.getTrash({ item_source: 'GMAIL', page: 0, size: 50 }, options),
-      storageApi.getTrash({ item_source: 'DRIVE', page: 0, size: 50 }, options),
-    ]);
 
-    const homeSummary = homeResult.status === 'fulfilled' ? homeResult.value : null;
-    const scanHistory = scanHistoryResult.status === 'fulfilled' ? scanHistoryResult.value.content ?? [] : [];
-    const storageMail = mailStorageResult.status === 'fulfilled' ? mailStorageResult.value.content ?? [] : [];
-    const storageDrive = driveStorageResult.status === 'fulfilled' ? driveStorageResult.value.content ?? [] : [];
-    const trashMail = mailTrashResult.status === 'fulfilled' ? mailTrashResult.value.content ?? [] : [];
-    const trashDrive = driveTrashResult.status === 'fulfilled' ? driveTrashResult.value.content ?? [] : [];
-    const latestHistory = scanHistory[0];
-    const latestScan = homeSummary?.latest_scan;
-    const latestCleanup = homeSummary?.latest_cleanup;
-    const estimatedBytes = latestScan?.estimated_reclaim_bytes ?? latestHistory?.estimated_reclaim_bytes ?? homeSummary?.storage_summary?.estimated_reclaim_bytes;
-    const candidateCount = latestScan?.candidate_count ?? latestHistory?.candidate_count;
-    const completedAt = latestScan?.completed_at ?? latestHistory?.created_at ?? latestScan?.started_at;
-    const source = latestScan?.scan_source ?? latestHistory?.scan_source;
-    const apiSummary = buildApiScanSummary({
-      storageMailItems: storageMail,
-      storageDriveItems: storageDrive,
-      trashMailItems: [...trashMail, ...trashDrive],
-      estimatedBytes,
-      candidateCount,
-      carbonGrams: latestCleanup?.estimated_carbon_grams ?? latestHistory?.estimated_carbon_grams ?? homeSummary?.storage_summary?.total_estimated_carbon_grams,
-    });
+    try {
+      const [
+        homeResult,
+        googlePermissionsResult,
+        notificationSettingsResult,
+        scanSettingsResult,
+        runningScanResult,
+        scanHistoryResult,
+        statisticsSummaryResult,
+        monthlyStatsResult,
+        cleanupHistoriesResult,
+        mailStorageResult,
+        driveStorageResult,
+        mailTrashResult,
+        driveTrashResult,
+      ] = await Promise.allSettled([
+        homeApi.getSummary(options),
+        googleApi.getPermissions(options),
+        notificationApi.getSettings(options),
+        scanApi.getSettings(options),
+        scanApi.getRunning(options),
+        scanApi.getHistory({ page: 0, size: 20 }, options),
+        statisticsApi.getSummary(options),
+        statisticsApi.getMonthly(undefined, options),
+        statisticsApi.getCleanupHistories({ page: 0, size: 20 }, options),
+        storageApi.getItems({ item_source: 'GMAIL', page: 0, size: 20 }, options),
+        storageApi.getItems({ item_source: 'DRIVE', page: 0, size: 20 }, options),
+        storageApi.getTrash({ item_source: 'GMAIL', page: 0, size: 20 }, options),
+        storageApi.getTrash({ item_source: 'DRIVE', page: 0, size: 20 }, options),
+      ]);
 
-    setApiHomeSummary(homeSummary);
-    setApiStorageSummary(apiSummary);
-    setApiScanHistoryItems(scanHistory);
+      const homeSummary = homeResult.status === 'fulfilled' ? homeResult.value : null;
+      const scanHistory = scanHistoryResult.status === 'fulfilled' ? scanHistoryResult.value.content ?? [] : [];
+      const storageMail = mailStorageResult.status === 'fulfilled' ? mailStorageResult.value.content ?? [] : [];
+      const storageDrive = driveStorageResult.status === 'fulfilled' ? driveStorageResult.value.content ?? [] : [];
+      const trashMail = mailTrashResult.status === 'fulfilled' ? mailTrashResult.value.content ?? [] : [];
+      const trashDrive = driveTrashResult.status === 'fulfilled' ? driveTrashResult.value.content ?? [] : [];
+      const saveStoragePageCache = (key: string, result: PromiseSettledResult<ApiPage<ApiStorageItem>>) => {
+        if (result.status !== 'fulfilled') return;
 
-    if (homeSummary?.permissions) {
-      setPermissions((items) => ({
-        ...items,
-        gmail: homeSummary.permissions?.gmail_status === 'CONNECTED',
-        drive: homeSummary.permissions?.drive_status === 'CONNECTED',
-      }));
-    }
+        storageServerPageCache[key] = {
+          items: result.value.content ?? [],
+          page: result.value.page ?? 0,
+          size: result.value.size ?? 20,
+          totalElements: result.value.total_elements ?? result.value.content?.length ?? 0,
+          totalPages: result.value.total_pages ?? 1,
+        };
+      };
 
-    if (googlePermissionsResult.status === 'fulfilled') {
-      const nextPermissions = googlePermissionsResult.value.permissions ?? [];
-      const gmail = nextPermissions.find((permission) => permission.service_type === 'GMAIL');
-      const drive = nextPermissions.find((permission) => permission.service_type === 'DRIVE');
-      setPermissions((items) => ({
-        ...items,
-        gmail: gmail ? gmail.permission_status === 'CONNECTED' : items.gmail,
-        drive: drive ? drive.permission_status === 'CONNECTED' : items.drive,
-      }));
-    }
+      saveStoragePageCache(`${token}:storageMail:GMAIL:0`, mailStorageResult);
+      saveStoragePageCache(`${token}:storageDrive:DRIVE:0`, driveStorageResult);
+      saveStoragePageCache(`${token}:storageTrash:GMAIL:0`, mailTrashResult);
+      saveStoragePageCache(`${token}:storageDriveTrash:DRIVE:0`, driveTrashResult);
+      const latestCompletedHistory = scanHistory.find((item) => isCompletedScanStatus(item.job_status));
+      const latestHistory = latestCompletedHistory ?? scanHistory[0];
+      const latestScan = homeSummary?.latest_scan;
+      const latestCleanup = homeSummary?.latest_cleanup;
+      const latestScanForResult = isCompletedScanStatus(latestScan?.job_status) ? latestScan : latestCompletedHistory;
+      const latestScanId = latestScanForResult?.scan_job_id ?? latestHistory?.scan_job_id;
+      const latestScanStatus = latestScanForResult?.job_status ?? latestHistory?.job_status;
+      let latestAnalysisSummary: ApiAnalysisSummary | null = null;
+      let latestCandidates: ApiCandidate[] = [];
 
-    if (notificationSettingsResult.status === 'fulfilled') {
-      setSettingsToggles((items) => ({
-        ...items,
-        scanComplete: Boolean(notificationSettingsResult.value.is_scan_complete_enabled),
-        aiNudge: Boolean(notificationSettingsResult.value.is_scan_recommend_enabled),
-      }));
-      setPermissions((items) => ({
-        ...items,
-        alarm: Boolean(notificationSettingsResult.value.is_scan_complete_enabled || notificationSettingsResult.value.is_scan_recommend_enabled),
-      }));
-    }
+      if (latestScanId && isCompletedScanStatus(latestScanStatus)) {
+        const [analysisSummaryResult, candidatesResult] = await Promise.allSettled([
+          scanApi.getAnalysisSummary(latestScanId, options),
+          fetchAllScanCandidates(latestScanId, token),
+        ]);
+        latestAnalysisSummary = analysisSummaryResult.status === 'fulfilled' ? analysisSummaryResult.value : null;
+        latestCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value : [];
+      }
 
-    if (scanSettingsResult.status === 'fulfilled') {
-      applyApiScanSetting(scanSettingsResult.value);
-    }
-
-    if (monthlyStatsResult.status === 'fulfilled') {
-      setApiMonthlyStats(monthlyStatsResult.value.months ?? []);
-    }
-
-    if (runningScanResult.status === 'fulfilled' && runningScanResult.value.scan_job) {
-      setHomeScanNotice('running');
-      setScanProgress(Math.round(runningScanResult.value.scan_job.progress_percent ?? 0));
-      setApiScanJobId(runningScanResult.value.scan_job.scan_job_id ?? null);
-      activeApiScanJobId.current = runningScanResult.value.scan_job.scan_job_id ?? null;
-      scanSourceLabelRef.current = apiScanSourceLabel(runningScanResult.value.scan_job.scan_source);
-    }
-
-    if (latestScan || latestHistory || storageMail.length || storageDrive.length) {
-      setLastScan({
-        dateLabel: formatApiDate(completedAt ?? latestCleanup?.completed_at),
-        sourceLabel: apiScanSourceLabel(source),
-        conditionLabel: apiScanSetting ? getPeriodLabel() : 'Swagger API 기준',
-        result: apiSummary,
+      const estimatedBytes =
+        latestAnalysisSummary?.total_estimated_reclaim_bytes ??
+        latestScanForResult?.estimated_reclaim_bytes ??
+        latestHistory?.estimated_reclaim_bytes ??
+        homeSummary?.storage_summary?.estimated_reclaim_bytes;
+      const candidateCount = latestAnalysisSummary?.total_candidate_count ?? latestScanForResult?.candidate_count ?? latestHistory?.candidate_count;
+      const latestScanCompletedAt =
+        latestScanForResult && 'completed_at' in latestScanForResult ? latestScanForResult.completed_at : undefined;
+      const latestScanStartedAt =
+        latestScanForResult && 'started_at' in latestScanForResult ? latestScanForResult.started_at : undefined;
+      const completedAt = latestScanCompletedAt ?? latestHistory?.created_at ?? latestScanStartedAt;
+      const source = latestScanForResult?.scan_source ?? latestHistory?.scan_source;
+      const apiSummary = buildApiScanSummary({
+        candidates: latestCandidates,
+        storageMailItems: storageMail,
+        storageDriveItems: storageDrive,
+        trashMailItems: [...trashMail, ...trashDrive],
+        estimatedBytes,
+        candidateCount,
+        carbonGrams: latestCleanup?.estimated_carbon_grams ?? latestHistory?.estimated_carbon_grams ?? homeSummary?.storage_summary?.total_estimated_carbon_grams,
       });
-      setHasCompletedScan(Boolean(latestScan || latestHistory));
-    }
 
-    if (statisticsSummaryResult.status === 'rejected') {
-      // 통계 API가 아직 토큰/데이터 문제로 실패해도 기존 화면을 유지한다.
+      setApiHomeSummary(homeSummary);
+      setApiStorageSummary(apiSummary);
+      setApiScanHistoryItems(scanHistory);
+      setApiStatisticsSummary(statisticsSummaryResult.status === 'fulfilled' ? statisticsSummaryResult.value : null);
+      setApiCleanupHistoryItems(cleanupHistoriesResult.status === 'fulfilled' ? cleanupHistoriesResult.value.content ?? [] : []);
+
+      if (homeSummary?.permissions) {
+        setPermissions((items) => ({
+          ...items,
+          gmail: homeSummary.permissions?.gmail_status === 'CONNECTED',
+          drive: homeSummary.permissions?.drive_status === 'CONNECTED',
+        }));
+      }
+
+      if (googlePermissionsResult.status === 'fulfilled') {
+        const nextPermissions = googlePermissionsResult.value.permissions ?? [];
+        const gmail = nextPermissions.find((permission) => permission.service_type === 'GMAIL');
+        const drive = nextPermissions.find((permission) => permission.service_type === 'DRIVE');
+        setPermissions((items) => ({
+          ...items,
+          gmail: gmail ? gmail.permission_status === 'CONNECTED' : items.gmail,
+          drive: drive ? drive.permission_status === 'CONNECTED' : items.drive,
+        }));
+      }
+
+      if (notificationSettingsResult.status === 'fulfilled') {
+        setSettingsToggles((items) => ({
+          ...items,
+          scanComplete: Boolean(notificationSettingsResult.value.is_scan_complete_enabled),
+          aiNudge: Boolean(notificationSettingsResult.value.is_scan_recommend_enabled),
+        }));
+        setPermissions((items) => ({
+          ...items,
+          alarm: Boolean(notificationSettingsResult.value.is_scan_complete_enabled || notificationSettingsResult.value.is_scan_recommend_enabled),
+        }));
+      }
+
+      if (scanSettingsResult.status === 'fulfilled') {
+        applyApiScanSetting(scanSettingsResult.value);
+      }
+
+      if (monthlyStatsResult.status === 'fulfilled') {
+        setApiMonthlyStats(monthlyStatsResult.value.months ?? []);
+      }
+
+      if (runningScanResult.status === 'fulfilled' && runningScanResult.value.scan_job) {
+        setHomeScanNotice('running');
+        setScanProgress(Math.round(runningScanResult.value.scan_job.progress_percent ?? 0));
+        setApiScanJobId(runningScanResult.value.scan_job.scan_job_id ?? null);
+        activeApiScanJobId.current = runningScanResult.value.scan_job.scan_job_id ?? null;
+        scanSourceLabelRef.current = apiScanSourceLabel(runningScanResult.value.scan_job.scan_source);
+      } else if (latestScanId && isCompletedScanStatus(latestScanStatus)) {
+        setApiScanJobId(latestScanId);
+        activeApiScanJobId.current = latestScanId;
+      }
+
+      if (latestScanForResult || latestHistory) {
+        setLastScan({
+          dateLabel: formatApiDate(completedAt ?? latestCleanup?.completed_at),
+          sourceLabel: apiScanSourceLabel(source),
+          conditionLabel: apiScanSetting ? getPeriodLabel() : 'Swagger API 기준',
+          result: apiSummary,
+        });
+        setHasCompletedScan(isCompletedScanStatus(latestScanStatus));
+      } else if (!homeSummary?.has_running_scan) {
+        setLastScan(null);
+        setHasCompletedScan(false);
+      }
+    } finally {
+      setApiBootstrapLoading(false);
     }
   };
 
@@ -2392,7 +2609,162 @@ export default function App() {
     replace('candidateSummary');
   };
 
-  const getCurrentScanResult = () => lastScan?.result ?? scanResultRef.current;
+  const getCurrentScanResult = () => apiStorageSummary ?? lastScan?.result ?? (apiAccessToken ? emptyScanSummary : scanResultRef.current);
+
+  const getLatestCompletedScanJobId = () => {
+    const latestScan = apiHomeSummary?.latest_scan;
+    if (latestScan?.scan_job_id && isCompletedScanStatus(latestScan.job_status)) {
+      return latestScan.scan_job_id;
+    }
+
+    return apiScanHistoryItems.find((item) => item.scan_job_id && isCompletedScanStatus(item.job_status))?.scan_job_id ?? null;
+  };
+
+  const applyApiCandidateSummary = (
+    scanJobId: number,
+    analysisSummary: ApiAnalysisSummary | null,
+    candidates: ApiCandidate[]
+  ) => {
+    const latestScan = apiHomeSummary?.latest_scan?.scan_job_id === scanJobId ? apiHomeSummary.latest_scan : undefined;
+    const historyItem =
+      apiScanHistoryItems.find((item) => item.scan_job_id === scanJobId) ??
+      apiScanHistoryItems.find((item) => isCompletedScanStatus(item.job_status));
+    const previousSummary = apiStorageSummary ?? emptyScanSummary;
+    const estimatedBytes =
+      analysisSummary?.total_estimated_reclaim_bytes ??
+      latestScan?.estimated_reclaim_bytes ??
+      historyItem?.estimated_reclaim_bytes ??
+      apiHomeSummary?.storage_summary?.estimated_reclaim_bytes;
+    const candidateCount =
+      analysisSummary?.total_candidate_count ??
+      latestScan?.candidate_count ??
+      historyItem?.candidate_count ??
+      candidates.length;
+    const candidateSummary = buildApiScanSummary({
+      candidates,
+      estimatedBytes,
+      candidateCount,
+      carbonGrams:
+        apiHomeSummary?.latest_cleanup?.estimated_carbon_grams ??
+        historyItem?.estimated_carbon_grams ??
+        apiHomeSummary?.storage_summary?.total_estimated_carbon_grams,
+    });
+    const nextSummary: ScanSummary = {
+      ...candidateSummary,
+      storageMailItems: previousSummary.storageMailItems,
+      storageDriveItems: previousSummary.storageDriveItems,
+      storageTrashItems: previousSummary.storageTrashItems,
+    };
+
+    scanResultRef.current = nextSummary;
+    setApiStorageSummary(nextSummary);
+    setApiScanJobId(scanJobId);
+    activeApiScanJobId.current = scanJobId;
+    setChecked((items) => {
+      const next = { ...items };
+      [...nextSummary.mailItems, ...nextSummary.driveItems].forEach((item) => {
+        const prefix = item.source === 'mail' ? 'mail' : 'drive';
+        const defaultSelected =
+          item.selectionStatus === 'DESELECTED'
+            ? false
+            : item.selectionStatus === 'NONE'
+              ? isDefaultCandidateSelected(prefix, item.id)
+              : true;
+        next[`${prefix}:${item.id}`] = defaultSelected;
+      });
+      return next;
+    });
+    setLastScan({
+      dateLabel: formatApiDate(latestScan?.completed_at ?? latestScan?.started_at ?? historyItem?.created_at),
+      sourceLabel: apiScanSourceLabel(latestScan?.scan_source ?? historyItem?.scan_source),
+      conditionLabel: apiScanSetting ? getPeriodLabel() : 'API 기준',
+      result: nextSummary,
+    });
+    setHasCompletedScan(true);
+  };
+
+  const loadLatestCandidateSummary = async () => {
+    if (!apiAccessToken || candidateSummaryLoading) return false;
+
+    const scanJobId = getLatestCompletedScanJobId();
+    if (!scanJobId) return false;
+
+    setCandidateSummaryLoading(true);
+    try {
+      const [analysisSummaryResult, candidatesResult] = await Promise.allSettled([
+        scanApi.getAnalysisSummary(scanJobId, { accessToken: apiAccessToken }),
+        fetchAllScanCandidates(scanJobId, apiAccessToken),
+      ]);
+      const analysisSummary = analysisSummaryResult.status === 'fulfilled' ? analysisSummaryResult.value : null;
+      const candidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value : [];
+      const candidateFetchFailed = candidatesResult.status === 'rejected';
+
+      if (candidateFetchFailed) {
+        showToast('분석 후보 목록을 불러오지 못했어요', undefined, 2600);
+        return false;
+      }
+
+      if (!analysisSummary && !candidates.length) {
+        showToast('분석 결과를 불러오지 못했어요', undefined, 2600);
+        return false;
+      }
+
+      applyApiCandidateSummary(scanJobId, analysisSummary, candidates);
+      return true;
+    } finally {
+      setCandidateSummaryLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (screen !== 'candidateSummary' && screen !== 'selectedReview') return;
+    if (!apiAccessToken || candidateSummaryLoading) return;
+
+    const result = getCurrentScanResult();
+    const localCandidateCount = result.mailItems.length + result.driveItems.length + result.largeItems.length;
+    const serverCandidateCount =
+      apiHomeSummary?.latest_scan?.candidate_count ??
+      apiScanHistoryItems.find((item) => isCompletedScanStatus(item.job_status))?.candidate_count ??
+      result.candidateCount;
+    const latestScanJobId = getLatestCompletedScanJobId();
+
+    if (localCandidateCount > 0 || serverCandidateCount <= 0) return;
+    if (latestScanJobId && candidateSummaryLoadAttemptedScanId.current === latestScanJobId) return;
+
+    candidateSummaryLoadAttemptedScanId.current = latestScanJobId;
+    void loadLatestCandidateSummary();
+  }, [
+    screen,
+    apiAccessToken,
+    candidateSummaryLoading,
+    apiHomeSummary?.latest_scan?.scan_job_id,
+    apiHomeSummary?.latest_scan?.candidate_count,
+    apiScanHistoryItems,
+    apiStorageSummary,
+  ]);
+
+  const cancelEmptyScanResult = () => {
+    const scanJobId = apiScanJobId ?? activeApiScanJobId.current ?? apiHomeSummary?.latest_scan?.scan_job_id;
+
+    if (apiAccessToken && scanJobId) {
+      void scanApi
+        .cancel(scanJobId, { accessToken: apiAccessToken })
+        .then(() => {
+          void refreshAuraApis(apiAccessToken);
+        })
+        .catch((error) => {
+          showToast(getErrorMessage(error, '스캔 취소에 실패했어요'), undefined, 2600);
+        });
+    }
+
+    setApiStorageSummary(emptyScanSummary);
+    setLastScan(null);
+    setHasCompletedScan(false);
+    setHomeScanNotice('cancelled');
+    activeApiScanJobId.current = null;
+    setApiScanJobId(null);
+    replace('home');
+  };
 
   const getCandidateItemsForPrefix = (prefix: string) => {
     const result = getCurrentScanResult();
@@ -2541,8 +2913,13 @@ export default function App() {
       go('scanFlowFolder');
       return;
     }
+    if (!apiAccessToken) {
+      showToast('로그인 후 서버 스캔을 실행할 수 있어요', undefined, 3200);
+      return;
+    }
     scanSourceLabelRef.current = getSimpleScanSourceLabel();
-    scanResultRef.current = getLiveScanResult();
+    scanResultRef.current = emptyScanSummary;
+    setApiStorageSummary(emptyScanSummary);
     setScanProgress(0);
     setScanStatusText('스캔 작업을 요청 중이에요');
     setApiScanJobId(null);
@@ -2550,40 +2927,37 @@ export default function App() {
     setHomeScanNotice('running');
     go('scanProgress');
 
-    if (apiAccessToken) {
-      void scanApi
-        .create(
-          {
-            use_saved_settings: hasCompletedScan && settingsToggles.autoScan,
-            settings_override: hasCompletedScan && settingsToggles.autoScan ? undefined : getApiScanSettingsPayload(),
-          },
-          { accessToken: apiAccessToken }
-        )
-        .then((job) => {
-          if (!job.scan_job_id) {
-            throw new Error('scan_job_id missing');
-          }
-          activeApiScanJobId.current = job.scan_job_id;
-          setApiScanJobId(job.scan_job_id);
-          if (job.scan_source) {
-            scanSourceLabelRef.current = apiScanSourceLabel(job.scan_source);
-          }
-          if (job.progress_percent !== undefined) {
-            setScanProgress(Math.round(job.progress_percent));
-          }
-          setScanStatusText('서버 스캔 작업을 확인 중이에요');
-        })
-        .catch(() => {
-          setHomeScanNotice('none');
-          setScanProgress(0);
-          setScanStatusText('스캔 시작에 실패했어요');
-          if (screenRef.current === 'scanProgress') {
-            replace('home');
-          }
-          showToast('백엔드 스캔 시작 실패: 권한 또는 서버 상태를 확인해주세요', undefined, 3200);
-        });
-      return;
-    }
+    void scanApi
+      .create(
+        {
+          use_saved_settings: hasCompletedScan && settingsToggles.autoScan,
+          settings_override: hasCompletedScan && settingsToggles.autoScan ? undefined : getApiScanSettingsPayload(),
+        },
+        { accessToken: apiAccessToken }
+      )
+      .then((job) => {
+        if (!job.scan_job_id) {
+          throw new Error('scan_job_id missing');
+        }
+        activeApiScanJobId.current = job.scan_job_id;
+        setApiScanJobId(job.scan_job_id);
+        if (job.scan_source) {
+          scanSourceLabelRef.current = apiScanSourceLabel(job.scan_source);
+        }
+        if (job.progress_percent !== undefined) {
+          setScanProgress(Math.round(job.progress_percent));
+        }
+        setScanStatusText('서버 스캔 작업을 확인 중이에요');
+      })
+      .catch(() => {
+        setHomeScanNotice('none');
+        setScanProgress(0);
+        setScanStatusText('스캔 시작에 실패했어요');
+        if (screenRef.current === 'scanProgress') {
+          replace('home');
+        }
+        showToast('백엔드 스캔 시작 실패: 권한 또는 서버 상태를 확인해주세요', undefined, 3200);
+      });
   };
 
   const cancelScan = () => {
@@ -2923,26 +3297,15 @@ export default function App() {
         try {
           const [summaryResult, candidatesResult] = await Promise.allSettled([
             scanApi.getAnalysisSummary(apiScanJobId, { accessToken: apiAccessToken }),
-            scanApi.getCandidates(apiScanJobId, { include_protected: true, page: 0, size: 100 }, { accessToken: apiAccessToken }),
+            fetchAllScanCandidates(apiScanJobId, apiAccessToken),
           ]);
 
           if (cancelled) return;
 
           const apiSummary = summaryResult.status === 'fulfilled' ? summaryResult.value : null;
-          const apiCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value.content ?? [] : [];
+          const apiCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value : [];
           const nextSummary = buildApiScanSummary({
             candidates: apiCandidates,
-            storageMailItems: apiStorageSummary?.storageMailItems.map((item) => ({
-              title: item.subtitle,
-              size_bytes: item.snapshotSizeBytes ?? Math.round(extractStorageSizeMB(item.meta) * 1024 * 1024),
-              modified_time: item.meta,
-            })) ?? [],
-            storageDriveItems: apiStorageSummary?.storageDriveItems.map((item) => ({
-              title: item.title,
-              file_extension: item.type,
-              size_bytes: item.snapshotSizeBytes ?? Math.round(extractStorageSizeMB(item.subtitle) * 1024 * 1024),
-              modified_time: item.subtitle,
-            })) ?? [],
             estimatedBytes: apiSummary?.total_estimated_reclaim_bytes ?? job.estimated_reclaim_bytes,
             candidateCount: apiSummary?.total_candidate_count ?? job.candidate_count,
           });
@@ -2957,7 +3320,7 @@ export default function App() {
           });
           setApiStorageSummary(nextSummary);
           setLastScan({
-            dateLabel: formatScanDate(new Date()),
+            dateLabel: formatApiDate(job.completed_at ?? job.started_at ?? job.created_at),
             sourceLabel: scanSourceLabelRef.current,
             conditionLabel: getPeriodLabel(),
             result: nextSummary,
@@ -3047,6 +3410,11 @@ export default function App() {
       };
     }
 
+    if (apiAccessToken) {
+      setScanStatusText('서버 스캔 작업을 기다리는 중이에요');
+      return undefined;
+    }
+
     const timer = setInterval(() => {
       setScanProgress((value) => {
         const next = Math.min(100, value + 4);
@@ -3058,10 +3426,10 @@ export default function App() {
             if (apiAccessToken && apiScanJobId) {
               void Promise.allSettled([
                 scanApi.getAnalysisSummary(apiScanJobId, { accessToken: apiAccessToken }),
-                scanApi.getCandidates(apiScanJobId, { include_protected: true, page: 0, size: 100 }, { accessToken: apiAccessToken }),
+                fetchAllScanCandidates(apiScanJobId, apiAccessToken),
               ]).then(([summaryResult, candidatesResult]) => {
                 const apiSummary = summaryResult.status === 'fulfilled' ? summaryResult.value : null;
-                const apiCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value.content ?? [] : [];
+                const apiCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value : [];
                 const nextSummary = buildApiScanSummary({
                   candidates: apiCandidates,
                   storageMailItems: apiStorageSummary?.storageMailItems.map((item) => ({
@@ -3110,7 +3478,7 @@ export default function App() {
     }, 140);
 
     return () => clearInterval(timer);
-  }, [homeScanNotice, permissions.alarm, settingsToggles.scanComplete]);
+  }, [apiAccessToken, apiScanJobId, homeScanNotice, permissions.alarm, settingsToggles.scanComplete]);
 
   useEffect(() => {
     if (deleteJobStatus !== 'running') return;
@@ -3231,6 +3599,11 @@ export default function App() {
       };
     }
 
+    if (apiAccessToken) {
+      setDeleteStatusText('서버 정리 작업을 기다리는 중이에요');
+      return undefined;
+    }
+
     const timer = setInterval(() => {
       setDeleteProgress((value) => {
         const next = Math.min(100, value + 4);
@@ -3271,7 +3644,7 @@ export default function App() {
     }, 120);
 
     return () => clearInterval(timer);
-  }, [deleteJobStatus]);
+  }, [apiAccessToken, apiCleanupJobId, deleteJobStatus]);
 
   useEffect(() => {
     return () => {
@@ -3474,7 +3847,7 @@ export default function App() {
       })),
     ];
     const isDriveSearching = Boolean(driveFolderSearch.trim());
-    const activeScanResult = lastScan?.result ?? scanResultRef.current;
+    const activeScanResult = getCurrentScanResult();
     const storageBackedScan =
       lastScan ??
       (apiStorageSummary
@@ -3515,15 +3888,31 @@ export default function App() {
     const selectedCandidateCount = selectedMailItems.length + selectedDriveItems.length;
     const selectedTotalSizeMB = sumScanItemSize(selectedMailItems) + sumScanItemSize(selectedDriveItems);
     const selectedTotalSizeLabel = formatDataSize(selectedTotalSizeMB);
-    const remainingAfterCleanup = apiHomeSummary?.storage_summary?.latest_remaining_drive_bytes
-      ? formatBytes(apiHomeSummary.storage_summary.latest_remaining_drive_bytes)
+    const homeStorageSummary = apiHomeSummary?.storage_summary as
+      | (NonNullable<ApiHomeSummary['storage_summary']> & {
+          remaining_drive_bytes?: number;
+          drive_remaining_bytes?: number;
+          total_drive_bytes?: number;
+          drive_total_bytes?: number;
+        })
+      | undefined;
+    const latestRemainingDriveBytes =
+      homeStorageSummary?.latest_remaining_drive_bytes ??
+      homeStorageSummary?.remaining_drive_bytes ??
+      homeStorageSummary?.drive_remaining_bytes;
+    const hasLatestRemainingDriveBytes = latestRemainingDriveBytes !== undefined && latestRemainingDriveBytes !== null;
+    const remainingAfterCleanup = hasLatestRemainingDriveBytes
+      ? formatBytes(latestRemainingDriveBytes)
       : activeScanResult.totalSizeLabel === '0MB' ? '2.6GB' : '4.7GB';
-    const homeRemainingDriveLabel = apiHomeSummary?.storage_summary?.latest_remaining_drive_bytes
-      ? formatBytes(apiHomeSummary.storage_summary.latest_remaining_drive_bytes)
-      : '2.6GB';
-    const homeDriveTotalGB = 15;
-    const homeDriveRemainingGB = 2.6;
-    const homeDriveUsagePercent = Math.round(((homeDriveTotalGB - homeDriveRemainingGB) / homeDriveTotalGB) * 100);
+    const homeRemainingDriveLabel = hasLatestRemainingDriveBytes ? formatBytes(latestRemainingDriveBytes) : '2.6GB';
+    const homeDriveTotalGB =
+      homeStorageSummary?.total_drive_bytes !== undefined
+        ? Math.max(1, homeStorageSummary.total_drive_bytes / 1024 / 1024 / 1024)
+        : homeStorageSummary?.drive_total_bytes !== undefined
+          ? Math.max(1, homeStorageSummary.drive_total_bytes / 1024 / 1024 / 1024)
+          : 15;
+    const homeDriveRemainingGB = hasLatestRemainingDriveBytes ? latestRemainingDriveBytes / 1024 / 1024 / 1024 : 2.6;
+    const homeDriveUsagePercent = Math.max(0, Math.min(100, Math.round(((homeDriveTotalGB - homeDriveRemainingGB) / homeDriveTotalGB) * 100)));
     const cleanupDriveTotalGB = 15;
     const cleanupRemainingGB = sizeLabelToMB(remainingAfterCleanup) / 1024;
     const cleanupReclaimedGB = selectedTotalSizeMB / 1024;
@@ -3531,6 +3920,41 @@ export default function App() {
     const cleanupCurrentUsedPercent = Math.min(100, Math.max(0, (cleanupCurrentUsedGB / cleanupDriveTotalGB) * 100));
     const cleanupReclaimedPercent = Math.min(100 - cleanupCurrentUsedPercent, Math.max(0, (cleanupReclaimedGB / cleanupDriveTotalGB) * 100));
     const checkedCleanupSizeLabel = selectedTotalSizeLabel;
+    const latestCleanupHistory = apiCleanupHistoryItems[0];
+    const latestScanHistoryForFallback = apiScanHistoryItems.find((item) => isCompletedScanStatus(item.job_status)) ?? apiScanHistoryItems[0];
+    const historyScanBytesTotal = apiScanHistoryItems.reduce((sum, item) => sum + (item.estimated_reclaim_bytes ?? item.reclaimed_bytes ?? 0), 0);
+    const latestScanHistoryBytes = latestScanHistoryForFallback?.estimated_reclaim_bytes ?? latestScanHistoryForFallback?.reclaimed_bytes;
+    const latestCleanupSizeLabel = latestCleanupHistory?.reclaimed_bytes !== undefined
+      ? formatBytes(latestCleanupHistory.reclaimed_bytes)
+      : latestScanHistoryBytes !== undefined
+        ? formatBytes(latestScanHistoryBytes)
+      : checkedCleanupSizeLabel;
+    const historyTotalSizeLabel = apiStatisticsSummary?.total_reclaimed_bytes !== undefined
+      ? formatBytes(apiStatisticsSummary.total_reclaimed_bytes)
+      : historyScanBytesTotal
+        ? formatBytes(historyScanBytesTotal)
+      : checkedCleanupSizeLabel;
+    const latestCleanupDateLabel = latestCleanupHistory?.completed_at
+      ? formatApiDate(latestCleanupHistory.completed_at)
+      : latestScanHistoryForFallback?.created_at
+        ? formatApiDate(latestScanHistoryForFallback.created_at)
+      : lastScan?.dateLabel;
+    const latestCleanupDesc = latestCleanupHistory
+      ? `정리 항목 ${latestCleanupHistory.cleaned_item_count ?? 0}개`
+      : latestScanHistoryForFallback
+        ? `${apiScanSourceLabel(latestScanHistoryForFallback.scan_source)} · 정리 후보 ${latestScanHistoryForFallback.candidate_count ?? 0}개`
+      : `Gmail ${selectedMailCleanupCount}개 · Drive ${selectedDriveCleanupCount}개`;
+    const historyGraphValues = apiCleanupHistoryItems.length
+      ? [...apiCleanupHistoryItems].reverse().map((item) => bytesToMB(item.reclaimed_bytes ?? 0) / 1024)
+      : apiScanHistoryItems.length
+        ? [...apiScanHistoryItems].reverse().map((item) => bytesToMB(item.estimated_reclaim_bytes ?? item.reclaimed_bytes ?? 0) / 1024)
+      : apiMonthlyStats.length
+        ? apiMonthlyStats.map((item) => bytesToMB(item.reclaimed_bytes ?? 0) / 1024)
+        : undefined;
+    const historyGraphLabels = historyGraphValues
+      ? historyGraphValues.map((_, index) => `${index + 1}회`)
+      : undefined;
+    const hasHistoryData = Boolean(apiCleanupHistoryItems.length || apiScanHistoryItems.length || apiStatisticsSummary?.total_cleanup_count || lastScan);
     const homeScanStatusTitle =
       homeScanNotice === 'completed' ? '스캔이 완료됐어요' : homeScanNotice === 'cancelled' ? '스캔이 중단됐어요' : '스캔 진행 중';
     const homeScanStatusDesc =
@@ -4102,52 +4526,65 @@ export default function App() {
       case 'candidateSummary':
         return (
           <ScreenShell title="분석 결과 요약" disableScroll>
-            <View style={styles.resultMetricGrid}>
-              <ResultMetricCard label="정리 후보" value={`${selectedCandidateCount}개`} />
-              <ResultMetricCard label="예상 확보" value={selectedTotalSizeLabel} />
-            </View>
-            <ResultCategoryCard
-              title="광고·프로모션 메일"
-              desc={`${promoMailCount}개 · ${formatDataSize(sumScanItemSize(promoMailItems))}`}
-              onPress={() => {
-                setMailListMode('promo');
-                go('mailList');
-              }}
-            />
-            <ResultCategoryCard
-              title="오래된 메일"
-              desc={`${oldMailCount}개 · ${formatDataSize(sumScanItemSize(oldMailItems))}`}
-              onPress={() => {
-                setMailListMode('old');
-                go('mailList');
-              }}
-            />
-            <ResultCategoryCard
-              title="오래된 파일"
-              desc={`${oldDriveItems.length}개 · ${formatDataSize(sumScanItemSize(oldDriveItems))}`}
-              onPress={() => {
-                setDriveListMode('old');
-                go('driveList');
-              }}
-            />
-            <ResultCategoryCard
-              title="중복 파일"
-              desc={`${duplicateDriveItems.length}개 · ${formatDataSize(sumScanItemSize(duplicateDriveItems))}`}
-              warning={duplicateDeselectedCount ? `미선택 ${duplicateDeselectedCount}개` : undefined}
-              onPress={() => {
-                setDriveListMode('duplicate');
-                go('driveList');
-              }}
-            />
-            <ResultCategoryCard
-              title="대용량 파일"
-              desc={`${largeOnlyDriveItems.length}개 · ${formatDataSize(sumScanItemSize(largeOnlyDriveItems))}`}
-              onPress={() => go('largeList')}
-            />
-            <Pressable onPress={() => activeScanResult.protectedItems.length ? go('protectedList') : showToast('제외 키워드로 보호된 항목이 없어요')}>
-              <Text style={styles.resultGuideText}>제외 키워드로 보호된 대상을 확인하세요</Text>
-            </Pressable>
-            <PrimaryButton title="다음" onPress={() => go('selectedReview')} inline />
+            {candidateSummaryLoading ? (
+              <View style={styles.inlineLoadingState}>
+                <ActivityIndicator size="large" color={navy} />
+                <Text style={styles.inlineLoadingText}>분석 결과를 불러오는 중이에요</Text>
+              </View>
+            ) : (
+              <>
+                <View style={styles.resultMetricGrid}>
+                  <ResultMetricCard label="정리 후보" value={`${selectedCandidateCount}개`} />
+                  <ResultMetricCard label="예상 확보" value={selectedTotalSizeLabel} />
+                </View>
+                <ResultCategoryCard
+                  title="광고·프로모션 메일"
+                  desc={`${promoMailCount}개 · ${formatDataSize(sumScanItemSize(promoMailItems))}`}
+                  onPress={() => {
+                    setMailListMode('promo');
+                    go('mailList');
+                  }}
+                />
+                <ResultCategoryCard
+                  title="오래된 메일"
+                  desc={`${oldMailCount}개 · ${formatDataSize(sumScanItemSize(oldMailItems))}`}
+                  onPress={() => {
+                    setMailListMode('old');
+                    go('mailList');
+                  }}
+                />
+                <ResultCategoryCard
+                  title="오래된 파일"
+                  desc={`${oldDriveItems.length}개 · ${formatDataSize(sumScanItemSize(oldDriveItems))}`}
+                  onPress={() => {
+                    setDriveListMode('old');
+                    go('driveList');
+                  }}
+                />
+                <ResultCategoryCard
+                  title="중복 파일"
+                  desc={`${duplicateDriveItems.length}개 · ${formatDataSize(sumScanItemSize(duplicateDriveItems))}`}
+                  warning={duplicateDeselectedCount ? `미선택 ${duplicateDeselectedCount}개` : undefined}
+                  onPress={() => {
+                    setDriveListMode('duplicate');
+                    go('driveList');
+                  }}
+                />
+                <ResultCategoryCard
+                  title="대용량 파일"
+                  desc={`${largeOnlyDriveItems.length}개 · ${formatDataSize(sumScanItemSize(largeOnlyDriveItems))}`}
+                  onPress={() => go('largeList')}
+                />
+                <Pressable onPress={() => activeScanResult.protectedItems.length ? go('protectedList') : showToast('제외 키워드로 보호된 항목이 없어요')}>
+                  <Text style={styles.resultGuideText}>제외 키워드로 보호된 대상을 확인하세요</Text>
+                </Pressable>
+                {selectedCandidateCount > 0 ? (
+                  <PrimaryButton title="다음" onPress={() => go('selectedReview')} inline />
+                ) : (
+                  <OutlineButton title="취소" onPress={cancelEmptyScanResult} />
+                )}
+              </>
+            )}
             <View style={styles.resultBottomSpacer} />
           </ScreenShell>
         );
@@ -4435,6 +4872,9 @@ export default function App() {
             mode={screen}
             scan={storageBackedScan}
             apiAccessToken={apiAccessToken}
+            apiBootstrapLoading={apiBootstrapLoading}
+            googlePermissionChecking={googlePermissionChecking}
+            driveFolders={apiDriveFolderOptions}
             permissions={permissions}
             checked={checked}
             toggle={toggleCheck}
@@ -4459,6 +4899,8 @@ export default function App() {
               setSelectedStorageDetail(item);
               go('storageDetail');
             }}
+            onLoadDriveFolders={loadApiDriveFolders}
+            onServerStorageChanged={apiAccessToken ? () => void refreshAuraApis(apiAccessToken) : undefined}
           />
         );
 
@@ -4528,9 +4970,9 @@ export default function App() {
 
             <SectionTitle>연결된 서비스</SectionTitle>
             <View style={styles.groupCard}>
-              <ServiceLinkRow service="gmail" title="Gmail" connected={permissions.gmail} onPress={() => void requestGoogleReconnect(['GMAIL'])} />
+              <ServiceLinkRow service="gmail" title="Gmail" connected={permissions.gmail} checking={googlePermissionChecking} onPress={() => void requestGoogleReconnect(['GMAIL'])} />
               <View style={styles.thinDivider} />
-              <ServiceLinkRow service="drive" title="Google Drive" connected={permissions.drive} onPress={() => void requestGoogleReconnect(['DRIVE'])} />
+              <ServiceLinkRow service="drive" title="Google Drive" connected={permissions.drive} checking={googlePermissionChecking} onPress={() => void requestGoogleReconnect(['DRIVE'])} />
             </View>
 
             <OutlineButton title="Google 권한 다시 확인" onPress={() => void refreshGooglePermissions()} />
@@ -4674,34 +5116,34 @@ export default function App() {
 
       case 'analysisHistory':
         return (
-          <ScreenShell title="스캔 이력" titleIcon="history" hideBack tightBottom disableScroll>
-            {lastScan ? (
+          <ScreenShell title="스캔 이력" titleIcon="history" hideBack tightBottom disableScroll={hasHistoryData}>
+            {hasHistoryData ? (
               <>
                 <View style={styles.carbonTotalCard}>
                   <View>
                     <Text style={styles.cardLabel}>전체 누적 삭제 용량</Text>
-                    <Text style={styles.carbonTotalValue}>{checkedCleanupSizeLabel}</Text>
+                    <Text style={styles.carbonTotalValue}>{historyTotalSizeLabel}</Text>
                   </View>
                   <View style={styles.monthCarbonPill}>
-                    <Text style={styles.monthCarbonText}>이번 달 +{checkedCleanupSizeLabel}</Text>
+                    <Text style={styles.monthCarbonText}>최근 스캔 +{latestCleanupSizeLabel}</Text>
                   </View>
                 </View>
                 <SectionTitle>스캔별 확보 용량 현황</SectionTitle>
-                <CarbonStatsGraph sizeLabel={checkedCleanupSizeLabel} />
+                <CarbonStatsGraph sizeLabel={latestCleanupSizeLabel} values={historyGraphValues} labels={historyGraphLabels} />
                 <View style={styles.rowBetween}>
                   <SectionTitle>최근 정리 기록</SectionTitle>
                   <Pressable onPress={() => go('analysisHistoryAll')} hitSlop={8}>
                     <Text style={styles.rowRight}>전체 보기</Text>
                   </Pressable>
                 </View>
-                {selectedCandidateCount ? (
+                {apiCleanupHistoryItems.length || latestScanHistoryForFallback || selectedCandidateCount ? (
                   <View style={styles.recentCleanupCard}>
                     <View style={styles.recentCleanupTopRow}>
                       <View style={styles.infoMain}>
-                        <Text style={styles.infoTitle}>{lastScan.dateLabel}</Text>
-                        <Text style={styles.infoDesc}>Gmail {selectedMailCleanupCount}개 · Drive {selectedDriveCleanupCount}개</Text>
+                        <Text style={styles.infoTitle}>{latestCleanupDateLabel ?? '-'}</Text>
+                        <Text style={styles.infoDesc}>{latestCleanupDesc}</Text>
                       </View>
-                      <Text style={styles.recentCleanupSizeValue}>{checkedCleanupSizeLabel}</Text>
+                      <Text style={styles.recentCleanupSizeValue}>{latestCleanupSizeLabel}</Text>
                     </View>
                   </View>
                 ) : (
@@ -4717,7 +5159,35 @@ export default function App() {
       case 'analysisHistoryAll':
         return (
           <ScreenShell title="정리 기록 전체보기">
-            {lastScan ? (
+            {apiCleanupHistoryItems.length ? (
+              <>
+                {apiCleanupHistoryItems.map((item, index) => (
+                  <View style={styles.recentCleanupCard} key={item.history_id ?? item.cleanup_job_id ?? item.completed_at ?? index}>
+                    <View style={styles.recentCleanupTopRow}>
+                      <View style={styles.infoMain}>
+                        <Text style={styles.infoTitle}>{formatApiDate(item.completed_at)}</Text>
+                        <Text style={styles.infoDesc}>정리 항목 {item.cleaned_item_count ?? 0}개</Text>
+                      </View>
+                      <Text style={styles.recentCleanupSizeValue}>{formatBytes(item.reclaimed_bytes ?? 0)}</Text>
+                    </View>
+                  </View>
+                ))}
+              </>
+            ) : apiScanHistoryItems.length ? (
+              <>
+                {apiScanHistoryItems.map((item, index) => (
+                  <View style={styles.recentCleanupCard} key={item.scan_job_id ?? item.created_at ?? index}>
+                    <View style={styles.recentCleanupTopRow}>
+                      <View style={styles.infoMain}>
+                        <Text style={styles.infoTitle}>{formatApiDate(item.created_at)}</Text>
+                        <Text style={styles.infoDesc}>{apiScanSourceLabel(item.scan_source)} · 정리 후보 {item.candidate_count ?? 0}개</Text>
+                      </View>
+                      <Text style={styles.recentCleanupSizeValue}>{formatBytes(item.estimated_reclaim_bytes ?? item.reclaimed_bytes ?? 0)}</Text>
+                    </View>
+                  </View>
+                ))}
+              </>
+            ) : lastScan ? (
               <>
                 <View style={styles.recentCleanupCard}>
                   <View style={styles.recentCleanupTopRow}>
@@ -6452,17 +6922,17 @@ function RecentResultRow({ title, desc, value }: { title: string; desc?: string;
   );
 }
 
-function CarbonStatsGraph({ sizeLabel }: { sizeLabel: string }) {
+function CarbonStatsGraph({ sizeLabel, values, labels }: { sizeLabel: string; values?: number[]; labels?: string[] }) {
   const reveal = useRef(new Animated.Value(0)).current;
   const current = sizeLabelToMB(sizeLabel) / 1024;
   const chartWidth = Math.max(260, Dimensions.get('window').width - 96);
-  const scanValues = current > 0
-    ? [
-        Math.max(0.2, current * 0.55),
-        Math.max(0.3, current * 1.18),
-        Math.max(0.2, current),
-      ]
-    : [0];
+  const rawValues = values?.length ? values : [Math.max(0, current)];
+  const scanValues = rawValues.length === 1
+    ? [0, Math.max(0, rawValues[0])]
+    : rawValues.map((value) => Math.max(0, value));
+  const scanLabels = labels?.length === rawValues.length
+    ? rawValues.length === 1 ? ['', labels[0]] : labels
+    : scanValues.map((_, index) => (index === 0 && rawValues.length === 1 ? '' : `${index + 1}회`));
 
   useEffect(() => {
     reveal.setValue(0);
@@ -6472,7 +6942,7 @@ function CarbonStatsGraph({ sizeLabel }: { sizeLabel: string }) {
       easing: Easing.out(Easing.cubic),
       useNativeDriver: false,
     }).start();
-  }, [reveal, sizeLabel]);
+  }, [reveal, sizeLabel, values]);
 
   const revealWidth = reveal.interpolate({
     inputRange: [0, 1],
@@ -6485,7 +6955,7 @@ function CarbonStatsGraph({ sizeLabel }: { sizeLabel: string }) {
         <Animated.View style={[styles.statsChartReveal, { width: revealWidth }]}>
           <LineChart
             data={{
-              labels: scanValues.map((_, index) => `${index + 1}회`),
+              labels: scanLabels,
               datasets: [{ data: scanValues }],
             }}
             width={chartWidth}
@@ -6524,6 +6994,9 @@ function StorageScreen({
   mode,
   scan,
   apiAccessToken,
+  apiBootstrapLoading,
+  googlePermissionChecking,
+  driveFolders,
   permissions,
   checked,
   toggle,
@@ -6545,10 +7018,15 @@ function StorageScreen({
   setStorageRestoredKeys,
   setStorageDriveMoveTargets,
   openStorageDetail,
+  onLoadDriveFolders,
+  onServerStorageChanged,
 }: {
   mode: 'storageMail' | 'storageDrive' | 'storageTrash' | 'storageDriveTrash';
   scan: ScanRecord | null;
   apiAccessToken: string | null;
+  apiBootstrapLoading: boolean;
+  googlePermissionChecking: boolean;
+  driveFolders: DriveFolderOption[];
   permissions: { gmail: boolean; drive: boolean; alarm: boolean };
   checked: Record<string, boolean>;
   toggle: (key: string) => void;
@@ -6570,6 +7048,8 @@ function StorageScreen({
   setStorageRestoredKeys: React.Dispatch<React.SetStateAction<string[]>>;
   setStorageDriveMoveTargets: React.Dispatch<React.SetStateAction<StorageDriveMoveTargets>>;
   openStorageDetail: (item: StorageDetailItem) => void;
+  onLoadDriveFolders: (parentPath?: string) => Promise<void>;
+  onServerStorageChanged?: () => void;
 }) {
   const isDrive = mode === 'storageDrive' || mode === 'storageDriveTrash';
   const isTrash = mode === 'storageTrash' || mode === 'storageDriveTrash';
@@ -6589,9 +7069,10 @@ function StorageScreen({
   const [serverPageLoading, setServerPageLoading] = useState(false);
   const [serverPageError, setServerPageError] = useState('');
   const serverPageRequestId = useRef(0);
-  const summary = scan?.result ?? defaultStorageSummary;
+  const serverPageCacheRef = useRef<Record<string, StorageServerPageState>>(storageServerPageCache);
+  const summary = scan?.result ?? (apiAccessToken ? emptyScanSummary : defaultStorageSummary);
   const serverMailItems = serverPage?.items.map(apiStorageItemToMail) ?? [];
-  const serverDriveItems = serverPage?.items.map(apiStorageItemToDrive) ?? [];
+  const serverDriveItems = serverPage?.items.map((item) => apiStorageItemToDriveFromApi(item, driveFolders)) ?? [];
   const serverTrashItems = serverPage?.items.map(apiStorageItemToTrash) ?? [];
   const mailItems = shouldUseServerPagination && mode === 'storageMail' ? serverMailItems : summary.storageMailItems;
   const allStorageDriveItems = getAllStorageDriveItems();
@@ -6609,15 +7090,21 @@ function StorageScreen({
       subtitle: item.type === 'F' ? `${fullPath} · 폴더` : `${meta} · ${targetFolder}`,
     };
   };
+  const apiStorageFolderItems =
+    shouldUseServerPagination && mode === 'storageDrive'
+      ? driveFolders
+          .filter((folder) => normalizeServerDrivePath(folder.parentId) === storageDriveFolder)
+          .map(apiDriveFolderToStorageItemFromApi)
+      : [];
   const storageDriveUniverse = (shouldUseServerPagination && mode === 'storageDrive'
-    ? serverDriveItems
+    ? dedupeStorageDriveItems([...apiStorageFolderItems, ...serverDriveItems])
     : hasApiStorageDriveItems
       ? summary.storageDriveItems
       : allStorageDriveItems).map(applyDriveMove);
   const currentStorageDriveItems = storageDriveUniverse
     .filter((item) => {
-      if (item.type === 'F') return getDriveParentPath(item.fullPath ?? '') === storageDriveFolder;
-      return item.fullPath === storageDriveFolder;
+      const itemPath = item.fullPath ?? '';
+      return itemPath === storageDriveFolder || getDriveParentPath(itemPath) === storageDriveFolder;
     });
   const driveItems = isDrive && !isTrash ? currentStorageDriveItems : summary.storageDriveItems;
   const activeDriveFolder = mode === 'storageDriveTrash' ? storageDriveTrashFolder : storageDriveFolder;
@@ -6768,9 +7255,19 @@ function StorageScreen({
       ? driveTrashUniverse.filter((item) => !isHiddenFromCurrentList(item.id) && isItemChecked(item.id))
     : activeItems.filter((item) => isItemChecked(item.id));
   const selectedActiveItemCount = selectedItems.length;
+  const isStorageLoading = googlePermissionChecking || apiBootstrapLoading || serverPageLoading;
 
   const loadStorageServerPage = (page: number) => {
     if (!apiAccessToken || !shouldUseServerPagination) return;
+
+    const cacheKey = `${apiAccessToken}:${mode}:${storageServerSource}:${page}`;
+    const cachedPage = serverPageCacheRef.current[cacheKey];
+    if (cachedPage) {
+      setServerPage(cachedPage);
+      setServerPageError('');
+      setServerPageLoading(false);
+      return;
+    }
 
     const requestId = serverPageRequestId.current + 1;
     serverPageRequestId.current = requestId;
@@ -6783,13 +7280,16 @@ function StorageScreen({
     void request
       .then((result) => {
         if (serverPageRequestId.current !== requestId) return;
-        setServerPage({
+        const nextPage = {
           items: result.content ?? [],
           page: result.page ?? page,
           size: result.size ?? storageApiPageSize,
           totalElements: result.total_elements ?? result.content?.length ?? 0,
           totalPages: result.total_pages ?? 1,
-        });
+        };
+        serverPageCacheRef.current[cacheKey] = nextPage;
+        storageServerPageCache[cacheKey] = nextPage;
+        setServerPage(nextPage);
       })
       .catch((error) => {
         if (serverPageRequestId.current !== requestId) return;
@@ -6803,6 +7303,7 @@ function StorageScreen({
 
   useEffect(() => {
     serverPageRequestId.current += 1;
+    serverPageCacheRef.current = storageServerPageCache;
     setServerPage(null);
     setServerPageError('');
     setServerPageLoading(false);
@@ -6812,6 +7313,11 @@ function StorageScreen({
     if (!shouldUseServerPagination || !apiAccessToken) return;
     loadStorageServerPage(storagePage);
   }, [apiAccessToken, mode, shouldUseServerPagination, storagePage]);
+
+  useEffect(() => {
+    if (!apiAccessToken || mode !== 'storageDrive' || !permissions.drive) return;
+    void onLoadDriveFolders(storageDriveFolder);
+  }, [apiAccessToken, mode, permissions.drive, storageDriveFolder]);
 
   useEffect(() => {
     setStoragePage(0);
@@ -6920,7 +7426,7 @@ function StorageScreen({
   };
   const getApiStorageActionItems = () =>
     selectedItems
-      .filter((item) => !item.id.startsWith('storage-folder-') && !item.id.startsWith('trash-drive-folder-'))
+      .filter((item) => !apiAccessToken || item.itemId !== undefined || Boolean(item.externalItemId))
       .map((item) => {
         const externalItemId =
           item.externalItemId ??
@@ -6953,7 +7459,12 @@ function StorageScreen({
       if (apiAccessToken && apiItems.length) {
         void storageApi
           .permanentDelete(apiItems, { accessToken: apiAccessToken })
-          .then(() => loadStorageServerPage(safeStoragePage))
+          .then(() => {
+            clearStorageServerPageCache();
+            serverPageCacheRef.current = storageServerPageCache;
+            onServerStorageChanged?.();
+            loadStorageServerPage(safeStoragePage);
+          })
           .catch(() => {
             showToast('백엔드 영구 삭제 요청 실패: 화면에서만 반영했어요');
           });
@@ -6965,10 +7476,24 @@ function StorageScreen({
       return;
     }
 
+    const apiItems = getApiStorageActionItems();
+    if (apiAccessToken && apiItems.length) {
+      void storageApi
+        .moveToTrash(apiItems, { accessToken: apiAccessToken })
+        .then(() => {
+          clearStorageServerPageCache();
+          serverPageCacheRef.current = storageServerPageCache;
+          onServerStorageChanged?.();
+          loadStorageServerPage(safeStoragePage);
+        })
+        .catch((error) => {
+          showToast(getErrorMessage(error, '휴지통 이동 요청에 실패했어요'), undefined, 2600);
+        });
+    }
     setStorageTrashMovedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
     clearSelectionPrefix(prefix);
     setSelectionMode(false);
-    showToast(apiAccessToken ? '저장소 직접 이동 API가 없어 화면에서만 반영했어요' : '선택 항목을 휴지통으로 이동했어요');
+    showToast('선택 항목을 휴지통으로 이동했어요');
   };
   const confirmStorageRestore = () => {
     if (!restoreConfirmChecked) {
@@ -6986,7 +7511,12 @@ function StorageScreen({
     if (apiAccessToken && apiItems.length) {
       void storageApi
         .restore(apiItems, { accessToken: apiAccessToken })
-        .then(() => loadStorageServerPage(safeStoragePage))
+        .then(() => {
+          clearStorageServerPageCache();
+          serverPageCacheRef.current = storageServerPageCache;
+          onServerStorageChanged?.();
+          loadStorageServerPage(safeStoragePage);
+        })
         .catch(() => {
           showToast('백엔드 복구 요청 실패: 화면에서만 반영했어요');
         });
@@ -7026,7 +7556,7 @@ function StorageScreen({
           <Text style={[styles.storagePrimaryTabText, isDrive && styles.storagePrimaryTabTextActive]}>Drive</Text>
         </Pressable>
       </View>
-      {!serviceConnected ? (
+      {!googlePermissionChecking && !serviceConnected ? (
         <PermissionRevokedCard onPress={onReconnect} />
       ) : (
         <View style={styles.storageLooseList}>
@@ -7101,7 +7631,7 @@ function StorageScreen({
               </View>
             </View>
           )}
-          {serverPageLoading ? <Text style={styles.infoDesc}>서버 목록을 불러오는 중...</Text> : null}
+          {isStorageLoading ? <Text style={styles.infoDesc}>서버 목록을 불러오는 중...</Text> : null}
           {serverPageError ? (
             <View style={styles.warningCard}>
               <Text style={styles.warningText}>{serverPageError}</Text>
@@ -7180,6 +7710,11 @@ function StorageScreen({
                           compact
                         />
                       ))}
+            </View>
+          ) : isStorageLoading ? (
+            <View style={styles.storageLoadingCard}>
+              <ActivityIndicator color="#74C987" />
+              <Text style={styles.infoDesc}>서버 데이터를 불러오는 중이에요</Text>
             </View>
           ) : (
             <EmptyState
@@ -7624,7 +8159,19 @@ function CheckBox({ checked, onPress, compact }: { checked: boolean; onPress: ()
   );
 }
 
-function ServiceLinkRow({ service, title, connected, onPress }: { service: 'gmail' | 'drive'; title: string; connected: boolean; onPress: () => void }) {
+function ServiceLinkRow({
+  service,
+  title,
+  connected,
+  checking,
+  onPress,
+}: {
+  service: 'gmail' | 'drive';
+  title: string;
+  connected: boolean;
+  checking?: boolean;
+  onPress: () => void;
+}) {
   const iconSource = service === 'gmail' ? gmailIcon : googleDriveIcon;
 
   return (
@@ -7634,9 +8181,18 @@ function ServiceLinkRow({ service, title, connected, onPress }: { service: 'gmai
       </View>
       <View style={styles.infoMain}>
         <Text style={styles.infoTitle}>{title}</Text>
-        <View style={styles.connectedPill}>
-          <Text style={styles.connectedPillText}>{connected ? '연결됨' : '연결안됨'}</Text>
-        </View>
+        {checking ? (
+          <View style={styles.connectedCheckingRow}>
+            <ActivityIndicator size="small" color="#74C987" />
+            <Text style={styles.connectedCheckingText}>확인 중</Text>
+          </View>
+        ) : (
+          <View style={[styles.connectedPill, !connected && styles.disconnectedPill]}>
+            <Text style={[styles.connectedPillText, !connected && styles.disconnectedPillText]}>
+              {connected ? '연결됨' : '연결 안됨'}
+            </Text>
+          </View>
+        )}
       </View>
       <Text style={styles.chevron}>›</Text>
     </Pressable>
@@ -8441,6 +8997,18 @@ const styles = StyleSheet.create({
   },
   resultBottomSpacer: {
     height: 20,
+  },
+  inlineLoadingState: {
+    flex: 1,
+    minHeight: 360,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 16,
+  },
+  inlineLoadingText: {
+    color: mutedText,
+    fontSize: 15,
+    fontWeight: '900',
   },
   heroSpacer: {
     height: 78,
@@ -11276,6 +11844,12 @@ const styles = StyleSheet.create({
     gap: 8,
     paddingBottom: 1,
   },
+  storageLoadingCard: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    paddingVertical: 28,
+  },
   storagePagerRow: {
     minHeight: 32,
     flexDirection: 'row',
@@ -11901,8 +12475,27 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  disconnectedPill: {
+    backgroundColor: '#F1F3F4',
+  },
   connectedPillText: {
     color: navy,
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  disconnectedPillText: {
+    color: mutedText,
+  },
+  connectedCheckingRow: {
+    alignSelf: 'flex-start',
+    marginTop: 6,
+    minHeight: 25,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  connectedCheckingText: {
+    color: mutedText,
     fontSize: 11,
     fontWeight: '900',
   },

@@ -81,6 +81,7 @@ export type ApiReconnectUrlRequest = {
 
 export type ApiReconnectUrlResponse = {
   auth_url?: string;
+  authorization_url?: string;
 };
 
 export type ApiNotificationSetting = {
@@ -270,12 +271,22 @@ export type ApiStorageItem = {
   size_bytes?: number;
   mime_type?: string;
   file_extension?: string;
+  sender_email?: string;
+  owner_email?: string;
+  folder_path?: string;
+  parent_folder_id?: string;
+  web_view_link?: string;
+  snippet?: string;
+  created_time?: string;
   modified_time?: string;
   last_opened_time?: string;
+  is_folder?: boolean;
+  item_type?: 'FILE' | 'FOLDER' | string;
   is_shared?: boolean;
   is_trashed?: boolean;
   trashed_at?: string;
   recoverable?: boolean;
+  metadata?: Record<string, unknown>;
 };
 
 export type ApiStorageDetail = ApiStorageItem & {
@@ -736,11 +747,21 @@ export const storageApi = {
       })
     );
   },
+  async moveToTrash(items: ApiStorageActionItem[], options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.storage.moveToTrash, {
+        method: 'POST',
+        body: { items, approval_confirmed: true },
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
   async permanentDelete(items: ApiStorageActionItem[], options?: ApiRequestOptions) {
     return unwrap(
       await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.storage.permanentDelete, {
         method: 'POST',
-        body: { items, approval_confirmed: true, confirmation_text: 'DELETE' },
+        body: { items, approval_confirmed: true, confirmation_text: '영구삭제' },
         accessToken: options?.accessToken,
         signal: options?.signal,
       })
