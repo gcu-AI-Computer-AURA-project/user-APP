@@ -32,7 +32,7 @@ export type ApiCandidateCategory =
 
 export type ApiStorageSummary = {
   estimated_reclaim_bytes?: number;
-  latest_remaining_drive_bytes?: number;
+  latest_remaining_drive_bytes?: number | null;
   total_reclaimed_bytes?: number;
   total_estimated_carbon_grams?: number;
 };

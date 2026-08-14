@@ -43,6 +43,7 @@ import {
   type ApiAnnouncement,
   type ApiAnalysisSummary,
   type ApiCandidate,
+  type ApiCandidateCategory,
   type ApiCandidateDetail,
   type ApiCandidateSelectionStatus,
   type ApiCleanupHistoryItem,
@@ -54,6 +55,7 @@ import {
   type ApiScanHistoryItem,
   type ApiScanJob,
   type ApiScanSetting,
+  type ApiScanSettingRequest,
   type ApiStatisticsSummary,
   type ApiStorageDetail,
   type ApiStorageItem,
@@ -178,6 +180,12 @@ type ScanSummary = {
   driveItems: ScanListItem[];
   largeItems: ScanListItem[];
   protectedItems: ScanListItem[];
+  categorySummaries: Array<{
+    category?: ApiCandidateCategory;
+    itemCount: number;
+    estimatedBytes: number;
+    selectedCount?: number;
+  }>;
   storageMailItems: StorageMailItem[];
   storageDriveItems: StorageDriveItem[];
   storageTrashItems: StorageMailItem[];
@@ -627,6 +635,7 @@ const emptyScanSummary: ScanSummary = {
   driveItems: [],
   largeItems: [],
   protectedItems: [],
+  categorySummaries: [],
   storageMailItems: [],
   storageDriveItems: [],
   storageTrashItems: [],
@@ -654,6 +663,16 @@ function bytesToMB(bytes?: number | null) {
 
 function formatBytes(bytes?: number | null) {
   return formatDataSize(bytesToMB(bytes));
+}
+
+const DEFAULT_GOOGLE_DRIVE_TOTAL_BYTES = 15 * 1024 * 1024 * 1024;
+
+function pickValidByteValue(...values: Array<number | null | undefined>) {
+  for (const value of values) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric >= 0) return numeric;
+  }
+  return undefined;
 }
 
 function formatApiDate(value?: string | null) {
@@ -907,6 +926,7 @@ function apiCandidateToScanItem(candidate: ApiCandidate): ScanListItem {
 
 function buildApiScanSummary(params: {
   candidates?: ApiCandidate[];
+  analysisSummary?: ApiAnalysisSummary | null;
   storageMailItems?: ApiStorageItem[];
   storageDriveItems?: ApiStorageItem[];
   trashMailItems?: ApiStorageItem[];
@@ -919,12 +939,22 @@ function buildApiScanSummary(params: {
   const mailItems = candidateItems.filter((item) => item.source === 'mail');
   const driveItems = candidateItems.filter((item) => item.source === 'drive');
   const largeItems = driveItems.filter((item) => item.sizeMB >= 500);
+  const categorySummaries = (params.analysisSummary?.categories ?? []).map((item) => ({
+    category: item.category,
+    itemCount: Number(item.item_count ?? 0),
+    estimatedBytes: Number(item.estimated_reclaim_bytes ?? 0),
+    selectedCount: item.selected_count,
+  }));
+  const categoryTotalBytes = categorySummaries.reduce((sum, item) => sum + item.estimatedBytes, 0);
+  const categoryCandidateCount = categorySummaries.reduce((sum, item) => sum + item.itemCount, 0);
   const protectedItems = (params.candidates ?? [])
     .filter((candidate) => candidate.is_protected || candidate.category === 'PROTECTED')
     .map(apiCandidateToScanItem);
   const totalSizeMB =
     params.estimatedBytes !== undefined
       ? bytesToMB(params.estimatedBytes)
+      : categoryTotalBytes
+        ? bytesToMB(categoryTotalBytes)
       : sumScanItemSize(mailItems) + sumScanItemSize(driveItems);
 
   return {
@@ -932,6 +962,7 @@ function buildApiScanSummary(params: {
     driveItems,
     largeItems,
     protectedItems,
+    categorySummaries,
     storageMailItems: (params.storageMailItems ?? []).map(apiStorageItemToMail),
     storageDriveItems: (params.storageDriveItems ?? []).map(apiStorageItemToDrive),
     storageTrashItems: (params.trashMailItems ?? []).map(apiStorageItemToTrash),
@@ -940,7 +971,7 @@ function buildApiScanSummary(params: {
     largeSizeLabel: formatDataSize(sumScanItemSize(largeItems)),
     totalSizeLabel: formatDataSize(totalSizeMB),
     carbonLabel: `약 ${(params.carbonGrams ?? Math.max(0, (totalSizeMB / 1024) * 0.19)).toFixed(1)}g CO₂`,
-    candidateCount: params.candidateCount ?? candidateItems.length,
+    candidateCount: (params.candidateCount ?? categoryCandidateCount) || candidateItems.length,
     folderLabel: params.folderLabel ?? '전체 Drive',
   };
 }
@@ -1164,6 +1195,7 @@ function buildScanResult({
     driveItems,
     largeItems,
     protectedItems,
+    categorySummaries: [],
     storageMailItems: scanSources.gmail
       ? [
           ...mailCandidates.map((mail) => ({
@@ -1357,7 +1389,7 @@ export default function App() {
   });
 
   useEffect(() => {
-    if (__DEV__ && DEV_AURA_ACCESS_TOKEN) return;
+    if (DEV_AURA_ACCESS_TOKEN) return;
 
     void loadGoogleSignInModule()
       .then(({ GoogleSignin }) => {
@@ -1864,11 +1896,13 @@ export default function App() {
   const applyApiScanSetting = (setting?: ApiScanSetting | null) => {
     if (!setting) return;
 
+    const savedScanSource = setting.scan_source;
+
     setApiScanSetting(setting);
     setScanSources({
-      gmail: setting.scan_source === 'MAIL' || setting.scan_source === 'MAIL_AND_DRIVE',
-      drive: setting.scan_source === 'DRIVE_ALL' || setting.scan_source === 'MAIL_AND_DRIVE',
-      folder: setting.scan_source === 'DRIVE_FOLDER',
+      gmail: savedScanSource === 'MAIL' || savedScanSource === 'MAIL_AND_DRIVE',
+      drive: savedScanSource === 'DRIVE_ALL' || savedScanSource === 'MAIL_AND_DRIVE' || savedScanSource === 'DRIVE_FOLDER',
+      folder: savedScanSource === 'DRIVE_FOLDER',
     });
     setIncludeSubFolders(Boolean(setting.include_subfolders ?? true));
     setIncludeMailAttachments(Boolean(setting.include_mail_attachment_size));
@@ -2194,12 +2228,9 @@ export default function App() {
       let latestCandidates: ApiCandidate[] = [];
 
       if (latestScanId && isCompletedScanStatus(latestScanStatus)) {
-        const [analysisSummaryResult, candidatesResult] = await Promise.allSettled([
-          scanApi.getAnalysisSummary(latestScanId, options),
-          fetchAllScanCandidates(latestScanId, token),
-        ]);
-        latestAnalysisSummary = analysisSummaryResult.status === 'fulfilled' ? analysisSummaryResult.value : null;
-        latestCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value : [];
+        const bundle = await fetchApiScanResultBundle(latestScanId, token);
+        latestAnalysisSummary = bundle.analysisSummary;
+        latestCandidates = bundle.candidates;
       }
 
       const estimatedBytes =
@@ -2216,6 +2247,7 @@ export default function App() {
       const source = latestScanForResult?.scan_source ?? latestHistory?.scan_source;
       const apiSummary = buildApiScanSummary({
         candidates: latestCandidates,
+        analysisSummary: latestAnalysisSummary,
         storageMailItems: storageMail,
         storageDriveItems: storageDrive,
         trashMailItems: [...trashMail, ...trashDrive],
@@ -2223,9 +2255,37 @@ export default function App() {
         candidateCount,
         carbonGrams: latestCleanup?.estimated_carbon_grams ?? latestHistory?.estimated_carbon_grams ?? homeSummary?.storage_summary?.total_estimated_carbon_grams,
       });
+      const currentSummary = scanResultRef.current;
+      const currentHasCandidateRows = Boolean(
+        currentSummary.mailItems.length ||
+        currentSummary.driveItems.length ||
+        currentSummary.largeItems.length ||
+        currentSummary.protectedItems.length
+      );
+      const apiHasCandidateRows = Boolean(
+        apiSummary.mailItems.length ||
+        apiSummary.driveItems.length ||
+        apiSummary.largeItems.length ||
+        apiSummary.protectedItems.length
+      );
+      const hasLatestCompletedScanResult = Boolean(latestScanId && isCompletedScanStatus(latestScanStatus));
+      const shouldPreserveCurrentScanRows =
+        (hasCompletedScan || homeScanNotice === 'completed') &&
+        currentHasCandidateRows &&
+        (!hasLatestCompletedScanResult || (apiSummary.candidateCount > 0 && !apiHasCandidateRows));
+      const nextApiSummary = shouldPreserveCurrentScanRows
+        ? {
+            ...currentSummary,
+            categorySummaries: apiSummary.categorySummaries.length ? apiSummary.categorySummaries : currentSummary.categorySummaries,
+            storageMailItems: apiSummary.storageMailItems,
+            storageDriveItems: apiSummary.storageDriveItems,
+            storageTrashItems: apiSummary.storageTrashItems,
+          }
+        : apiSummary;
 
       setApiHomeSummary(homeSummary);
-      setApiStorageSummary(apiSummary);
+      scanResultRef.current = nextApiSummary;
+      setApiStorageSummary(nextApiSummary);
       setApiScanHistoryItems(scanHistory);
       setApiStatisticsSummary(statisticsSummaryResult.status === 'fulfilled' ? statisticsSummaryResult.value : null);
       setApiCleanupHistoryItems(cleanupHistoriesResult.status === 'fulfilled' ? cleanupHistoriesResult.value.content ?? [] : []);
@@ -2298,22 +2358,22 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!__DEV__ || !DEV_AURA_ACCESS_TOKEN || devAccessTokenApplied.current) return;
+    if (!DEV_AURA_ACCESS_TOKEN || devAccessTokenApplied.current) return;
 
     devAccessTokenApplied.current = true;
     setApiAccessToken(DEV_AURA_ACCESS_TOKEN);
+    setCurrentUser((user) => user ?? { email: 'ejunwon1004@gmail.com', name: 'AURA 사용자' });
+    setPrivacyChecked(true);
+    setPrivacyDetailChecked(true);
+    replace('home');
 
     void userApi
       .getMe({ accessToken: DEV_AURA_ACCESS_TOKEN })
       .then((user) => {
         applyApiUser(user);
-        setPrivacyChecked(true);
-        setPrivacyDetailChecked(true);
         void refreshAuraApis(DEV_AURA_ACCESS_TOKEN);
-        replace('home');
       })
       .catch(() => {
-        setApiAccessToken(null);
         showToast('개발용 AURA access token을 확인해주세요');
       });
   }, []);
@@ -2614,12 +2674,50 @@ export default function App() {
   const getCurrentScanResult = () => apiStorageSummary ?? lastScan?.result ?? (apiAccessToken ? emptyScanSummary : scanResultRef.current);
 
   const getLatestCompletedScanJobId = () => {
+    if (hasCompletedScan || homeScanNotice === 'completed') {
+      if (activeApiScanJobId.current) return activeApiScanJobId.current;
+      if (apiScanJobId) return apiScanJobId;
+    }
+
     const latestScan = apiHomeSummary?.latest_scan;
     if (latestScan?.scan_job_id && isCompletedScanStatus(latestScan.job_status)) {
       return latestScan.scan_job_id;
     }
 
     return apiScanHistoryItems.find((item) => item.scan_job_id && isCompletedScanStatus(item.job_status))?.scan_job_id ?? null;
+  };
+
+  const fetchApiScanResultBundle = async (scanJobId: number, accessToken: string) => {
+    const [analysisSummaryResult, candidatesResult] = await Promise.allSettled([
+      scanApi.getAnalysisSummary(scanJobId, { accessToken }),
+      fetchAllScanCandidates(scanJobId, accessToken),
+    ]);
+    const analysisSummary = analysisSummaryResult.status === 'fulfilled' ? analysisSummaryResult.value : null;
+    let candidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value : [];
+    let candidateFetchFailed = candidatesResult.status === 'rejected';
+    const expectedCandidateCount = analysisSummary?.total_candidate_count ?? 0;
+
+    if (!candidates.length && expectedCandidateCount > 0) {
+      const selectedCandidatesResult = await Promise.allSettled([
+        scanApi.getSelectedCandidates(scanJobId, { accessToken }),
+      ]);
+      const selectedCandidates =
+        selectedCandidatesResult[0].status === 'fulfilled'
+          ? selectedCandidatesResult[0].value.items ?? []
+          : [];
+
+      if (selectedCandidates.length) {
+        candidates = selectedCandidates.map((candidate) => ({
+          ...candidate,
+          selection_status: candidate.selection_status ?? 'SELECTED',
+        }));
+        candidateFetchFailed = false;
+      } else if (selectedCandidatesResult[0].status === 'rejected') {
+        candidateFetchFailed = true;
+      }
+    }
+
+    return { analysisSummary, candidates, candidateFetchFailed };
   };
 
   const applyApiCandidateSummary = (
@@ -2644,6 +2742,7 @@ export default function App() {
       candidates.length;
     const candidateSummary = buildApiScanSummary({
       candidates,
+      analysisSummary,
       estimatedBytes,
       candidateCount,
       carbonGrams:
@@ -2693,13 +2792,7 @@ export default function App() {
 
     setCandidateSummaryLoading(true);
     try {
-      const [analysisSummaryResult, candidatesResult] = await Promise.allSettled([
-        scanApi.getAnalysisSummary(scanJobId, { accessToken: apiAccessToken }),
-        fetchAllScanCandidates(scanJobId, apiAccessToken),
-      ]);
-      const analysisSummary = analysisSummaryResult.status === 'fulfilled' ? analysisSummaryResult.value : null;
-      const candidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value : [];
-      const candidateFetchFailed = candidatesResult.status === 'rejected';
+      const { analysisSummary, candidates, candidateFetchFailed } = await fetchApiScanResultBundle(scanJobId, apiAccessToken);
 
       if (candidateFetchFailed) {
         showToast('분석 후보 목록을 불러오지 못했어요', undefined, 2600);
@@ -2758,6 +2851,7 @@ export default function App() {
         });
     }
 
+    scanResultRef.current = emptyScanSummary;
     setApiStorageSummary(emptyScanSummary);
     setLastScan(null);
     setHasCompletedScan(false);
@@ -2789,6 +2883,24 @@ export default function App() {
         candidate_id: Number(item.candidateId),
         selection_version: Number(item.selectionVersion ?? 0),
       }));
+  };
+
+  const openSelectedReviewFromSummary = () => {
+    const scanJobId = getLatestCompletedScanJobId();
+    const selectedServerCandidates = getSelectedApiCandidatePayloads();
+
+    if (apiAccessToken && scanJobId && !selectedServerCandidates.length) {
+      void loadLatestCandidateSummary().then((loaded) => {
+        if (loaded) {
+          go('selectedReview');
+          return;
+        }
+        showToast('후보 목록을 아직 불러오지 못했어요. 잠시 후 다시 눌러주세요', undefined, 2600);
+      });
+      return;
+    }
+
+    go('selectedReview');
   };
 
   const syncCandidateSelection = (key: string, selected: boolean) => {
@@ -2877,21 +2989,87 @@ export default function App() {
     return 'MAIL_AND_DRIVE' as const;
   };
 
-  const getApiScanSettingsPayload = () => ({
+  const normalizeKeywordListForPayload = (keywords: string[]) => {
+    const seen = new Set<string>();
+    const result: string[] = [];
+
+    keywords.forEach((keyword) => {
+      const value = keyword.trim();
+      const key = normalizeKeyword(value);
+      if (!value || seen.has(key)) return;
+      seen.add(key);
+      result.push(value);
+    });
+
+    return result;
+  };
+
+  const getEffectiveKeywordList = (type: 'include' | 'exclude') => {
+    const baseKeywords = type === 'include' ? includeKeywords : excludeKeywords;
+    const oppositeKeywords = type === 'include' ? excludeKeywords : includeKeywords;
+    const input = type === 'include' ? includeInput : excludeInput;
+    const pendingKeyword = keywordSheetType === type ? input.trim() : '';
+    const nextKeywords = [...baseKeywords];
+
+    if (
+      pendingKeyword &&
+      !keywordExists(baseKeywords, pendingKeyword) &&
+      !keywordExists(oppositeKeywords, pendingKeyword)
+    ) {
+      nextKeywords.push(pendingKeyword);
+    }
+
+    return normalizeKeywordListForPayload(nextKeywords);
+  };
+
+  const normalizeComparableKeywordList = (keywords?: string[]) =>
+    normalizeKeywordListForPayload(keywords ?? []).map(normalizeKeyword).sort();
+
+  const areKeywordListsEqual = (left?: string[], right?: string[]) => {
+    const leftList = normalizeComparableKeywordList(left);
+    const rightList = normalizeComparableKeywordList(right);
+    return leftList.length === rightList.length && leftList.every((item, index) => item === rightList[index]);
+  };
+
+  const areStringListsEqual = (left?: string[], right?: string[]) => {
+    const leftList = [...(left ?? [])].map((item) => item.trim().toUpperCase()).filter(Boolean).sort();
+    const rightList = [...(right ?? [])].map((item) => item.trim().toUpperCase()).filter(Boolean).sort();
+    return leftList.length === rightList.length && leftList.every((item, index) => item === rightList[index]);
+  };
+
+  const getApiScanSettingsPayload = (): ApiScanSettingRequest => ({
     scan_source: getApiScanSource(),
     drive_folder_id: getSelectedDriveFolderId() || undefined,
     include_subfolders: includeSubFolders,
     last_opened_before_months: lastOpenedBeforeMonths,
     last_modified_before_months: lastModifiedBeforeMonths,
     exclude_recent_days: 0,
-    include_keywords: includeKeywords,
-    exclude_keywords: excludeKeywords,
+    include_keywords: getEffectiveKeywordList('include'),
+    exclude_keywords: getEffectiveKeywordList('exclude'),
     file_extensions: Object.entries(selectedFileTypes)
       .filter(([, selected]) => selected)
       .map(([extension]) => extension.toUpperCase()),
     include_mail_attachment_size: includeMailAttachments,
     apply_recent_conditions: settingsToggles.autoScan,
   });
+
+  const hasLocalScanSettingChanges = (payload: ApiScanSettingRequest) => {
+    if (!apiScanSetting) return true;
+
+    return (
+      apiScanSetting.scan_source !== payload.scan_source ||
+      (apiScanSetting.drive_folder_id ?? undefined) !== (payload.drive_folder_id ?? undefined) ||
+      apiScanSetting.include_subfolders !== payload.include_subfolders ||
+      apiScanSetting.last_opened_before_months !== payload.last_opened_before_months ||
+      apiScanSetting.last_modified_before_months !== payload.last_modified_before_months ||
+      (apiScanSetting.exclude_recent_days ?? 0) !== payload.exclude_recent_days ||
+      !areKeywordListsEqual(apiScanSetting.include_keywords, payload.include_keywords) ||
+      !areKeywordListsEqual(apiScanSetting.exclude_keywords, payload.exclude_keywords) ||
+      !areStringListsEqual(apiScanSetting.file_extensions, payload.file_extensions) ||
+      apiScanSetting.include_mail_attachment_size !== payload.include_mail_attachment_size ||
+      apiScanSetting.apply_recent_conditions !== payload.apply_recent_conditions
+    );
+  };
 
   const saveApiScanSettings = async () => {
     if (!apiAccessToken) return;
@@ -2928,11 +3106,17 @@ export default function App() {
     setHomeScanNotice('running');
     go('scanProgress');
 
+    const scanSettingsPayload = getApiScanSettingsPayload();
+    const shouldUseSavedScanSettings =
+      hasCompletedScan &&
+      settingsToggles.autoScan &&
+      !hasLocalScanSettingChanges(scanSettingsPayload);
+
     void scanApi
       .create(
         {
-          use_saved_settings: hasCompletedScan && settingsToggles.autoScan,
-          settings_override: hasCompletedScan && settingsToggles.autoScan ? undefined : getApiScanSettingsPayload(),
+          use_saved_settings: shouldUseSavedScanSettings,
+          settings_override: shouldUseSavedScanSettings ? undefined : scanSettingsPayload,
         },
         { accessToken: apiAccessToken }
       )
@@ -3295,17 +3479,17 @@ export default function App() {
 
       const completeApiScan = async (job: ApiScanJob) => {
         try {
-          const [summaryResult, candidatesResult] = await Promise.allSettled([
-            scanApi.getAnalysisSummary(apiScanJobId, { accessToken: apiAccessToken }),
-            fetchAllScanCandidates(apiScanJobId, apiAccessToken),
-          ]);
+          const {
+            analysisSummary: apiSummary,
+            candidates: apiCandidates,
+            candidateFetchFailed,
+          } = await fetchApiScanResultBundle(apiScanJobId, apiAccessToken);
 
           if (cancelled) return;
 
-          const apiSummary = summaryResult.status === 'fulfilled' ? summaryResult.value : null;
-          const apiCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value : [];
           const nextSummary = buildApiScanSummary({
             candidates: apiCandidates,
+            analysisSummary: apiSummary,
             estimatedBytes: apiSummary?.total_estimated_reclaim_bytes ?? job.estimated_reclaim_bytes,
             candidateCount: apiSummary?.total_candidate_count ?? job.candidate_count,
           });
@@ -3330,6 +3514,9 @@ export default function App() {
 
           if (job.job_status === 'PARTIAL_FAILED') {
             showToast('일부 분석에 실패했어요. 후보를 확인해주세요', undefined, 3600);
+          }
+          if (candidateFetchFailed) {
+            showToast('분석 후보 목록 일부를 불러오지 못했어요. 결과 화면에서 다시 시도할게요', undefined, 3200);
           }
           if (permissions.alarm && settingsToggles.scanComplete) {
             notifyScanComplete();
@@ -3424,14 +3611,10 @@ export default function App() {
           setTimeout(() => {
             const apiScanJobId = activeApiScanJobId.current;
             if (apiAccessToken && apiScanJobId) {
-              void Promise.allSettled([
-                scanApi.getAnalysisSummary(apiScanJobId, { accessToken: apiAccessToken }),
-                fetchAllScanCandidates(apiScanJobId, apiAccessToken),
-              ]).then(([summaryResult, candidatesResult]) => {
-                const apiSummary = summaryResult.status === 'fulfilled' ? summaryResult.value : null;
-                const apiCandidates = candidatesResult.status === 'fulfilled' ? candidatesResult.value : [];
+              void fetchApiScanResultBundle(apiScanJobId, apiAccessToken).then(({ analysisSummary: apiSummary, candidates: apiCandidates }) => {
                 const nextSummary = buildApiScanSummary({
                   candidates: apiCandidates,
+                  analysisSummary: apiSummary,
                   storageMailItems: apiStorageSummary?.storageMailItems.map((item) => ({
                     title: item.subtitle,
                     size_bytes: Math.round(extractStorageSizeMB(item.meta) * 1024 * 1024),
@@ -3888,31 +4071,64 @@ export default function App() {
     const selectedCandidateCount = selectedMailItems.length + selectedDriveItems.length;
     const selectedTotalSizeMB = sumScanItemSize(selectedMailItems) + sumScanItemSize(selectedDriveItems);
     const selectedTotalSizeLabel = formatDataSize(selectedTotalSizeMB);
+    const getCategoryStats = (categories: ApiCandidateCategory[], fallbackItems: ScanListItem[]) => {
+      const categoryItems = activeScanResult.categorySummaries.filter((item) => item.category && categories.includes(item.category));
+      const fallbackCount = fallbackItems.length;
+      const fallbackBytes = Math.round(sumScanItemSize(fallbackItems) * 1024 * 1024);
+      const categoryCount = categoryItems.reduce((sum, item) => sum + item.itemCount, 0);
+      const categoryBytes = categoryItems.reduce((sum, item) => sum + item.estimatedBytes, 0);
+
+      return {
+        count: fallbackCount || categoryCount,
+        sizeLabel: fallbackBytes ? formatBytes(fallbackBytes) : formatBytes(categoryBytes),
+      };
+    };
+    const promoMailDisplay = getCategoryStats(['PROMOTION_MAIL'], promoMailItems);
+    const oldMailDisplay = getCategoryStats(['OLD_MAIL', 'LOW_VALUE_ATTACHMENT'], oldMailItems);
+    const oldDriveDisplay = getCategoryStats(['OLD_DRIVE_FILE', 'TEMP_OR_BACKUP'], oldDriveItems);
+    const duplicateDriveDisplay = getCategoryStats(['DUPLICATE_FILE'], duplicateDriveItems);
+    const largeDriveDisplay = getCategoryStats(['LARGE_FILE'], largeOnlyDriveItems);
+    const summaryCandidateDisplayCount = selectedCandidateCount || activeScanResult.candidateCount;
+    const summarySizeDisplayLabel = selectedTotalSizeMB > 0 ? selectedTotalSizeLabel : activeScanResult.totalSizeLabel;
     const homeStorageSummary = apiHomeSummary?.storage_summary as
       | (NonNullable<ApiHomeSummary['storage_summary']> & {
-          remaining_drive_bytes?: number;
-          drive_remaining_bytes?: number;
-          total_drive_bytes?: number;
-          drive_total_bytes?: number;
+          remaining_drive_bytes?: number | null;
+          drive_remaining_bytes?: number | null;
+          total_drive_bytes?: number | null;
+          drive_total_bytes?: number | null;
         })
       | undefined;
-    const latestRemainingDriveBytes =
+    const reportedRemainingDriveBytes = pickValidByteValue(
       homeStorageSummary?.latest_remaining_drive_bytes ??
-      homeStorageSummary?.remaining_drive_bytes ??
-      homeStorageSummary?.drive_remaining_bytes;
+      undefined,
+      homeStorageSummary?.remaining_drive_bytes,
+      homeStorageSummary?.drive_remaining_bytes,
+    );
+    const reportedDriveTotalBytes = pickValidByteValue(
+      homeStorageSummary?.total_drive_bytes,
+      homeStorageSummary?.drive_total_bytes,
+    );
+    const hasReportedDriveUsageBytes = reportedRemainingDriveBytes !== undefined && reportedDriveTotalBytes !== undefined && reportedDriveTotalBytes > 0;
+    const homeDriveTotalBytes = reportedDriveTotalBytes ?? DEFAULT_GOOGLE_DRIVE_TOTAL_BYTES;
+    const knownDriveStoredBytes = (apiStorageSummary?.storageDriveItems ?? []).reduce(
+      (sum, item) => sum + (item.type === 'F' ? 0 : Number(item.snapshotSizeBytes ?? 0)),
+      0,
+    );
+    const estimatedRemainingDriveBytes = Math.max(0, homeDriveTotalBytes - knownDriveStoredBytes);
+    const latestRemainingDriveBytes =
+      reportedRemainingDriveBytes ??
+      (permissions.drive ? estimatedRemainingDriveBytes : undefined);
     const hasLatestRemainingDriveBytes = latestRemainingDriveBytes !== undefined && latestRemainingDriveBytes !== null;
     const remainingAfterCleanup = hasLatestRemainingDriveBytes
       ? formatBytes(latestRemainingDriveBytes)
-      : activeScanResult.totalSizeLabel === '0MB' ? '-' : '-';
+      : '-';
     const homeRemainingDriveLabel = hasLatestRemainingDriveBytes ? formatBytes(latestRemainingDriveBytes) : '-';
-    const homeDriveTotalGB =
-      homeStorageSummary?.total_drive_bytes !== undefined
-        ? Math.max(1, homeStorageSummary.total_drive_bytes / 1024 / 1024 / 1024)
-        : homeStorageSummary?.drive_total_bytes !== undefined
-          ? Math.max(1, homeStorageSummary.drive_total_bytes / 1024 / 1024 / 1024)
-          : 15;
-    const homeDriveRemainingGB = hasLatestRemainingDriveBytes ? latestRemainingDriveBytes / 1024 / 1024 / 1024 : 2.6;
-    const homeDriveUsagePercent = Math.max(0, Math.min(100, Math.round(((homeDriveTotalGB - homeDriveRemainingGB) / homeDriveTotalGB) * 100)));
+    const homeDriveTotalGB = Math.max(1, homeDriveTotalBytes / 1024 / 1024 / 1024);
+    const homeDriveRemainingGB = hasLatestRemainingDriveBytes ? latestRemainingDriveBytes / 1024 / 1024 / 1024 : homeDriveTotalGB;
+    const homeDriveUsagePercent = hasReportedDriveUsageBytes
+      ? Math.max(0, Math.min(100, Math.round(((homeDriveTotalGB - homeDriveRemainingGB) / homeDriveTotalGB) * 100)))
+      : 0;
+    const homeDriveUsageLabel = hasReportedDriveUsageBytes ? `${homeDriveUsagePercent}% 사용` : '사용률 -';
     const cleanupDriveTotalGB = 15;
     const cleanupRemainingGB = sizeLabelToMB(remainingAfterCleanup) / 1024;
     const cleanupReclaimedGB = selectedTotalSizeMB / 1024;
@@ -4136,7 +4352,7 @@ export default function App() {
                   <Text style={styles.bigNumber}>{homeRemainingDriveLabel}</Text>
                 </View>
                 <View style={styles.capacityUsageBox}>
-                  <Text style={styles.capacityUsageText}>{homeDriveUsagePercent}% 사용</Text>
+                  <Text style={styles.capacityUsageText}>{homeDriveUsageLabel}</Text>
                   <View style={styles.capacityUsageTrack}>
                     <View style={[styles.capacityUsageFill, { width: `${homeDriveUsagePercent}%` }]} />
                   </View>
@@ -4163,7 +4379,7 @@ export default function App() {
                     <View style={styles.homeSummaryCapacityRow}>
                       <View style={styles.infoMain}>
                         <Text style={styles.homeSummaryCapacityLabel} numberOfLines={1}>확보용량</Text>
-                        <Text style={styles.homeSummaryValue}>{selectedTotalSizeLabel}</Text>
+                        <Text style={styles.homeSummaryValue}>{summarySizeDisplayLabel}</Text>
                       </View>
                       <Pressable
                         style={styles.homeTrashIconButton}
@@ -4243,35 +4459,35 @@ export default function App() {
                 <View style={styles.infoMain}>
                   <Text style={styles.recentHeroDate}>{formatScanDateOnly(lastScan.dateLabel)}</Text>
                 </View>
-                <Text style={styles.recentHeroSizeValue}>{selectedTotalSizeLabel}</Text>
+                <Text style={styles.recentHeroSizeValue}>{summarySizeDisplayLabel}</Text>
               </View>
               <Text style={styles.infoDesc}>{lastScan.sourceLabel}</Text>
               <View style={styles.thinDivider} />
               <View style={styles.rowBetween}>
                 <Text style={[styles.cardLabel, styles.textStrong]}>정리 후보</Text>
-                <Text style={styles.rowRight}>{selectedCandidateCount}개</Text>
+                <Text style={styles.rowRight}>{summaryCandidateDisplayCount}개</Text>
               </View>
             </View>
             <SectionTitle>분류별 결과</SectionTitle>
             <RecentResultRow
               title="광고·프로모션 메일"
-              value={`${promoMailCount}개\n${formatDataSize(sumScanItemSize(promoMailItems))}`}
+              value={`${promoMailDisplay.count}개\n${promoMailDisplay.sizeLabel}`}
             />
             <RecentResultRow
               title="오래된 메일"
-              value={`${oldMailCount}개\n${formatDataSize(sumScanItemSize(oldMailItems))}`}
+              value={`${oldMailDisplay.count}개\n${oldMailDisplay.sizeLabel}`}
             />
             <RecentResultRow
               title="오래된 파일"
-              value={`${oldDriveItems.length}개\n${formatDataSize(sumScanItemSize(oldDriveItems))}`}
+              value={`${oldDriveDisplay.count}개\n${oldDriveDisplay.sizeLabel}`}
             />
             <RecentResultRow
               title="중복 파일"
-              value={`${duplicateDriveItems.length}개\n${formatDataSize(sumScanItemSize(duplicateDriveItems))}`}
+              value={`${duplicateDriveDisplay.count}개\n${duplicateDriveDisplay.sizeLabel}`}
             />
             <RecentResultRow
               title="대용량 파일"
-              value={`${largeOnlyDriveItems.length}개\n${formatDataSize(sumScanItemSize(largeOnlyDriveItems))}`}
+              value={`${largeDriveDisplay.count}개\n${largeDriveDisplay.sizeLabel}`}
             />
           </ScreenShell>
         ) : (
@@ -4323,7 +4539,7 @@ export default function App() {
             />
             <ScanSourceCard
               title="Drive"
-              checked={scanSources.folder && Boolean(selectedDriveFolders.length || selectedDriveFiles.length)}
+              checked={scanSources.drive || scanSources.folder}
               detail="폴더 선택"
               onPress={() => {
                 if (!permissions.drive) {
@@ -4534,12 +4750,12 @@ export default function App() {
             ) : (
               <>
                 <View style={styles.resultMetricGrid}>
-                  <ResultMetricCard label="정리 후보" value={`${selectedCandidateCount}개`} />
-                  <ResultMetricCard label="예상 확보" value={selectedTotalSizeLabel} />
+                  <ResultMetricCard label="정리 후보" value={`${summaryCandidateDisplayCount}개`} />
+                  <ResultMetricCard label="예상 확보" value={summarySizeDisplayLabel} />
                 </View>
                 <ResultCategoryCard
                   title="광고·프로모션 메일"
-                  desc={`${promoMailCount}개 · ${formatDataSize(sumScanItemSize(promoMailItems))}`}
+                  desc={`${promoMailDisplay.count}개 · ${promoMailDisplay.sizeLabel}`}
                   onPress={() => {
                     setMailListMode('promo');
                     go('mailList');
@@ -4547,7 +4763,7 @@ export default function App() {
                 />
                 <ResultCategoryCard
                   title="오래된 메일"
-                  desc={`${oldMailCount}개 · ${formatDataSize(sumScanItemSize(oldMailItems))}`}
+                  desc={`${oldMailDisplay.count}개 · ${oldMailDisplay.sizeLabel}`}
                   onPress={() => {
                     setMailListMode('old');
                     go('mailList');
@@ -4555,7 +4771,7 @@ export default function App() {
                 />
                 <ResultCategoryCard
                   title="오래된 파일"
-                  desc={`${oldDriveItems.length}개 · ${formatDataSize(sumScanItemSize(oldDriveItems))}`}
+                  desc={`${oldDriveDisplay.count}개 · ${oldDriveDisplay.sizeLabel}`}
                   onPress={() => {
                     setDriveListMode('old');
                     go('driveList');
@@ -4563,7 +4779,7 @@ export default function App() {
                 />
                 <ResultCategoryCard
                   title="중복 파일"
-                  desc={`${duplicateDriveItems.length}개 · ${formatDataSize(sumScanItemSize(duplicateDriveItems))}`}
+                  desc={`${duplicateDriveDisplay.count}개 · ${duplicateDriveDisplay.sizeLabel}`}
                   warning={duplicateDeselectedCount ? `미선택 ${duplicateDeselectedCount}개` : undefined}
                   onPress={() => {
                     setDriveListMode('duplicate');
@@ -4572,14 +4788,14 @@ export default function App() {
                 />
                 <ResultCategoryCard
                   title="대용량 파일"
-                  desc={`${largeOnlyDriveItems.length}개 · ${formatDataSize(sumScanItemSize(largeOnlyDriveItems))}`}
+                  desc={`${largeDriveDisplay.count}개 · ${largeDriveDisplay.sizeLabel}`}
                   onPress={() => go('largeList')}
                 />
                 <Pressable onPress={() => activeScanResult.protectedItems.length ? go('protectedList') : showToast('제외 키워드로 보호된 항목이 없어요')}>
                   <Text style={styles.resultGuideText}>제외 키워드로 보호된 대상을 확인하세요</Text>
                 </Pressable>
-                {selectedCandidateCount > 0 ? (
-                  <PrimaryButton title="다음" onPress={() => go('selectedReview')} inline />
+                {summaryCandidateDisplayCount > 0 ? (
+                  <PrimaryButton title={selectedCandidateCount > 0 ? '다음' : '후보 목록 다시 불러오기'} onPress={openSelectedReviewFromSummary} inline />
                 ) : (
                   <OutlineButton title="취소" onPress={cancelEmptyScanResult} />
                 )}
@@ -4991,7 +5207,7 @@ export default function App() {
             />
             <InfoRow
               title="기본 분석 범위"
-              desc={scanSources.gmail && scanSources.drive ? 'Gmail + Drive' : scanSources.gmail ? 'Gmail' : scanSources.drive ? 'Drive' : '선택된 서비스 없음'}
+              desc={getSimpleScanSourceLabel()}
               right="변경  ›"
               onPress={openScanSourceSettings}
             />
@@ -6905,9 +7121,11 @@ function RecentResultRow({ title, desc, value }: { title: string; desc?: string;
 
 function CarbonStatsGraph({ sizeLabel, values, labels }: { sizeLabel: string; values?: number[]; labels?: string[] }) {
   const reveal = useRef(new Animated.Value(0)).current;
+  const lastAnimatedGraphKey = useRef('');
   const current = sizeLabelToMB(sizeLabel) / 1024;
   const chartWidth = Math.max(260, Dimensions.get('window').width - 96);
   const rawValues = values?.length ? values : [Math.max(0, current)];
+  const graphKey = `${sizeLabel}|${rawValues.join(',')}|${(labels ?? []).join(',')}`;
   const scanValues = rawValues.length === 1
     ? [0, Math.max(0, rawValues[0])]
     : rawValues.map((value) => Math.max(0, value));
@@ -6916,14 +7134,22 @@ function CarbonStatsGraph({ sizeLabel, values, labels }: { sizeLabel: string; va
     : scanValues.map((_, index) => (index === 0 && rawValues.length === 1 ? '' : `${index + 1}회`));
 
   useEffect(() => {
+    if (lastAnimatedGraphKey.current === graphKey) {
+      reveal.setValue(1);
+      return undefined;
+    }
+
+    lastAnimatedGraphKey.current = graphKey;
     reveal.setValue(0);
-    Animated.timing(reveal, {
+    const animation = Animated.timing(reveal, {
       toValue: 1,
       duration: 850,
       easing: Easing.out(Easing.cubic),
       useNativeDriver: false,
-    }).start();
-  }, [reveal, sizeLabel, values]);
+    });
+    animation.start();
+    return () => animation.stop();
+  }, [graphKey, reveal]);
 
   const revealWidth = reveal.interpolate({
     inputRange: [0, 1],
