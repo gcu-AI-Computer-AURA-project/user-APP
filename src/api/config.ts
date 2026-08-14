@@ -77,6 +77,7 @@ export const API_ENDPOINTS = {
     items: '/api/storage/items',
     itemDetail: (itemId: string | number) => `/api/storage/items/${itemId}`,
     liveDetail: '/api/storage/items/detail',
+    moveToTrash: '/api/storage/items/trash',
     trash: '/api/storage/trash',
     restore: '/api/storage/trash/restore',
     permanentDelete: '/api/storage/trash/permanent-delete',
