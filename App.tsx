@@ -1562,6 +1562,8 @@ export default function App() {
   };
 
   const closeKeywordSheet = () => {
+    if (keywordSheetType === 'include' && includeInput.trim()) addKeyword('include');
+    if (keywordSheetType === 'exclude' && excludeInput.trim()) addKeyword('exclude');
     Animated.timing(keywordSheetMotion, {
       toValue: 1,
       duration: 220,
@@ -2701,7 +2703,6 @@ export default function App() {
 
       if (candidateFetchFailed) {
         showToast('분석 후보 목록을 불러오지 못했어요', undefined, 2600);
-        return false;
       }
 
       if (!analysisSummary && !candidates.length) {
@@ -2728,7 +2729,7 @@ export default function App() {
       result.candidateCount;
     const latestScanJobId = getLatestCompletedScanJobId();
 
-    if (localCandidateCount > 0 || serverCandidateCount <= 0) return;
+    if (localCandidateCount > 0) return;
     if (latestScanJobId && candidateSummaryLoadAttemptedScanId.current === latestScanJobId) return;
 
     candidateSummaryLoadAttemptedScanId.current = latestScanJobId;
@@ -3093,9 +3094,8 @@ export default function App() {
           },
           { accessToken: apiAccessToken }
         )
-        .catch(() => undefined)
         .then(() => {
-          if (!activeApiScanJobId.current) return null;
+          if (!activeApiScanJobId.current) throw new Error('No active scan job');
           return cleanupApi.create(
             {
               scan_job_id: activeApiScanJobId.current,
@@ -3107,7 +3107,7 @@ export default function App() {
           );
         })
         .then((job) => {
-          if (!job?.cleanup_job_id) return;
+          if (!job?.cleanup_job_id) throw new Error('No cleanup job created');
           activeApiCleanupJobId.current = job.cleanup_job_id;
           setApiCleanupJobId(job.cleanup_job_id);
         })
@@ -3903,8 +3903,8 @@ export default function App() {
     const hasLatestRemainingDriveBytes = latestRemainingDriveBytes !== undefined && latestRemainingDriveBytes !== null;
     const remainingAfterCleanup = hasLatestRemainingDriveBytes
       ? formatBytes(latestRemainingDriveBytes)
-      : activeScanResult.totalSizeLabel === '0MB' ? '2.6GB' : '4.7GB';
-    const homeRemainingDriveLabel = hasLatestRemainingDriveBytes ? formatBytes(latestRemainingDriveBytes) : '2.6GB';
+      : activeScanResult.totalSizeLabel === '0MB' ? '-' : '-';
+    const homeRemainingDriveLabel = hasLatestRemainingDriveBytes ? formatBytes(latestRemainingDriveBytes) : '-';
     const homeDriveTotalGB =
       homeStorageSummary?.total_drive_bytes !== undefined
         ? Math.max(1, homeStorageSummary.total_drive_bytes / 1024 / 1024 / 1024)
@@ -5066,31 +5066,7 @@ export default function App() {
                     </View>
                     <Text style={styles.rowRight}>{formatUnknownValue(privacyData?.managed_data_summary?.cleanup_history_count)}</Text>
                   </View>
-                  <View style={styles.thinDivider} />
-                  <View style={styles.settingPlainRow}>
-                    <View style={styles.infoMain}>
-                      <Text style={styles.infoTitle}>저장소 항목</Text>
-                    </View>
-                    <Text style={styles.rowRight}>{formatUnknownValue(privacyData?.managed_data_summary?.scanned_item_count)}</Text>
-                  </View>
-                  <View style={styles.thinDivider} />
-                  <View style={styles.settingPlainRow}>
-                    <View style={styles.infoMain}>
-                      <Text style={styles.infoTitle}>데이터 정책</Text>
-                    </View>
-                    <Text style={styles.rowRight}>
-                      {privacyData?.data_retention
-                        ? `스캔 ${privacyData.data_retention.scan_data_policy ?? '-'} / 기록 ${privacyData.data_retention.history_data_policy ?? '-'}`
-                        : '-'}
-                    </Text>
-                  </View>
-                  <View style={styles.thinDivider} />
-                  <View style={styles.settingPlainRow}>
-                    <View style={styles.infoMain}>
-                      <Text style={styles.infoTitle}>동의 버전</Text>
-                    </View>
-                    <Text style={styles.rowRight}>{privacyData?.consents?.consent_version ?? '-'}</Text>
-                  </View>
+
                 </>
               ) : null}
             </View>
@@ -6024,6 +6000,11 @@ function KeywordBottomSheet({
 }) {
   const isInclude = type === 'include';
 
+  const handleClose = () => {
+    if (input.trim()) onAddInput();
+    onClose();
+  };
+
   return (
     <Animated.View
       style={[
@@ -6036,9 +6017,9 @@ function KeywordBottomSheet({
         },
       ]}
     >
-      <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
+      <Pressable style={StyleSheet.absoluteFill} onPress={handleClose} />
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.sheetKeyboardAvoider}>
-        <BottomSheetPanel motion={motion} outputRange={[0, 360]} style={styles.keywordSheet} onClose={onClose}>
+        <BottomSheetPanel motion={motion} outputRange={[0, 360]} style={styles.keywordSheet} onClose={handleClose}>
           <Text style={styles.modalTitle}>{isInclude ? '포함 키워드 설정' : '제외 키워드 설정'}</Text>
           <Text style={[styles.infoDesc, styles.keywordSheetDesc]}>
             {isInclude ? '해당 키워드가 있는 메일을 정리 후보에 포함합니다' : '해당 키워드가 있는 메일은 정리 후보에서 보호합니다'}
@@ -6063,7 +6044,7 @@ function KeywordBottomSheet({
               </Pressable>
             ))}
           </View>
-          <PrimaryButton title={isInclude ? '포함 키워드 적용' : '제외 키워드 적용'} onPress={onClose} inline />
+          <PrimaryButton title={isInclude ? '포함 키워드 적용' : '제외 키워드 적용'} onPress={handleClose} inline />
         </BottomSheetPanel>
       </KeyboardAvoidingView>
     </Animated.View>
@@ -6823,7 +6804,7 @@ function ScanItemDetailScreen({
             </Text>
           ) : null}
           {apiDetail?.analysis?.ai_confidence_score !== undefined ? (
-            <Text style={styles.detailInfoText}>AI 신뢰도 {Math.round(apiDetail.analysis.ai_confidence_score * 100)}%</Text>
+            <Text style={styles.detailInfoText}>AI 신뢰도 {(apiDetail.analysis.ai_confidence_score * 100).toFixed(2)}%</Text>
           ) : null}
           {detailError ? <Text style={styles.warningText}>{detailError}</Text> : null}
         </View>
@@ -6839,7 +6820,7 @@ function ScanItemDetailScreen({
           ) : null}
           {apiDetail?.item?.folder_path ? <Text style={styles.detailInfoText}>Drive 경로 {apiDetail.item.folder_path}</Text> : null}
           {apiDetail?.analysis?.ai_confidence_score !== undefined ? (
-            <Text style={styles.detailInfoText}>AI 신뢰도 {Math.round(apiDetail.analysis.ai_confidence_score * 100)}%</Text>
+            <Text style={styles.detailInfoText}>AI 신뢰도 {(apiDetail.analysis.ai_confidence_score * 100).toFixed(2)}%</Text>
           ) : null}
           {detailError ? <Text style={styles.warningText}>{detailError}</Text> : null}
         </View>
@@ -7104,7 +7085,8 @@ function StorageScreen({
   const currentStorageDriveItems = storageDriveUniverse
     .filter((item) => {
       const itemPath = item.fullPath ?? '';
-      return itemPath === storageDriveFolder || getDriveParentPath(itemPath) === storageDriveFolder;
+      if (item.type === 'F') return getDriveParentPath(itemPath) === storageDriveFolder;
+      return itemPath === storageDriveFolder;
     });
   const driveItems = isDrive && !isTrash ? currentStorageDriveItems : summary.storageDriveItems;
   const activeDriveFolder = mode === 'storageDriveTrash' ? storageDriveTrashFolder : storageDriveFolder;
@@ -7584,29 +7566,7 @@ function StorageScreen({
                 ))}
               </View>
               <Text style={styles.storagePathCountText}>{activeItems.length}개</Text>
-              {shouldUseServerPagination ? (
-                <View style={styles.storagePagerRow}>
-                  <Text style={styles.storagePagerText}>
-                    {pageRangeTotal}개 중 {mailPageRangeStart}~{mailPageRangeEnd}개
-                  </Text>
-                  <View style={styles.storagePagerButtons}>
-                    <Pressable
-                      style={[styles.storagePagerButton, safeStoragePage <= 0 && styles.storagePagerButtonDisabled]}
-                      disabled={safeStoragePage <= 0}
-                      onPress={() => setStoragePage((page) => Math.max(0, page - 1))}
-                    >
-                      <Text style={[styles.storagePagerGlyph, safeStoragePage <= 0 && styles.storagePagerGlyphDisabled]}>‹</Text>
-                    </Pressable>
-                    <Pressable
-                      style={[styles.storagePagerButton, safeStoragePage >= mailPageCount - 1 && styles.storagePagerButtonDisabled]}
-                      disabled={safeStoragePage >= mailPageCount - 1}
-                      onPress={() => setStoragePage((page) => Math.min(mailPageCount - 1, page + 1))}
-                    >
-                      <Text style={[styles.storagePagerGlyph, safeStoragePage >= mailPageCount - 1 && styles.storagePagerGlyphDisabled]}>›</Text>
-                    </Pressable>
-                  </View>
-                </View>
-              ) : null}
+
             </View>
           ) : (
             <View style={[styles.storagePathCard, styles.storagePagerCard]}>
@@ -8394,14 +8354,14 @@ function CarbonSaveAnimation({ onDone, skip }: { onDone: () => void; skip?: bool
       <View style={styles.historyTotalMiniCard}>
         <View>
           <Text style={styles.onboardingMetricLabel}>전체 누적 삭제 용량</Text>
-          <Text style={styles.historyTotalMiniValue}>{step >= 1 ? '6.8GB' : '...'}</Text>
+          <Text style={styles.historyTotalMiniValue}>{step >= 1 ? '0MB' : '...'}</Text>
         </View>
         <View style={styles.historyMiniPill}>
-          <Text style={styles.historyMiniPillText}>최근 스캔 +2.6GB</Text>
+          <Text style={styles.historyMiniPillText}>최근 스캔 +0MB</Text>
         </View>
       </View>
       <SectionTitle>스캔별 확보 용량 현황</SectionTitle>
-      <CarbonStatsGraph sizeLabel="2.6GB" />
+      <CarbonStatsGraph sizeLabel="0MB" />
     </View>
   );
 }
