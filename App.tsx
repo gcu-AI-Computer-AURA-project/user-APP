@@ -27,6 +27,7 @@ import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
 import { LineChart } from 'react-native-chart-kit';
 import Constants from 'expo-constants';
 import * as Device from 'expo-device';
+import * as FileSystem from 'expo-file-system/legacy';
 import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
 import { DEV_AURA_ACCESS_TOKEN, GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
@@ -886,7 +887,7 @@ function apiStorageItemToDriveFromApi(item: ApiStorageItem, folders: DriveFolder
     itemSource: item.item_source ?? 'DRIVE',
     type: extension || 'FILE',
     title,
-    subtitle: isFolder ? `${parentPath} · 폴더` : `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · Drive`,
+    subtitle: isFolder ? `${parentPath} · 폴더` : `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · ${parentPath}`,
     fullPath: isFolder ? normalizeServerDrivePath(`${parentPath} › ${title}`) : parentPath,
   };
 }
@@ -906,7 +907,7 @@ function apiStorageItemToDrive(item: ApiStorageItem): StorageDriveItem {
     itemSource: item.item_source ?? 'DRIVE',
     type: extension || 'FILE',
     title: item.title || item.external_item_id || 'Drive 파일',
-    subtitle: `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · Drive`,
+    subtitle: `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · ${parentPath}`,
     fullPath: isFolder ? normalizeApiDrivePath(`${parentPath} › ${title}`) : parentPath,
   };
 }
@@ -1316,6 +1317,7 @@ export default function App() {
   const [apiAccessToken, setApiAccessToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<AuraUser | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
+  const [deviceStorageBytes, setDeviceStorageBytes] = useState<{ free?: number; total?: number }>({});
   const [permissionToast, setPermissionToast] = useState('');
   const [toastTarget, setToastTarget] = useState<Screen | null>(null);
   const [includeInput, setIncludeInput] = useState('');
@@ -1453,6 +1455,31 @@ export default function App() {
         // Expo Go에는 Google Sign-In 네이티브 모듈이 포함되지 않는다.
       });
   }, []);
+
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    if (screen !== 'home') return;
+
+    let active = true;
+    void Promise.all([
+      FileSystem.getFreeDiskStorageAsync(),
+      FileSystem.getTotalDiskCapacityAsync(),
+    ])
+      .then(([free, total]) => {
+        if (!active) return;
+        setDeviceStorageBytes({
+          free: Number.isFinite(free) ? free : undefined,
+          total: Number.isFinite(total) ? total : undefined,
+        });
+      })
+      .catch(() => {
+        if (active) setDeviceStorageBytes({});
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [screen]);
 
   const go = (next: Screen) => {
     transitionDirection.current = -1;
@@ -4216,11 +4243,12 @@ export default function App() {
       homeStorageSummary?.total_drive_bytes,
       homeStorageSummary?.drive_total_bytes,
     );
+    const reportedDeviceFreeBytes = pickValidByteValue(deviceStorageBytes.free);
+    const reportedDeviceTotalBytes = pickValidByteValue(deviceStorageBytes.total);
     const homeEstimatedReclaimBytes = homeStorageSummary?.estimated_reclaim_bytes ?? 0;
     const apiSummarySizeDisplayLabel = formatBytes(homeEstimatedReclaimBytes);
     const summaryCandidateDisplayCount = selectedCandidateCount || activeScanResult.candidateCount;
     const summarySizeDisplayLabel = selectedTotalSizeMB > 0 ? selectedTotalSizeLabel : apiSummarySizeDisplayLabel;
-    const hasReportedDriveUsageBytes = reportedRemainingDriveBytes !== undefined && reportedDriveTotalBytes !== undefined && reportedDriveTotalBytes > 0;
     const homeDriveTotalBytes = reportedDriveTotalBytes ?? DEFAULT_GOOGLE_DRIVE_TOTAL_BYTES;
     const knownDriveStoredBytes = (apiStorageSummary?.storageDriveItems ?? []).reduce(
       (sum, item) => sum + (item.type === 'F' ? 0 : Number(item.snapshotSizeBytes ?? 0)),
@@ -4234,13 +4262,23 @@ export default function App() {
     const remainingAfterCleanup = hasLatestRemainingDriveBytes
       ? formatBytes(latestRemainingDriveBytes)
       : '-';
-    const homeRemainingDriveLabel = hasLatestRemainingDriveBytes ? formatBytes(latestRemainingDriveBytes) : '-';
     const homeDriveTotalGB = Math.max(1, homeDriveTotalBytes / 1024 / 1024 / 1024);
-    const homeDriveRemainingGB = hasLatestRemainingDriveBytes ? latestRemainingDriveBytes / 1024 / 1024 / 1024 : homeDriveTotalGB;
-    const homeDriveUsagePercent = hasReportedDriveUsageBytes
-      ? Math.max(0, Math.min(100, Math.round(((homeDriveTotalGB - homeDriveRemainingGB) / homeDriveTotalGB) * 100)))
+    const hasReportedDeviceStorageBytes =
+      reportedDeviceFreeBytes !== undefined &&
+      reportedDeviceTotalBytes !== undefined &&
+      reportedDeviceTotalBytes > 0;
+    const homeCapacityFreeBytes = hasReportedDeviceStorageBytes ? reportedDeviceFreeBytes : latestRemainingDriveBytes;
+    const homeCapacityTotalBytes = hasReportedDeviceStorageBytes ? reportedDeviceTotalBytes : homeDriveTotalBytes;
+    const hasHomeCapacityBytes =
+      homeCapacityFreeBytes !== undefined &&
+      homeCapacityFreeBytes !== null &&
+      homeCapacityTotalBytes !== undefined &&
+      homeCapacityTotalBytes > 0;
+    const homeCapacityUsagePercent = hasHomeCapacityBytes
+      ? Math.max(0, Math.min(100, Math.round(((homeCapacityTotalBytes - homeCapacityFreeBytes) / homeCapacityTotalBytes) * 100)))
       : 0;
-    const homeDriveUsageLabel = hasReportedDriveUsageBytes ? `${homeDriveUsagePercent}% 사용` : '사용률 -';
+    const homeCapacityUsageLabel = hasHomeCapacityBytes ? `${homeCapacityUsagePercent}% 사용` : '사용률 -';
+    const homeCapacityRemainingLabel = homeCapacityFreeBytes !== undefined && homeCapacityFreeBytes !== null ? formatBytes(homeCapacityFreeBytes) : '-';
     const cleanupDriveTotalGB = Math.max(1, homeDriveTotalBytes / 1024 / 1024 / 1024);
     const cleanupDriveTotalLabel = formatBytes(homeDriveTotalBytes);
     const cleanupRemainingGB = sizeLabelToMB(remainingAfterCleanup) / 1024;
@@ -4466,12 +4504,12 @@ export default function App() {
               <View style={styles.capacityCardRow}>
                 <View style={styles.infoMain}>
                   <Text style={styles.cardLabel}>남은 용량</Text>
-                  <Text style={styles.bigNumber}>{homeRemainingDriveLabel}</Text>
+                  <Text style={styles.bigNumber}>{homeCapacityRemainingLabel}</Text>
                 </View>
                 <View style={styles.capacityUsageBox}>
-                  <Text style={styles.capacityUsageText}>{homeDriveUsageLabel}</Text>
+                  <Text style={styles.capacityUsageText}>{homeCapacityUsageLabel}</Text>
                   <View style={styles.capacityUsageTrack}>
-                    <View style={[styles.capacityUsageFill, { width: `${homeDriveUsagePercent}%` }]} />
+                    <View style={[styles.capacityUsageFill, { width: `${homeCapacityUsagePercent}%` }]} />
                   </View>
                 </View>
               </View>
@@ -8346,7 +8384,9 @@ function StorageDriveCard({
           <Text style={styles.infoTitle}>{item.title}</Text>
           {descriptionOverride ? (
             <Text style={styles.storageCompactMeta} numberOfLines={1}>{descriptionOverride}</Text>
-          ) : compact ? null : (
+          ) : compact ? (
+            <Text style={styles.storageCompactMeta} numberOfLines={2}>{item.subtitle}</Text>
+          ) : (
             <Text style={styles.infoDesc}>{item.subtitle}</Text>
           )}
         </View>
