@@ -33,6 +33,7 @@ export type ApiCandidateCategory =
 export type ApiStorageSummary = {
   estimated_reclaim_bytes?: number;
   latest_remaining_drive_bytes?: number | null;
+  total_drive_bytes?: number | null;
   total_reclaimed_bytes?: number;
   total_estimated_carbon_grams?: number;
 };
@@ -698,7 +699,10 @@ export const cleanupApi = {
 };
 
 export const storageApi = {
-  async getItems(query: { item_source: ApiItemSource; trashed?: boolean; sort?: string; page?: number; size?: number }, options?: ApiRequestOptions) {
+  async getItems(
+    query: { item_source: ApiItemSource; trashed?: boolean; sort?: string; page?: number; size?: number; parent_id?: string },
+    options?: ApiRequestOptions
+  ) {
     return unwrap(
       await apiRequest<ApiEnvelope<ApiPage<ApiStorageItem>>>(API_ENDPOINTS.storage.items, {
         method: 'GET',

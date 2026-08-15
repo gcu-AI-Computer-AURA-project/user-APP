@@ -649,9 +649,11 @@ const emptyScanSummary: ScanSummary = {
 };
 
 function formatDataSize(sizeMB: number) {
+  if (sizeMB >= 1024 * 1024) {
+    return `${Math.round(sizeMB / 1024 / 1024)}TB`;
+  }
   if (sizeMB >= 1024) {
-    const gb = sizeMB / 1024;
-    return `${gb >= 10 ? gb.toFixed(0) : gb.toFixed(1)}GB`;
+    return `${Math.round(sizeMB / 1024)}GB`;
   }
   if (sizeMB < 1) return `${sizeMB.toFixed(1)}MB`;
   return `${Math.round(sizeMB)}MB`;
@@ -990,14 +992,20 @@ function formatMonthDuration(months: number) {
 
 function sizeLabelToMB(label: string) {
   const value = Number.parseFloat(label.replace(/[^0-9.]/g, '')) || 0;
-  return label.includes('GB') ? value * 1024 : value;
+  const unit = label.toUpperCase();
+  if (unit.includes('TB')) return value * 1024 * 1024;
+  if (unit.includes('GB')) return value * 1024;
+  return value;
 }
 
 function extractStorageSizeMB(textValue: string) {
-  const match = textValue.match(/(\d+(?:\.\d+)?)\s*(GB|MB)/i);
+  const match = textValue.match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB)/i);
   if (!match) return 0;
   const value = Number.parseFloat(match[1]) || 0;
-  return match[2].toUpperCase() === 'GB' ? value * 1024 : value;
+  const unit = match[2].toUpperCase();
+  if (unit === 'TB') return value * 1024 * 1024;
+  if (unit === 'GB') return value * 1024;
+  return value;
 }
 
 function getStorageSizeLabel(textValue: string) {
@@ -4088,8 +4096,6 @@ export default function App() {
     const oldDriveDisplay = getCategoryStats(['OLD_DRIVE_FILE', 'TEMP_OR_BACKUP'], oldDriveItems);
     const duplicateDriveDisplay = getCategoryStats(['DUPLICATE_FILE'], duplicateDriveItems);
     const largeDriveDisplay = getCategoryStats(['LARGE_FILE'], largeOnlyDriveItems);
-    const summaryCandidateDisplayCount = selectedCandidateCount || activeScanResult.candidateCount;
-    const summarySizeDisplayLabel = selectedTotalSizeMB > 0 ? selectedTotalSizeLabel : activeScanResult.totalSizeLabel;
     const homeStorageSummary = apiHomeSummary?.storage_summary as
       | (NonNullable<ApiHomeSummary['storage_summary']> & {
           remaining_drive_bytes?: number | null;
@@ -4108,6 +4114,10 @@ export default function App() {
       homeStorageSummary?.total_drive_bytes,
       homeStorageSummary?.drive_total_bytes,
     );
+    const homeEstimatedReclaimBytes = homeStorageSummary?.estimated_reclaim_bytes ?? 0;
+    const apiSummarySizeDisplayLabel = formatBytes(homeEstimatedReclaimBytes);
+    const summaryCandidateDisplayCount = selectedCandidateCount || activeScanResult.candidateCount;
+    const summarySizeDisplayLabel = selectedTotalSizeMB > 0 ? selectedTotalSizeLabel : apiSummarySizeDisplayLabel;
     const hasReportedDriveUsageBytes = reportedRemainingDriveBytes !== undefined && reportedDriveTotalBytes !== undefined && reportedDriveTotalBytes > 0;
     const homeDriveTotalBytes = reportedDriveTotalBytes ?? DEFAULT_GOOGLE_DRIVE_TOTAL_BYTES;
     const knownDriveStoredBytes = (apiStorageSummary?.storageDriveItems ?? []).reduce(
@@ -4129,7 +4139,8 @@ export default function App() {
       ? Math.max(0, Math.min(100, Math.round(((homeDriveTotalGB - homeDriveRemainingGB) / homeDriveTotalGB) * 100)))
       : 0;
     const homeDriveUsageLabel = hasReportedDriveUsageBytes ? `${homeDriveUsagePercent}% 사용` : '사용률 -';
-    const cleanupDriveTotalGB = 15;
+    const cleanupDriveTotalGB = Math.max(1, homeDriveTotalBytes / 1024 / 1024 / 1024);
+    const cleanupDriveTotalLabel = formatBytes(homeDriveTotalBytes);
     const cleanupRemainingGB = sizeLabelToMB(remainingAfterCleanup) / 1024;
     const cleanupReclaimedGB = selectedTotalSizeMB / 1024;
     const cleanupCurrentUsedGB = Math.max(0, cleanupDriveTotalGB - cleanupRemainingGB - cleanupReclaimedGB);
@@ -4617,7 +4628,7 @@ export default function App() {
                     <FolderRow
                       key={folder.name}
                       title={isDriveSearching ? folder.name : getDriveFolderName(folder.name)}
-                      desc={folder.meta ? formatFolderMeta(folder.meta) : undefined}
+                      desc={undefined}
                       selected={getDriveFolderSelected(folder.name, selectedDriveFolders, selectedDriveFiles, activeDriveFolderOptions)}
                       canOpen={hasDriveFolderChildren(folder.name, activeDriveFolderOptions)}
                       onPress={() => toggleDriveFolder(folder.name)}
@@ -5032,7 +5043,7 @@ export default function App() {
                   ]}
                 />
               </View>
-              <Text style={styles.cleanupDriveTotalLabel}>{cleanupDriveTotalGB}GB</Text>
+              <Text style={styles.cleanupDriveTotalLabel}>{cleanupDriveTotalLabel}</Text>
             </Card>
             <View style={styles.cleanupButtonSpacer} />
             <View style={styles.twoButtons}>
@@ -7297,10 +7308,11 @@ function StorageScreen({
       subtitle: item.type === 'F' ? `${fullPath} · 폴더` : `${meta} · ${targetFolder}`,
     };
   };
+  const normalizedStorageDriveFolder = normalizeServerDrivePath(storageDriveFolder);
   const apiStorageFolderItems =
     shouldUseServerPagination && mode === 'storageDrive'
       ? driveFolders
-          .filter((folder) => normalizeServerDrivePath(folder.parentId) === storageDriveFolder)
+          .filter((folder) => normalizeServerDrivePath(folder.parentId) === normalizedStorageDriveFolder)
           .map(apiDriveFolderToStorageItemFromApi)
       : [];
   const storageDriveUniverse = (shouldUseServerPagination && mode === 'storageDrive'
@@ -7311,8 +7323,8 @@ function StorageScreen({
   const currentStorageDriveItems = storageDriveUniverse
     .filter((item) => {
       const itemPath = item.fullPath ?? '';
-      if (item.type === 'F') return getDriveParentPath(itemPath) === storageDriveFolder;
-      return itemPath === storageDriveFolder;
+      if (item.type === 'F') return getDriveParentPath(itemPath) === normalizedStorageDriveFolder;
+      return normalizeServerDrivePath(itemPath) === normalizedStorageDriveFolder;
     });
   const driveItems = isDrive && !isTrash ? currentStorageDriveItems : summary.storageDriveItems;
   const activeDriveFolder = mode === 'storageDriveTrash' ? storageDriveTrashFolder : storageDriveFolder;
@@ -7464,11 +7476,16 @@ function StorageScreen({
     : activeItems.filter((item) => isItemChecked(item.id));
   const selectedActiveItemCount = selectedItems.length;
   const isStorageLoading = googlePermissionChecking || apiBootstrapLoading || serverPageLoading;
+  const storageDriveParentId =
+    storageServerSource === 'DRIVE' && !isTrash && normalizedStorageDriveFolder !== driveRootPath
+      ? driveFolders.find((folder) => normalizeServerDrivePath(folder.name) === normalizedStorageDriveFolder)?.id
+      : undefined;
 
   const loadStorageServerPage = (page: number) => {
     if (!apiAccessToken || !shouldUseServerPagination) return;
+    if (storageServerSource === 'DRIVE' && !isTrash && normalizedStorageDriveFolder !== driveRootPath && !storageDriveParentId) return;
 
-    const cacheKey = `${apiAccessToken}:${mode}:${storageServerSource}:${page}`;
+    const cacheKey = `${apiAccessToken}:${mode}:${storageServerSource}:${page}:${storageDriveParentId ?? 'root'}`;
     const cachedPage = serverPageCacheRef.current[cacheKey];
     if (cachedPage) {
       setServerPage(cachedPage);
@@ -7483,7 +7500,10 @@ function StorageScreen({
     setServerPageError('');
     const request = isTrash
       ? storageApi.getTrash({ item_source: storageServerSource, page, size: storageApiPageSize }, { accessToken: apiAccessToken })
-      : storageApi.getItems({ item_source: storageServerSource, page, size: storageApiPageSize }, { accessToken: apiAccessToken });
+      : storageApi.getItems(
+          { item_source: storageServerSource, page, size: storageApiPageSize, parent_id: storageDriveParentId },
+          { accessToken: apiAccessToken }
+        );
 
     void request
       .then((result) => {
@@ -7515,12 +7535,12 @@ function StorageScreen({
     setServerPage(null);
     setServerPageError('');
     setServerPageLoading(false);
-  }, [apiAccessToken, mode]);
+  }, [apiAccessToken, mode, storageDriveFolder]);
 
   useEffect(() => {
     if (!shouldUseServerPagination || !apiAccessToken) return;
     loadStorageServerPage(storagePage);
-  }, [apiAccessToken, mode, shouldUseServerPagination, storagePage]);
+  }, [apiAccessToken, mode, shouldUseServerPagination, storagePage, storageDriveFolder, storageDriveParentId]);
 
   useEffect(() => {
     if (!apiAccessToken || mode !== 'storageDrive' || !permissions.drive) return;
