@@ -52,6 +52,7 @@ import {
   type ApiHomeSummary,
   type ApiMonthlyStatistic,
   type ApiPage,
+  type ApiPermissionResponse,
   type ApiScanHistoryItem,
   type ApiScanJob,
   type ApiScanSetting,
@@ -294,6 +295,38 @@ const getErrorMessage = (error: unknown, fallback: string) => {
   return fallback;
 };
 
+const getUrlQueryParam = (url: string, key: string) => {
+  const query = url.split('?')[1]?.split('#')[0];
+  if (!query) return null;
+
+  const pairs = query.split('&');
+  for (const pair of pairs) {
+    const [rawKey, rawValue = ''] = pair.split('=');
+    if (decodeURIComponent(rawKey) === key) {
+      return decodeURIComponent(rawValue.replace(/\+/g, ' '));
+    }
+  }
+
+  return null;
+};
+
+const getGooglePermissionFlags = (response?: ApiPermissionResponse | null) => {
+  let gmailStatus = response?.gmail_status;
+  let driveStatus = response?.drive_status;
+
+  response?.permissions?.forEach((permission) => {
+    if (permission.service_type === 'GMAIL') gmailStatus = permission.permission_status;
+    if (permission.service_type === 'DRIVE') driveStatus = permission.permission_status;
+  });
+
+  return {
+    hasGmail: gmailStatus !== undefined,
+    hasDrive: driveStatus !== undefined,
+    gmail: gmailStatus === 'CONNECTED',
+    drive: driveStatus === 'CONNECTED',
+  };
+};
+
 const formatUnknownValue = (value: unknown): string => {
   if (value === null || value === undefined || value === '') return '-';
   if (Array.isArray(value)) return value.length ? `${value.length}개` : '0개';
@@ -433,8 +466,8 @@ const NavigationContext = React.createContext<{
   navigate: (screen: Screen) => void;
   navigateTab: (tab: MainTab) => void;
   back: () => void;
-  connectedInstant?: boolean;
   scanResultPending?: boolean;
+  connectedInstant?: boolean;
 } | null>(null);
 
 const auraMailMessages: AuraMailMessage[] = [
@@ -1340,12 +1373,12 @@ export default function App() {
   const [privacyDataError, setPrivacyDataError] = useState('');
   const [withdrawSubmitting, setWithdrawSubmitting] = useState(false);
   const [hasCompletedScan, setHasCompletedScan] = useState(false);
+  const [onboardingGhostDone, setOnboardingGhostDone] = useState(false);
+  const [onboardingCarbonDone, setOnboardingCarbonDone] = useState(false);
   const [connectedDone, setConnectedDone] = useState(false);
   const [connectedStep, setConnectedStep] = useState(0);
   const [hasSeenConnectedSuccess, setHasSeenConnectedSuccess] = useState(false);
   const [skipConnectedAnimation, setSkipConnectedAnimation] = useState(false);
-  const [onboardingGhostDone, setOnboardingGhostDone] = useState(false);
-  const [onboardingCarbonDone, setOnboardingCarbonDone] = useState(false);
   const screenMotion = useRef(new Animated.Value(1)).current;
   const transitionDirection = useRef(1);
   const toastOpacity = useRef(new Animated.Value(0)).current;
@@ -1368,6 +1401,8 @@ export default function App() {
   const fcmRegistrationInFlight = useRef(false);
   const registeredFcmTokenRef = useRef('');
   const loadedDriveFolderPaths = useRef<Set<string>>(new Set());
+  const pendingGoogleReconnectServices = useRef<Array<'GMAIL' | 'DRIVE'> | null>(null);
+  const handledGoogleOauthCodes = useRef<Set<string>>(new Set());
   const [withdrawSheetVisible, setWithdrawSheetVisible] = useState(false);
   const [filterSheetVisible, setFilterSheetVisible] = useState(false);
   const [carbonHelpVisible, setCarbonHelpVisible] = useState(false);
@@ -1817,12 +1852,12 @@ export default function App() {
     setWithdrawSubmitting(false);
     registeredFcmTokenRef.current = '';
     setHasCompletedScan(false);
+    setOnboardingGhostDone(false);
+    setOnboardingCarbonDone(false);
     setConnectedDone(false);
     setConnectedStep(0);
     setHasSeenConnectedSuccess(false);
     setSkipConnectedAnimation(false);
-    setOnboardingGhostDone(false);
-    setOnboardingCarbonDone(false);
     setWithdrawSheetVisible(false);
     setKeywordChoiceVisible(false);
     setKeywordSheetType(null);
@@ -1989,24 +2024,25 @@ export default function App() {
     }
   };
 
-  const refreshGooglePermissions = async () => {
-    if (!apiAccessToken) {
+  const refreshGooglePermissions = async (tokenOverride?: string | null, showSuccessToast = true) => {
+    const token = tokenOverride ?? apiAccessToken;
+    if (!token) {
       showToast('로그인 후 권한 상태를 확인할 수 있어요');
       return;
     }
 
     setGooglePermissionChecking(true);
     try {
-      const response = await googleApi.recheckPermissions({ accessToken: apiAccessToken });
-      const nextPermissions = response.permissions ?? [];
-      const gmail = nextPermissions.find((permission) => permission.service_type === 'GMAIL');
-      const drive = nextPermissions.find((permission) => permission.service_type === 'DRIVE');
+      const response = await googleApi.recheckPermissions({ accessToken: token });
+      const next = getGooglePermissionFlags(response);
       setPermissions((items) => ({
         ...items,
-        gmail: gmail ? gmail.permission_status === 'CONNECTED' : items.gmail,
-        drive: drive ? drive.permission_status === 'CONNECTED' : items.drive,
+        gmail: next.hasGmail ? next.gmail : items.gmail,
+        drive: next.hasDrive ? next.drive : items.drive,
       }));
-      showToast('Google 권한 상태를 다시 확인했어요');
+      if (showSuccessToast) {
+        showToast('Google 권한 상태를 다시 확인했어요');
+      }
     } catch {
       showToast('Google 권한 상태 확인에 실패했어요');
     } finally {
@@ -2030,19 +2066,70 @@ export default function App() {
         { accessToken: apiAccessToken }
       );
 
-      if (!response.auth_url) {
+      const reconnectUrl = response.authorization_url ?? response.auth_url;
+      if (!reconnectUrl) {
         showToast('Google 권한 요청 URL이 내려오지 않았어요');
         return;
       }
 
-      await Linking.openURL(response.auth_url);
-      setTimeout(() => void refreshGooglePermissions(), 1200);
+      pendingGoogleReconnectServices.current = serviceTypes;
+      await Linking.openURL(reconnectUrl);
+      setTimeout(() => void refreshGooglePermissions(undefined, false), 1200);
     } catch {
       showToast('Google 권한 재연결을 시작하지 못했어요');
     } finally {
       setGooglePermissionChecking(false);
     }
   };
+
+  const handleGoogleOAuthRedirect = async (url: string) => {
+    if (!url.startsWith(GOOGLE_OAUTH_REDIRECT_URI)) return;
+
+    const authorizationCode = getUrlQueryParam(url, 'code');
+    if (!authorizationCode || handledGoogleOauthCodes.current.has(authorizationCode)) return;
+
+    handledGoogleOauthCodes.current.add(authorizationCode);
+    setGooglePermissionChecking(true);
+
+    try {
+      const session = await authApi.loginWithGoogle({
+        authorization_code: authorizationCode,
+        redirect_uri: GOOGLE_OAUTH_REDIRECT_URI,
+        platform: getAuraPlatform(),
+      });
+      const nextAccessToken = session.accessToken ?? apiAccessToken;
+
+      if (session.accessToken) {
+        setApiAccessToken(session.accessToken);
+      }
+      if (session.user) {
+        applyApiUser(session.user);
+      }
+      if (nextAccessToken) {
+        await refreshGooglePermissions(nextAccessToken, false);
+        void refreshAuraApis(nextAccessToken);
+      }
+
+      pendingGoogleReconnectServices.current = null;
+      showToast('Google 권한 연결을 확인했어요');
+    } catch (error) {
+      showToast(getErrorMessage(error, 'Google 권한 연결 확인에 실패했어요'), undefined, 2800);
+    } finally {
+      setGooglePermissionChecking(false);
+    }
+  };
+
+  useEffect(() => {
+    const subscription = Linking.addEventListener('url', ({ url }) => {
+      void handleGoogleOAuthRedirect(url);
+    });
+
+    void Linking.getInitialURL().then((url) => {
+      if (url) void handleGoogleOAuthRedirect(url);
+    });
+
+    return () => subscription.remove();
+  }, [apiAccessToken]);
 
   const registerFcmTokenWithServer = async () => {
     if (
@@ -2299,13 +2386,11 @@ export default function App() {
       }
 
       if (googlePermissionsResult.status === 'fulfilled') {
-        const nextPermissions = googlePermissionsResult.value.permissions ?? [];
-        const gmail = nextPermissions.find((permission) => permission.service_type === 'GMAIL');
-        const drive = nextPermissions.find((permission) => permission.service_type === 'DRIVE');
+        const next = getGooglePermissionFlags(googlePermissionsResult.value);
         setPermissions((items) => ({
           ...items,
-          gmail: gmail ? gmail.permission_status === 'CONNECTED' : items.gmail,
-          drive: drive ? drive.permission_status === 'CONNECTED' : items.drive,
+          gmail: next.hasGmail ? next.gmail : items.gmail,
+          drive: next.hasDrive ? next.drive : items.drive,
         }));
       }
 
@@ -3252,6 +3337,43 @@ export default function App() {
     replace('cleanupComplete');
   };
 
+  useEffect(() => {
+    if (screen !== 'connected') return;
+
+    if (hasSeenConnectedSuccess) {
+      setSkipConnectedAnimation(true);
+      setConnectedDone(true);
+      setConnectedStep(3);
+      return;
+    }
+
+    setSkipConnectedAnimation(false);
+    setConnectedDone(false);
+    setConnectedStep(0);
+  }, [screen, hasSeenConnectedSuccess]);
+
+  useEffect(() => {
+    if (screen !== 'connected') return;
+
+    if (skipConnectedAnimation) {
+      setConnectedStep(3);
+      return;
+    }
+
+    if (!connectedDone) return;
+
+    setConnectedStep(0);
+    const timers = [
+      setTimeout(() => setConnectedStep(1), 180),
+      setTimeout(() => setConnectedStep(2), 640),
+      setTimeout(() => setConnectedStep(3), 1180),
+    ];
+
+    return () => {
+      timers.forEach((timer) => clearTimeout(timer));
+    };
+  }, [screen, connectedDone, skipConnectedAnimation]);
+
   const startDeleteJob = () => {
     if (apiAccessToken && activeApiScanJobId.current) {
       const candidates = getSelectedApiCandidatePayloads();
@@ -3437,32 +3559,12 @@ export default function App() {
   }, [screen, scanSourceEditOnly, periodEditOnly]);
 
   useEffect(() => {
-    if (screen === 'connected') {
-      if (hasSeenConnectedSuccess) {
-        setSkipConnectedAnimation(true);
-        setConnectedDone(true);
-        setConnectedStep(3);
-        return;
-      }
-
-      setSkipConnectedAnimation(false);
-      setConnectedDone(true);
-      setConnectedStep(3);
-    }
-  }, [screen]);
-
-  useEffect(() => {
     setScanSources((items) => ({
       gmail: items.gmail && permissions.gmail,
       drive: items.drive && permissions.drive,
       folder: items.folder && permissions.drive,
     }));
   }, [permissions.gmail, permissions.drive]);
-
-  useEffect(() => {
-    if (screen !== 'connected') return;
-    setConnectedStep(3);
-  }, [screen, connectedDone, skipConnectedAnimation]);
 
   useEffect(() => {
     if (screen !== 'scanFlowFolder' || !apiAccessToken || !permissions.drive) return;
@@ -4271,14 +4373,18 @@ export default function App() {
                 setHasSeenConnectedSuccess(true);
               }}
             />
-            <RevealIn duration={skipConnectedAnimation ? 0 : 180} distance={skipConnectedAnimation ? 0 : 4}>
-              <Text style={styles.centerTitle}>모든 서비스가 연결됐어요</Text>
-            </RevealIn>
+            {connectedDone ? (
+              <RevealIn duration={skipConnectedAnimation ? 0 : 220} distance={skipConnectedAnimation ? 0 : 5}>
+                <Text style={styles.centerTitle}>모든 서비스가 연결됐어요</Text>
+              </RevealIn>
+            ) : null}
             <ConnectedInfoRow service="gmail" title="Gmail" status={permissions.gmail ? '연결됨' : '연결안됨'} visible={connectedStep >= 1} />
             <ConnectedInfoRow service="drive" title="Drive" status={permissions.drive ? '연결됨' : '연결안됨'} visible={connectedStep >= 2} />
-            <RevealIn style={styles.connectedButtonReveal} duration={skipConnectedAnimation ? 0 : 180} distance={skipConnectedAnimation ? 0 : 4}>
-              <PrimaryButton title="AURA 둘러보기" onPress={() => go('onboardingIntro')} inline />
-            </RevealIn>
+            {connectedStep >= 3 ? (
+              <RevealIn style={styles.connectedButtonReveal} duration={skipConnectedAnimation ? 0 : 460} distance={skipConnectedAnimation ? 0 : 12}>
+                <PrimaryButton title="AURA 둘러보기" onPress={() => go('onboardingIntro')} inline />
+              </RevealIn>
+            ) : null}
           </ScreenShell>
         );
 
@@ -5538,8 +5644,8 @@ export default function App() {
           navigate: replace,
           navigateTab,
           back,
-          connectedInstant: screen === 'connected' && skipConnectedAnimation,
           scanResultPending: homeScanNotice === 'completed' || homeScanNotice === 'running',
+          connectedInstant: screen === 'connected' && skipConnectedAnimation,
         }}
       >
         <SafeAreaView style={styles.page} edges={['top', 'bottom']}>
@@ -7654,56 +7760,55 @@ function StorageScreen({
           ...(item.snapshotSizeBytes !== undefined ? { snapshot_size_bytes: item.snapshotSizeBytes } : {}),
         };
       });
-  const confirmStorageDelete = () => {
+  const refreshStorageServerAfterAction = () => {
+    clearStorageServerPageCache();
+    serverPageCacheRef.current = storageServerPageCache;
+    onServerStorageChanged?.();
+    loadStorageServerPage(safeStoragePage);
+  };
+
+  const confirmStorageDelete = async () => {
     if (!deleteConfirmChecked) {
       showToast('삭제 확인 체크가 필요합니다');
       return;
     }
+
     const permanent = deleteSheetMode === 'permanent';
     const selectedKeys = selectedItems.map((item) => itemStorageKey(item.id));
-    closeDeleteSheet();
-    if (permanent) {
-      const apiItems = getApiStorageActionItems();
-      if (apiAccessToken && apiItems.length) {
-        void storageApi
-          .permanentDelete(apiItems, { accessToken: apiAccessToken })
-          .then(() => {
-            clearStorageServerPageCache();
-            serverPageCacheRef.current = storageServerPageCache;
-            onServerStorageChanged?.();
-            loadStorageServerPage(safeStoragePage);
-          })
-          .catch(() => {
-            showToast('백엔드 영구 삭제 요청 실패: 화면에서만 반영했어요');
-          });
-      }
-      setStorageDeletedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
-      clearSelectionPrefix(prefix);
-      setSelectionMode(false);
-      showToast('영구 삭제가 완료됐어요');
+    const apiItems = getApiStorageActionItems();
+
+    if (apiAccessToken && !apiItems.length) {
+      showToast('서버에 전달할 항목 정보가 없어요');
       return;
     }
 
-    const apiItems = getApiStorageActionItems();
-    if (apiAccessToken && apiItems.length) {
-      void storageApi
-        .moveToTrash(apiItems, { accessToken: apiAccessToken })
-        .then(() => {
-          clearStorageServerPageCache();
-          serverPageCacheRef.current = storageServerPageCache;
-          onServerStorageChanged?.();
-          loadStorageServerPage(safeStoragePage);
-        })
-        .catch((error) => {
-          showToast(getErrorMessage(error, '휴지통 이동 요청에 실패했어요'), undefined, 2600);
-        });
+    try {
+      if (apiAccessToken) {
+        if (permanent) {
+          await storageApi.permanentDelete(apiItems, { accessToken: apiAccessToken });
+        } else {
+          await storageApi.moveToTrash(apiItems, { accessToken: apiAccessToken });
+        }
+        refreshStorageServerAfterAction();
+      }
+
+      closeDeleteSheet();
+
+      if (!permanent) {
+        setStorageTrashMovedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
+        showToast('선택 항목을 휴지통으로 이동했어요');
+      } else {
+        setStorageDeletedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
+        showToast('영구 삭제가 완료됐어요');
+      }
+
+      clearSelectionPrefix(prefix);
+      setSelectionMode(false);
+    } catch (error) {
+      showToast(getErrorMessage(error, permanent ? '영구 삭제 요청에 실패했어요' : '휴지통 이동 요청에 실패했어요'), undefined, 3000);
     }
-    setStorageTrashMovedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
-    clearSelectionPrefix(prefix);
-    setSelectionMode(false);
-    showToast('선택 항목을 휴지통으로 이동했어요');
   };
-  const confirmStorageRestore = () => {
+  const confirmStorageRestore = async () => {
     if (!restoreConfirmChecked) {
       showToast('복구 확인 체크가 필요합니다');
       return;
@@ -7715,27 +7820,28 @@ function StorageScreen({
       .filter((key): key is string => Boolean(key));
     const apiItems = getApiStorageActionItems();
 
-    closeRestoreSheet();
-    if (apiAccessToken && apiItems.length) {
-      void storageApi
-        .restore(apiItems, { accessToken: apiAccessToken })
-        .then(() => {
-          clearStorageServerPageCache();
-          serverPageCacheRef.current = storageServerPageCache;
-          onServerStorageChanged?.();
-          loadStorageServerPage(safeStoragePage);
-        })
-        .catch(() => {
-          showToast('백엔드 복구 요청 실패: 화면에서만 반영했어요');
-        });
+    if (apiAccessToken && !apiItems.length) {
+      showToast('서버에 전달할 항목 정보가 없어요');
+      return;
     }
-    setStorageRestoredKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
-    if (movedSourceKeys.length) {
-      setStorageTrashMovedKeys((items) => items.filter((key) => !movedSourceKeys.includes(key)));
+
+    try {
+      if (apiAccessToken) {
+        await storageApi.restore(apiItems, { accessToken: apiAccessToken });
+        refreshStorageServerAfterAction();
+      }
+
+      closeRestoreSheet();
+      setStorageRestoredKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
+      if (movedSourceKeys.length) {
+        setStorageTrashMovedKeys((items) => items.filter((key) => !movedSourceKeys.includes(key)));
+      }
+      clearSelectionPrefix(prefix);
+      setSelectionMode(false);
+      showToast('선택 항목을 정리함으로 복구했어요');
+    } catch (error) {
+      showToast(getErrorMessage(error, '복구 요청에 실패했어요'), undefined, 3000);
     }
-    clearSelectionPrefix(prefix);
-    setSelectionMode(false);
-    showToast('선택 항목을 정리함으로 복구했어요');
   };
   const storageFloatingActions: FloatingAction[] | undefined = selectionMode && !deleteSheetMode && !restoreSheetVisible
     ? isTrash
@@ -8692,6 +8798,46 @@ function CenterIcon({ label }: { label: string }) {
   );
 }
 
+function RevealIn({
+  children,
+  style,
+  duration = 260,
+  distance = 8,
+}: {
+  children: React.ReactNode;
+  style?: any;
+  duration?: number;
+  distance?: number;
+}) {
+  const motion = useRef(new Animated.Value(duration === 0 ? 1 : 0)).current;
+
+  useEffect(() => {
+    if (duration === 0) {
+      motion.setValue(1);
+      return;
+    }
+
+    motion.setValue(0);
+    Animated.timing(motion, {
+      toValue: 1,
+      duration,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+  }, [distance, duration, motion]);
+
+  const translateY = motion.interpolate({
+    inputRange: [0, 1],
+    outputRange: [distance, 0],
+  });
+
+  return (
+    <Animated.View style={[style, { opacity: motion, transform: [{ translateY }] }]}>
+      {children}
+    </Animated.View>
+  );
+}
+
 function ConnectedInfoRow({
   service,
   title,
@@ -8703,8 +8849,8 @@ function ConnectedInfoRow({
   status: '연결됨' | '연결안됨';
   visible: boolean;
 }) {
-  const connectedInstant = useContext(NavigationContext)?.connectedInstant ?? false;
   const iconSource = service === 'gmail' ? gmailIcon : googleDriveIcon;
+  const connectedInstant = useContext(NavigationContext)?.connectedInstant ?? false;
 
   return (
     <View style={styles.infoRow}>
@@ -8723,94 +8869,60 @@ function ConnectedInfoRow({
   );
 }
 
-function RevealIn({
-  children,
-  style,
-  duration = 260,
-  distance = 8,
-}: {
-  children: React.ReactNode;
-  style?: object;
-  duration?: number;
-  distance?: number;
-}) {
-  const motion = useRef(new Animated.Value(duration <= 0 ? 1 : 0)).current;
-
-  useEffect(() => {
-    if (duration <= 0) {
-      motion.setValue(1);
-      return;
-    }
-
-    Animated.timing(motion, {
-      toValue: 1,
-      duration,
-      useNativeDriver: false,
-    }).start();
-  }, []);
-
-  if (duration <= 0) {
-    return <View style={style}>{children}</View>;
-  }
-
-  return (
-    <Animated.View
-      style={[
-        style,
-        {
-          opacity: motion,
-          transform: [
-            {
-              translateY: motion.interpolate({
-                inputRange: [0, 1],
-                outputRange: [distance, 0],
-              }),
-            },
-          ],
-        },
-      ]}
-    >
-      {children}
-    </Animated.View>
-  );
-}
-
 function ConnectedSuccessIcon({ onDone, skip }: { onDone: () => void; skip?: boolean }) {
   const [progress, setProgress] = useState(skip ? 100 : 0);
   const [completed, setCompleted] = useState(Boolean(skip));
   const rotate = useRef(new Animated.Value(0)).current;
   const bounce = useRef(new Animated.Value(0)).current;
   const doneCalled = useRef(false);
+  const onDoneRef = useRef(onDone);
+
+  useEffect(() => {
+    onDoneRef.current = onDone;
+  }, [onDone]);
 
   useEffect(() => {
     if (skip) {
       setProgress(100);
       setCompleted(true);
+      if (!doneCalled.current) {
+        doneCalled.current = true;
+        onDoneRef.current();
+      }
       return;
     }
+
+    doneCalled.current = false;
+    setProgress(0);
+    setCompleted(false);
+    rotate.setValue(0);
+    bounce.setValue(0);
 
     const spin = Animated.loop(
       Animated.timing(rotate, {
         toValue: 1,
         duration: 420,
+        easing: Easing.linear,
         useNativeDriver: false,
       })
     );
     spin.start();
 
-    const startedAt = Date.now();
-    const timer = setInterval(() => {
-      const next = Math.min(100, Math.round(((Date.now() - startedAt) / 450) * 100));
+    let frame = 0;
+    const interval = setInterval(() => {
+      frame += 1;
+      const next = Math.min(100, Math.round((frame / 12) * 100));
       setProgress(next);
 
       if (next >= 100) {
-        clearInterval(timer);
+        clearInterval(interval);
         spin.stop();
         setCompleted(true);
         Animated.sequence([
           Animated.timing(bounce, {
-            toValue: -10,
-            duration: 130,
+            toValue: -8,
+            duration: 140,
+            easing: Easing.out(Easing.cubic),
             useNativeDriver: false,
           }),
           Animated.spring(bounce, {
@@ -8819,20 +8931,20 @@ function ConnectedSuccessIcon({ onDone, skip }: { onDone: () => void; skip?: boo
             tension: 90,
             useNativeDriver: false,
           }),
-        ]).start(({ finished }) => {
-          if (finished && !doneCalled.current) {
+        ]).start(() => {
+          if (!doneCalled.current) {
             doneCalled.current = true;
-            onDone();
+            onDoneRef.current();
           }
         });
       }
-    }, 20);
+    }, 38);
 
     return () => {
-      clearInterval(timer);
+      clearInterval(interval);
       spin.stop();
     };
-  }, [skip]);
+  }, [bounce, rotate, skip]);
 
   const spinValue = rotate.interpolate({
     inputRange: [0, 1],
@@ -8872,7 +8984,7 @@ function ProgressCircle({ progress, compact }: { progress: number; compact?: boo
         duration: 1150,
         easing: Easing.linear,
         useNativeDriver: true,
-      }),
+      })
     );
     animation.start();
     return () => animation.stop();

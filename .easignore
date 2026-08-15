@@ -1,0 +1,48 @@
+# dependencies
+node_modules/
+
+# Expo / build output
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native generated folders
+/ios
+/android
+.kotlin/
+
+# local env / credentials
+.env
+.env*.local
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.pem
+
+# logs and local debugging
+*.log
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+tmp_*/
+.claude/
+app-browser-logs.txt
+app-dev-methods.txt
+app-page-check.txt
+browser-api-check.txt
+browser-debug.txt
+locator-methods.txt
+oauth-buttons.txt
+oauth-form.txt
+oauth-page.txt
+oauth-positions.json
+oauth-retry.txt
+oauth-screen-info.txt
+playwright-methods.txt
+
+# OS/editor
+.DS_Store
+*.tsbuildinfo
