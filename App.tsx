@@ -27,7 +27,6 @@ import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
 import { LineChart } from 'react-native-chart-kit';
 import Constants from 'expo-constants';
 import * as Device from 'expo-device';
-import * as FileSystem from 'expo-file-system/legacy';
 import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
 import { DEV_AURA_ACCESS_TOKEN, GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
@@ -1361,7 +1360,6 @@ export default function App() {
   const [apiAccessToken, setApiAccessToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<AuraUser | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
-  const [deviceStorageBytes, setDeviceStorageBytes] = useState<{ free?: number; total?: number }>({});
   const [permissionToast, setPermissionToast] = useState('');
   const [toastTarget, setToastTarget] = useState<Screen | null>(null);
   const [includeInput, setIncludeInput] = useState('');
@@ -1499,31 +1497,6 @@ export default function App() {
         // Expo Go에는 Google Sign-In 네이티브 모듈이 포함되지 않는다.
       });
   }, []);
-
-  useEffect(() => {
-    if (Platform.OS === 'web') return;
-    if (screen !== 'home') return;
-
-    let active = true;
-    void Promise.all([
-      FileSystem.getFreeDiskStorageAsync(),
-      FileSystem.getTotalDiskCapacityAsync(),
-    ])
-      .then(([free, total]) => {
-        if (!active) return;
-        setDeviceStorageBytes({
-          free: Number.isFinite(free) ? free : undefined,
-          total: Number.isFinite(total) ? total : undefined,
-        });
-      })
-      .catch(() => {
-        if (active) setDeviceStorageBytes({});
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [screen]);
 
   const go = (next: Screen) => {
     transitionDirection.current = -1;
@@ -4287,8 +4260,6 @@ export default function App() {
       homeStorageSummary?.total_drive_bytes,
       homeStorageSummary?.drive_total_bytes,
     );
-    const reportedDeviceFreeBytes = pickValidByteValue(deviceStorageBytes.free);
-    const reportedDeviceTotalBytes = pickValidByteValue(deviceStorageBytes.total);
     const homeEstimatedReclaimBytes = homeStorageSummary?.estimated_reclaim_bytes ?? 0;
     const apiSummarySizeDisplayLabel = formatBytes(homeEstimatedReclaimBytes);
     const summaryCandidateDisplayCount = selectedCandidateCount || activeScanResult.candidateCount;
@@ -4307,12 +4278,8 @@ export default function App() {
       ? formatBytes(latestRemainingDriveBytes)
       : '-';
     const homeDriveTotalGB = Math.max(1, homeDriveTotalBytes / 1024 / 1024 / 1024);
-    const hasReportedDeviceStorageBytes =
-      reportedDeviceFreeBytes !== undefined &&
-      reportedDeviceTotalBytes !== undefined &&
-      reportedDeviceTotalBytes > 0;
-    const homeCapacityFreeBytes = hasReportedDeviceStorageBytes ? reportedDeviceFreeBytes : latestRemainingDriveBytes;
-    const homeCapacityTotalBytes = hasReportedDeviceStorageBytes ? reportedDeviceTotalBytes : homeDriveTotalBytes;
+    const homeCapacityFreeBytes = latestRemainingDriveBytes;
+    const homeCapacityTotalBytes = homeDriveTotalBytes;
     const hasHomeCapacityBytes =
       homeCapacityFreeBytes !== undefined &&
       homeCapacityFreeBytes !== null &&
