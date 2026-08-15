@@ -3,6 +3,7 @@
     "name": "AURA",
     "owner": "gcu-aura-app",
     "slug": "aura-user-app",
+    "scheme": "aura-app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/AURA-logo.png",
