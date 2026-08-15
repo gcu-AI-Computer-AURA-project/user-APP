@@ -820,19 +820,57 @@ function isCompletedScanStatus(status?: string | null) {
   return status === 'COMPLETED' || status === 'PARTIAL_FAILED';
 }
 
-async function fetchAllScanCandidates(scanJobId: number, accessToken: string) {
+const SCAN_CANDIDATE_PAGE_SIZE = 100;
+
+function getApiCandidateKey(candidate: ApiCandidate) {
+  if (candidate.candidate_id !== undefined && candidate.candidate_id !== null) return `candidate:${candidate.candidate_id}`;
+  if (candidate.item_id !== undefined && candidate.item_id !== null) return `item:${candidate.item_id}`;
+  if (candidate.external_item_id) return `${candidate.item_source ?? 'UNKNOWN'}:${candidate.external_item_id}`;
+  return `title:${candidate.title ?? 'unknown'}`;
+}
+
+function mergeApiCandidates(candidates: ApiCandidate[]) {
+  const map = new Map<string, ApiCandidate>();
+  candidates.forEach((candidate) => {
+    map.set(getApiCandidateKey(candidate), candidate);
+  });
+  return Array.from(map.values());
+}
+
+async function fetchScanCandidatesByQuery(
+  scanJobId: number,
+  accessToken: string,
+  query: Parameters<typeof scanApi.getCandidates>[1]
+) {
   const collected: ApiCandidate[] = [];
 
   for (let page = 0; page < 50; page += 1) {
-    const result = await scanApi.getCandidates(scanJobId, { include_protected: true, page, size: 200 }, { accessToken });
+    const result = await scanApi.getCandidates(
+      scanJobId,
+      { ...query, page, size: SCAN_CANDIDATE_PAGE_SIZE },
+      { accessToken }
+    );
     const content = result.content ?? [];
     collected.push(...content);
 
     if (result.total_pages !== undefined && page + 1 >= result.total_pages) break;
-    if (content.length < 200) break;
+    if (content.length < SCAN_CANDIDATE_PAGE_SIZE) break;
   }
 
   return collected;
+}
+
+async function fetchAllScanCandidates(scanJobId: number, accessToken: string) {
+  const [cleanupCandidates, protectedCandidates] = await Promise.all([
+    fetchScanCandidatesByQuery(scanJobId, accessToken, { include_protected: false }),
+    fetchScanCandidatesByQuery(scanJobId, accessToken, {
+      category: 'PROTECTED',
+      selection_status: 'NONE',
+      include_protected: true,
+    }),
+  ]);
+
+  return mergeApiCandidates([...cleanupCandidates, ...protectedCandidates]);
 }
 
 function normalizeServerDrivePath(path?: string | null) {
@@ -886,7 +924,7 @@ function apiStorageItemToDriveFromApi(item: ApiStorageItem, folders: DriveFolder
     itemSource: item.item_source ?? 'DRIVE',
     type: extension || 'FILE',
     title,
-    subtitle: isFolder ? `${parentPath} · 폴더` : `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · Drive`,
+    subtitle: isFolder ? `${parentPath} · 폴더` : `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · Drive`,
     fullPath: isFolder ? normalizeServerDrivePath(`${parentPath} › ${title}`) : parentPath,
   };
 }
@@ -906,7 +944,7 @@ function apiStorageItemToDrive(item: ApiStorageItem): StorageDriveItem {
     itemSource: item.item_source ?? 'DRIVE',
     type: extension || 'FILE',
     title: item.title || item.external_item_id || 'Drive 파일',
-    subtitle: `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 수정 ${date} · Drive`,
+    subtitle: `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · Drive`,
     fullPath: isFolder ? normalizeApiDrivePath(`${parentPath} › ${title}`) : parentPath,
   };
 }
@@ -959,6 +997,10 @@ function apiCandidateToScanItem(candidate: ApiCandidate): ScanListItem {
   };
 }
 
+function isProtectedApiCandidate(candidate: ApiCandidate) {
+  return candidate.is_protected === true || candidate.category === 'PROTECTED';
+}
+
 function buildApiScanSummary(params: {
   candidates?: ApiCandidate[];
   analysisSummary?: ApiAnalysisSummary | null;
@@ -970,7 +1012,11 @@ function buildApiScanSummary(params: {
   carbonGrams?: number;
   folderLabel?: string;
 }): ScanSummary {
-  const candidateItems = (params.candidates ?? []).map(apiCandidateToScanItem);
+  const apiCandidates = params.candidates ?? [];
+  const protectedCandidates = apiCandidates.filter(isProtectedApiCandidate);
+  const candidateItems = apiCandidates
+    .filter((candidate) => !isProtectedApiCandidate(candidate))
+    .map(apiCandidateToScanItem);
   const mailItems = candidateItems.filter((item) => item.source === 'mail');
   const driveItems = candidateItems.filter((item) => item.source === 'drive');
   const largeItems = driveItems.filter((item) => item.sizeMB >= 500);
@@ -982,9 +1028,7 @@ function buildApiScanSummary(params: {
   }));
   const categoryTotalBytes = categorySummaries.reduce((sum, item) => sum + item.estimatedBytes, 0);
   const categoryCandidateCount = categorySummaries.reduce((sum, item) => sum + item.itemCount, 0);
-  const protectedItems = (params.candidates ?? [])
-    .filter((candidate) => candidate.is_protected || candidate.category === 'PROTECTED')
-    .map(apiCandidateToScanItem);
+  const protectedItems = protectedCandidates.map(apiCandidateToScanItem);
   const totalSizeMB =
     params.estimatedBytes !== undefined
       ? bytesToMB(params.estimatedBytes)
@@ -2020,7 +2064,7 @@ export default function App() {
           id: folder.folder_id,
           parentId: parentPath,
           name: path,
-          meta: folder.modified_time ? `수정 ${formatApiDateOnly(folder.modified_time)}` : 'Google Drive 폴더',
+          meta: 'Google Drive 폴더',
         };
       });
       mergeDriveFolderOptions(nextFolders);
@@ -7900,6 +7944,7 @@ function StorageScreen({
                 {storageDriveBreadcrumbs.map((crumb, index) => (
                   <React.Fragment key={crumb.path}>
                     <Pressable
+                      style={styles.storageBreadcrumbPressable}
                       onPress={() => {
                         if (mode === 'storageDriveTrash') {
                           setStorageDriveTrashFolder(crumb.path);
@@ -12107,7 +12152,13 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     flexWrap: 'wrap',
+    flex: 1,
     gap: 6,
+    minWidth: 0,
+    paddingRight: 8,
+  },
+  storageBreadcrumbPressable: {
+    maxWidth: '100%',
   },
   storageBreadcrumbText: {
     color: text,
@@ -12127,6 +12178,9 @@ const styles = StyleSheet.create({
     color: mutedText,
     fontSize: 12,
     fontWeight: '900',
+    flexShrink: 0,
+    minWidth: 34,
+    textAlign: 'right',
   },
   storageItemCard: {
     minHeight: 78,
