@@ -72,6 +72,9 @@ export type ApiPermissionResponse = {
     granted_scopes?: string[];
     last_checked_at?: string;
   }>;
+  gmail_status?: ApiPermissionStatus;
+  drive_status?: ApiPermissionStatus;
+  checked_at?: string;
 };
 
 export type ApiReconnectUrlRequest = {
