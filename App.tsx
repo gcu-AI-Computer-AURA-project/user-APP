@@ -2235,7 +2235,7 @@ export default function App() {
   const requestGoogleReconnect = async (serviceTypes: Array<'GMAIL' | 'DRIVE'>) => {
     if (!apiAccessToken) {
       showToast('로그인 후 Google 권한을 다시 연결할 수 있어요');
-      return;
+      return false;
     }
 
     setGooglePermissionChecking(true);
@@ -2251,14 +2251,16 @@ export default function App() {
       const reconnectUrl = response.authorization_url ?? response.auth_url;
       if (!reconnectUrl) {
         showToast('Google 권한 요청 URL이 내려오지 않았어요');
-        return;
+        return false;
       }
 
       pendingGoogleReconnectServices.current = serviceTypes;
       await Linking.openURL(reconnectUrl);
       setTimeout(() => void refreshGooglePermissions(undefined, false), 1200);
+      return true;
     } catch {
       showToast('Google 권한 재연결을 시작하지 못했어요');
+      return false;
     } finally {
       setGooglePermissionChecking(false);
     }
@@ -4769,9 +4771,9 @@ export default function App() {
           <PermissionDetail
             screen={screen}
             back={back}
-            setPermissions={setPermissions}
             onServicePermissionChange={syncUserPermissions}
             requestPushPermission={requestPushPermission}
+            requestGoogleReconnect={requestGoogleReconnect}
           />
         );
 
@@ -5741,9 +5743,9 @@ export default function App() {
 
             <SectionTitle>연결된 서비스</SectionTitle>
             <View style={styles.groupCard}>
-              <ServiceLinkRow service="gmail" title="Gmail" connected={permissions.gmail} checking={googlePermissionChecking} onPress={() => void requestGoogleReconnect(['GMAIL'])} />
+              <ServiceLinkRow service="gmail" title="Gmail" connected={permissions.gmail} checking={googlePermissionChecking} onPress={() => go('gmailPermission')} />
               <View style={styles.thinDivider} />
-              <ServiceLinkRow service="drive" title="Google Drive" connected={permissions.drive} checking={googlePermissionChecking} onPress={() => void requestGoogleReconnect(['DRIVE'])} />
+              <ServiceLinkRow service="drive" title="Google Drive" connected={permissions.drive} checking={googlePermissionChecking} onPress={() => go('drivePermission')} />
             </View>
 
             <OutlineButton title="Google 권한 다시 확인" onPress={() => void refreshGooglePermissions()} />
@@ -7260,15 +7262,15 @@ function PushNotificationPermissionContent() {
 function PermissionDetail({
   screen,
   back,
-  setPermissions,
   onServicePermissionChange,
   requestPushPermission,
+  requestGoogleReconnect,
 }: {
   screen: PermissionScreen;
   back: () => void;
-  setPermissions: React.Dispatch<React.SetStateAction<PermissionState>>;
   onServicePermissionChange: (nextPermissions: Partial<AuraServicePermissions>) => Promise<void>;
   requestPushPermission: () => Promise<boolean>;
+  requestGoogleReconnect: (serviceTypes: Array<'GMAIL' | 'DRIVE'>) => Promise<boolean>;
 }) {
   const info = {
     gmailPermission: {
@@ -7386,11 +7388,15 @@ function PermissionDetail({
             return;
           }
 
-          setPermissions((items) => ({ ...items, [info.key]: true }));
-          void onServicePermissionChange({ [info.key]: true });
-          back();
+          const serviceType = info.key === 'gmail' ? 'GMAIL' : 'DRIVE';
+          void requestGoogleReconnect([serviceType]).then((started) => {
+            if (started) {
+              back();
+            }
+          });
         }}
       />
+      {info.key !== 'alarm' ? <OutlineButton title="지금은 허용하지 않기" onPress={back} /> : null}
       <Text style={styles.helperText}>{info.guide}</Text>
     </ScreenShell>
   );
