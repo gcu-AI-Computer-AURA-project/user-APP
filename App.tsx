@@ -149,6 +149,8 @@ type ScanListItem = {
   sortText: string;
   source: 'mail' | 'drive';
   previewLabel?: string;
+  bodyPreview?: string;
+  webViewLink?: string;
   detailTitle?: string;
   detailSubtitle?: string;
 };
@@ -158,6 +160,8 @@ type StorageApiFields = {
   snapshotTitle?: string;
   snapshotSizeBytes?: number;
   itemSource?: 'GMAIL' | 'DRIVE';
+  snippet?: string;
+  webViewLink?: string;
 };
 type StorageMailItem = StorageApiFields & { id: string; title: string; subtitle: string; meta: string; badge?: string };
 type StorageDriveItem = StorageApiFields & { id: string; type: string; title: string; subtitle: string; fullPath?: string };
@@ -335,6 +339,25 @@ const formatUnknownValue = (value: unknown): string => {
   if (Array.isArray(value)) return value.length ? `${value.length}개` : '0개';
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
+};
+
+const pickReadableText = (...values: Array<string | null | undefined>) => {
+  for (const value of values) {
+    const textValue = value?.trim();
+    if (textValue) return textValue;
+  }
+  return undefined;
+};
+
+const getUserInitial = (user?: AuraUser | null) => {
+  const profileText = pickReadableText(user?.name, user?.email);
+  return profileText ? profileText.charAt(0).toUpperCase() : 'A';
+};
+
+const buildGoogleDriveWebViewLink = (externalItemId?: string | null) => {
+  const fileId = externalItemId?.trim();
+  if (!fileId) return undefined;
+  return `https://drive.google.com/open?id=${encodeURIComponent(fileId)}`;
 };
 
 const extractServerAuthCode = (response: unknown) => {
@@ -703,6 +726,49 @@ function formatBytes(bytes?: number | null) {
   return formatDataSize(bytesToMB(bytes));
 }
 
+function getNiceChartTickStep(targetStep: number, suffix: string) {
+  if (!Number.isFinite(targetStep) || targetStep <= 0) return 1;
+
+  if ((suffix === 'MB' || suffix === 'GB') && targetStep < 1) {
+    return 1;
+  }
+
+  const magnitude = Math.pow(10, Math.floor(Math.log10(targetStep)));
+  const normalized = targetStep / magnitude;
+  const multipliers = [1, 2, 2.5, 5, 10];
+  const multiplier = multipliers.find((candidate) => normalized <= candidate) ?? 10;
+
+  return multiplier * magnitude;
+}
+
+function getChartSizeScale(valuesInBytes: number[]) {
+  const maxBytes = Math.max(0, ...valuesInBytes.map((value) => Number(value) || 0));
+  const KB = 1024;
+  const MB = KB * 1024;
+  const GB = MB * 1024;
+  const TB = GB * 1024;
+  const unit = maxBytes >= TB
+    ? { divisor: TB, suffix: 'TB' }
+    : maxBytes >= GB
+      ? { divisor: GB, suffix: 'GB' }
+      : maxBytes >= MB
+        ? { divisor: MB, suffix: 'MB' }
+        : maxBytes >= KB
+          ? { divisor: KB, suffix: 'KB' }
+          : { divisor: 1, suffix: 'B' };
+  const maxValue = maxBytes / unit.divisor;
+  const tickStep = getNiceChartTickStep(maxValue / 4, unit.suffix);
+  const axisMax = maxValue > 0 ? tickStep * 4 : tickStep;
+  const decimalPlaces = tickStep >= 1 ? 0 : 1;
+
+  return {
+    ...unit,
+    axisMax,
+    decimalPlaces,
+    segments: maxValue > 0 ? 4 : 1,
+  };
+}
+
 const DEFAULT_GOOGLE_DRIVE_TOTAL_BYTES = 15 * 1024 * 1024 * 1024;
 
 function pickValidByteValue(...values: Array<number | null | undefined>) {
@@ -756,6 +822,7 @@ function apiStorageItemToMail(item: ApiStorageItem): StorageMailItem {
     snapshotTitle: item.title,
     snapshotSizeBytes: item.size_bytes,
     itemSource: item.item_source ?? 'GMAIL',
+    snippet: item.snippet,
     title: item.title || item.external_item_id || 'Gmail 항목',
     subtitle: item.title || '메일 항목',
     meta: `받은날짜 ${date} · Gmail · ${formatBytes(item.size_bytes)}`,
@@ -929,6 +996,7 @@ function apiStorageItemToDriveFromApi(item: ApiStorageItem, folders: DriveFolder
     title,
     subtitle: isFolder ? `${parentPath} · 폴더` : `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · Drive`,
     fullPath: isFolder ? normalizeServerDrivePath(`${parentPath} › ${title}`) : parentPath,
+    webViewLink: item.web_view_link ?? buildGoogleDriveWebViewLink(item.external_item_id),
   };
 }
 
@@ -949,6 +1017,7 @@ function apiStorageItemToDrive(item: ApiStorageItem): StorageDriveItem {
     title: item.title || item.external_item_id || 'Drive 파일',
     subtitle: `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · Drive`,
     fullPath: isFolder ? normalizeApiDrivePath(`${parentPath} › ${title}`) : parentPath,
+    webViewLink: item.web_view_link ?? buildGoogleDriveWebViewLink(item.external_item_id),
   };
 }
 
@@ -965,6 +1034,8 @@ function apiStorageItemToTrash(item: ApiStorageItem): StorageMailItem {
     snapshotTitle: item.title,
     snapshotSizeBytes: item.size_bytes,
     itemSource: source,
+    snippet: item.snippet,
+    webViewLink: source === 'DRIVE' ? item.web_view_link ?? buildGoogleDriveWebViewLink(item.external_item_id) : undefined,
     title: item.title || item.external_item_id || (source === 'DRIVE' ? 'Drive 파일' : 'Gmail 항목'),
     subtitle: item.title || (source === 'DRIVE' ? 'Drive 파일' : '메일 항목'),
     meta:
@@ -995,8 +1066,10 @@ function apiCandidateToScanItem(candidate: ApiCandidate): ScanListItem {
     sortText: candidate.sender_domain || candidate.owner_email || candidate.title || '',
     source: candidate.item_source === 'DRIVE' ? 'drive' : 'mail',
     previewLabel: candidate.label_text || candidate.snippet,
+    bodyPreview: candidate.snippet,
+    webViewLink: candidate.item_source === 'DRIVE' ? candidate.web_view_link ?? buildGoogleDriveWebViewLink(candidate.external_item_id) : undefined,
     detailTitle: candidate.title,
-    detailSubtitle: candidate.snippet || candidate.folder_path || candidate.mime_type,
+    detailSubtitle: candidate.item_source === 'DRIVE' ? candidate.folder_path || candidate.mime_type : undefined,
   };
 }
 
@@ -1394,6 +1467,7 @@ export default function App() {
   const [periodRange, setPeriodRange] = useState('3년 이상');
   const [lastOpenedBeforeMonths, setLastOpenedBeforeMonths] = useState(6);
   const [lastModifiedBeforeMonths, setLastModifiedBeforeMonths] = useState(6);
+  const [createdBeforeMonths, setCreatedBeforeMonths] = useState(6);
   const [openedYearRange, setOpenedYearRange] = useState<MonthRange>({ from: toMonthIndex(2023, 1), to: maxScanMonthIndex });
   const [modifiedYearRange, setModifiedYearRange] = useState<MonthRange>({ from: toMonthIndex(2022, 1), to: maxScanMonthIndex });
   const [yearSheetType, setYearSheetType] = useState<'opened' | 'modified' | null>(null);
@@ -1404,7 +1478,7 @@ export default function App() {
   const [scanProgress, setScanProgress] = useState(0);
   const [scanStatusText, setScanStatusText] = useState('메일 및 드라이브 데이터 수집중');
   const [deleteProgress, setDeleteProgress] = useState(0);
-  const [deleteJobStatus, setDeleteJobStatus] = useState<'idle' | 'running' | 'completed' | 'failed'>('idle');
+  const [deleteJobStatus, setDeleteJobStatus] = useState<'idle' | 'running' | 'completed' | 'failed' | 'cancelled'>('idle');
   const [deleteStatusText, setDeleteStatusText] = useState('선택 항목을 휴지통으로 이동 중');
   const [homeScanNotice, setHomeScanNotice] = useState<'none' | 'running' | 'cancelled' | 'completed'>('none');
   const [apiScanJobId, setApiScanJobId] = useState<number | null>(null);
@@ -1876,6 +1950,7 @@ export default function App() {
     setIncludeSubFolders(true);
     setLastOpenedBeforeMonths(36);
     setLastModifiedBeforeMonths(24);
+    setCreatedBeforeMonths(6);
     setOpenedYearRange({ from: toMonthIndex(2023, 1), to: maxScanMonthIndex });
     setModifiedYearRange({ from: toMonthIndex(2022, 1), to: maxScanMonthIndex });
     setPeriodEditOnly(false);
@@ -2001,24 +2076,27 @@ export default function App() {
       autoScan: Boolean(setting.apply_recent_conditions ?? items.autoScan),
     }));
 
-    if (setting.last_opened_before_months) {
+    if (setting.last_opened_before_months !== undefined && setting.last_opened_before_months !== null) {
       setLastOpenedBeforeMonths(setting.last_opened_before_months);
     }
-    if (setting.last_modified_before_months) {
+    if (setting.last_modified_before_months !== undefined && setting.last_modified_before_months !== null) {
       setLastModifiedBeforeMonths(setting.last_modified_before_months);
     }
-    if (setting.include_keywords) {
+    if (setting.created_before_months !== undefined && setting.created_before_months !== null) {
+      setCreatedBeforeMonths(setting.created_before_months);
+    }
+    if (Array.isArray(setting.include_keywords)) {
       setIncludeKeywords(setting.include_keywords);
     }
-    if (setting.exclude_keywords) {
+    if (Array.isArray(setting.exclude_keywords)) {
       setExcludeKeywords(setting.exclude_keywords);
     }
-    if (setting.file_extensions?.length) {
+    if (Array.isArray(setting.file_extensions)) {
       const selected = setting.file_extensions.reduce<Record<string, boolean>>((acc, extension) => {
         acc[extension.replace(/^\./, '').toUpperCase()] = true;
         return acc;
       }, {});
-      setSelectedFileTypes((items) => ({ ...items, ...selected }));
+      setSelectedFileTypes(selected);
     }
   };
 
@@ -2313,6 +2391,7 @@ export default function App() {
         notificationSettingsResult,
         scanSettingsResult,
         runningScanResult,
+        runningCleanupResult,
         scanHistoryResult,
         statisticsSummaryResult,
         monthlyStatsResult,
@@ -2327,6 +2406,7 @@ export default function App() {
         notificationApi.getSettings(options),
         scanApi.getSettings(options),
         scanApi.getRunning(options),
+        cleanupApi.getRunning(options),
         scanApi.getHistory({ page: 0, size: 20 }, options),
         statisticsApi.getSummary(options),
         statisticsApi.getMonthly(undefined, options),
@@ -2478,6 +2558,19 @@ export default function App() {
       } else if (latestScanId && isCompletedScanStatus(latestScanStatus)) {
         setApiScanJobId(latestScanId);
         activeApiScanJobId.current = latestScanId;
+      }
+
+      if (runningCleanupResult.status === 'fulfilled' && runningCleanupResult.value.cleanup_job) {
+        const runningCleanupJob = runningCleanupResult.value.cleanup_job;
+        setDeleteJobStatus('running');
+        setDeleteProgress(Math.max(0, Math.min(100, Math.round(runningCleanupJob.progress_percent ?? 0))));
+        setApiCleanupJobId(runningCleanupJob.cleanup_job_id ?? null);
+        activeApiCleanupJobId.current = runningCleanupJob.cleanup_job_id ?? null;
+        setDeleteStatusText(
+          runningCleanupJob.action_type === 'RESTORE_FROM_TRASH'
+            ? '선택 항목을 정리함으로 복구 중'
+            : '선택 항목을 휴지통으로 이동 중'
+        );
       }
 
       if (latestScanForResult || latestHistory) {
@@ -3194,6 +3287,7 @@ export default function App() {
     include_subfolders: includeSubFolders,
     last_opened_before_months: lastOpenedBeforeMonths,
     last_modified_before_months: lastModifiedBeforeMonths,
+    created_before_months: createdBeforeMonths,
     exclude_recent_days: 0,
     include_keywords: getEffectiveKeywordList('include'),
     exclude_keywords: getEffectiveKeywordList('exclude'),
@@ -3213,6 +3307,7 @@ export default function App() {
       apiScanSetting.include_subfolders !== payload.include_subfolders ||
       apiScanSetting.last_opened_before_months !== payload.last_opened_before_months ||
       apiScanSetting.last_modified_before_months !== payload.last_modified_before_months ||
+      apiScanSetting.created_before_months !== payload.created_before_months ||
       (apiScanSetting.exclude_recent_days ?? 0) !== payload.exclude_recent_days ||
       !areKeywordListsEqual(apiScanSetting.include_keywords, payload.include_keywords) ||
       !areKeywordListsEqual(apiScanSetting.exclude_keywords, payload.exclude_keywords) ||
@@ -3223,14 +3318,25 @@ export default function App() {
   };
 
   const saveApiScanSettings = async () => {
-    if (!apiAccessToken) return;
+    if (!apiAccessToken) {
+      showToast('로그인 후 기본 스캔 조건을 저장할 수 있어요', undefined, 2600);
+      return false;
+    }
 
     try {
       const saved = await scanApi.saveSettings(getApiScanSettingsPayload(), { accessToken: apiAccessToken });
       applyApiScanSetting(saved);
+      return true;
     } catch {
       showToast('스캔 조건은 화면에만 적용됐어요');
+      return false;
     }
+  };
+  const saveDefaultScanSettings = async () => {
+    const saved = await saveApiScanSettings();
+    if (!saved) return;
+    showToast('기본 스캔 조건을 저장했어요', undefined, 2200);
+    back();
   };
 
   const startScan = () => {
@@ -3307,6 +3413,31 @@ export default function App() {
     replace('home');
   };
 
+  const cancelCleanupJob = () => {
+    const cleanupJobId = activeApiCleanupJobId.current ?? apiCleanupJobId;
+    const applyCancelledCleanupJob = () => {
+      setDeleteJobStatus('cancelled');
+      setDeleteProgress(0);
+      setDeleteStatusText('휴지통 이동이 취소됐어요');
+      setApiCleanupJobId(null);
+      activeApiCleanupJobId.current = null;
+      showToast('휴지통 이동을 취소했어요', undefined, 2400);
+      replace('home');
+    };
+
+    if (apiAccessToken && cleanupJobId) {
+      void cleanupApi
+        .cancel(cleanupJobId, { accessToken: apiAccessToken })
+        .then(applyCancelledCleanupJob)
+        .catch(() => {
+          showToast('휴지통 이동 취소 요청에 실패했어요', undefined, 2600);
+        });
+      return;
+    }
+
+    applyCancelledCleanupJob();
+  };
+
   const handleHomeScanPress = () => {
     setScanSourceEditOnly(false);
     setPeriodEditOnly(false);
@@ -3366,6 +3497,11 @@ export default function App() {
   };
 
   const back = () => {
+    if (screen === 'scanProgress' || screen === 'deleteProcessing') {
+      replace('home');
+      return;
+    }
+
     if (screen === 'onboardingIntro') {
       setHasSeenConnectedSuccess(true);
       setSkipConnectedAnimation(true);
@@ -3486,6 +3622,9 @@ export default function App() {
         if (!job?.cleanup_job_id) throw new Error('No cleanup job created');
         activeApiCleanupJobId.current = job.cleanup_job_id;
         setApiCleanupJobId(job.cleanup_job_id);
+        if (job.progress_percent !== undefined) {
+          setDeleteProgress(Math.max(0, Math.min(100, Math.round(job.progress_percent))));
+        }
       })().catch((error) => {
         setDeleteJobStatus('failed');
         setDeleteStatusText('정리 요청에 실패했어요');
@@ -3878,6 +4017,8 @@ export default function App() {
 
         setDeleteProgress(100);
         setDeleteJobStatus('completed');
+        setApiCleanupJobId(null);
+        activeApiCleanupJobId.current = null;
         setHomeScanNotice('none');
         if (job.job_status === 'PARTIAL_FAILED') {
           setDeleteStatusText(failedItemCount ? `일부 항목 ${failedItemCount}개 이동 실패` : '일부 항목 이동 실패');
@@ -3926,11 +4067,17 @@ export default function App() {
               clearInterval(timer);
               timer = null;
             }
-            setDeleteJobStatus('failed');
-            setDeleteStatusText('정리 작업이 완료되지 못했어요');
-            showToast('휴지통 이동이 실패했어요. 잠시 후 다시 시도해주세요', undefined, 3600);
+            setDeleteJobStatus(job.job_status === 'CANCELED' ? 'cancelled' : 'failed');
+            setApiCleanupJobId(null);
+            activeApiCleanupJobId.current = null;
+            setDeleteStatusText(job.job_status === 'CANCELED' ? '휴지통 이동이 취소됐어요' : '정리 작업을 완료하지 못했어요');
+            showToast(
+              job.job_status === 'CANCELED' ? '휴지통 이동을 취소했어요' : '휴지통 이동이 실패했어요. 잠시 후 다시 시도해주세요',
+              undefined,
+              3600
+            );
             if (screenRef.current === 'deleteProcessing') {
-              replace('selectedReview');
+              replace(job.job_status === 'CANCELED' ? 'home' : 'selectedReview');
             }
           }
         } catch {
@@ -3943,7 +4090,7 @@ export default function App() {
       void pollCleanupJob();
       timer = setInterval(() => {
         void pollCleanupJob();
-      }, 2500);
+      }, 1000);
 
       return () => {
         cancelled = true;
@@ -3964,6 +4111,7 @@ export default function App() {
         if (next >= 100) {
           clearInterval(timer);
           setDeleteJobStatus('completed');
+          setApiCleanupJobId(null);
           setTimeout(() => {
             if (apiAccessToken && activeApiCleanupJobId.current) {
               void cleanupApi
@@ -3985,6 +4133,7 @@ export default function App() {
                 })
                 .catch(() => undefined);
             }
+            activeApiCleanupJobId.current = null;
             setHomeScanNotice('none');
             if (screenRef.current === 'deleteProcessing') {
               replace('cleanupComplete');
@@ -4315,20 +4464,22 @@ export default function App() {
     const cleanupCurrentUsedPercent = Math.min(100, Math.max(0, (cleanupCurrentUsedGB / cleanupDriveTotalGB) * 100));
     const cleanupReclaimedPercent = Math.min(100 - cleanupCurrentUsedPercent, Math.max(0, (cleanupReclaimedGB / cleanupDriveTotalGB) * 100));
     const checkedCleanupSizeLabel = selectedTotalSizeLabel;
-    const latestCleanupHistory = apiCleanupHistoryItems[0];
-    const latestScanHistoryForFallback = apiScanHistoryItems.find((item) => isCompletedScanStatus(item.job_status)) ?? apiScanHistoryItems[0];
-    const historyScanBytesTotal = apiScanHistoryItems.reduce((sum, item) => sum + (item.estimated_reclaim_bytes ?? item.reclaimed_bytes ?? 0), 0);
-    const latestScanHistoryBytes = latestScanHistoryForFallback?.estimated_reclaim_bytes ?? latestScanHistoryForFallback?.reclaimed_bytes;
+    const hasLinkedScanJob = (scanJobId?: number | null) => typeof scanJobId === 'number' && scanJobId > 0;
+    const scanCleanupHistoryItems = apiCleanupHistoryItems.filter((item) => hasLinkedScanJob(item.scan_job_id));
+    const scanHistoryCleanupItems = apiScanHistoryItems.filter((item) => item.cleanup_done === true || (item.reclaimed_bytes ?? 0) > 0);
+    const latestCleanupHistory = scanCleanupHistoryItems[0];
+    const latestScanHistoryForFallback =
+      scanHistoryCleanupItems.find((item) => isCompletedScanStatus(item.job_status)) ?? scanHistoryCleanupItems[0];
+    const scanCleanupHistoryBytesTotal = scanCleanupHistoryItems.reduce((sum, item) => sum + (item.reclaimed_bytes ?? 0), 0);
+    const scanHistoryCleanupBytesTotal = scanHistoryCleanupItems.reduce((sum, item) => sum + (item.reclaimed_bytes ?? 0), 0);
+    const historyScanBytesTotal = scanCleanupHistoryItems.length ? scanCleanupHistoryBytesTotal : scanHistoryCleanupBytesTotal;
+    const latestScanHistoryBytes = latestScanHistoryForFallback?.reclaimed_bytes;
     const latestCleanupSizeLabel = latestCleanupHistory?.reclaimed_bytes !== undefined
       ? formatBytes(latestCleanupHistory.reclaimed_bytes)
       : latestScanHistoryBytes !== undefined
         ? formatBytes(latestScanHistoryBytes)
-      : checkedCleanupSizeLabel;
-    const historyTotalSizeLabel = apiStatisticsSummary?.total_reclaimed_bytes !== undefined
-      ? formatBytes(apiStatisticsSummary.total_reclaimed_bytes)
-      : historyScanBytesTotal
-        ? formatBytes(historyScanBytesTotal)
-      : checkedCleanupSizeLabel;
+      : formatBytes(0);
+    const historyTotalSizeLabel = formatBytes(historyScanBytesTotal);
     const latestCleanupDateLabel = latestCleanupHistory?.completed_at
       ? formatApiDate(latestCleanupHistory.completed_at)
       : latestScanHistoryForFallback?.created_at
@@ -4339,17 +4490,15 @@ export default function App() {
       : latestScanHistoryForFallback
         ? `${apiScanSourceLabel(latestScanHistoryForFallback.scan_source)} · 정리 후보 ${latestScanHistoryForFallback.candidate_count ?? 0}개`
       : `Gmail ${selectedMailCleanupCount}개 · Drive ${selectedDriveCleanupCount}개`;
-    const historyGraphValues = apiCleanupHistoryItems.length
-      ? [...apiCleanupHistoryItems].reverse().map((item) => bytesToMB(item.reclaimed_bytes ?? 0) / 1024)
-      : apiScanHistoryItems.length
-        ? [...apiScanHistoryItems].reverse().map((item) => bytesToMB(item.estimated_reclaim_bytes ?? item.reclaimed_bytes ?? 0) / 1024)
-      : apiMonthlyStats.length
-        ? apiMonthlyStats.map((item) => bytesToMB(item.reclaimed_bytes ?? 0) / 1024)
+    const historyGraphValues = scanCleanupHistoryItems.length
+      ? [...scanCleanupHistoryItems].reverse().map((item) => item.reclaimed_bytes ?? 0)
+      : scanHistoryCleanupItems.length
+        ? [...scanHistoryCleanupItems].reverse().map((item) => item.reclaimed_bytes ?? 0)
         : undefined;
     const historyGraphLabels = historyGraphValues
       ? historyGraphValues.map((_, index) => `${index + 1}회`)
       : undefined;
-    const hasHistoryData = Boolean(apiCleanupHistoryItems.length || apiScanHistoryItems.length || apiStatisticsSummary?.total_cleanup_count || lastScan);
+    const hasHistoryData = Boolean(scanCleanupHistoryItems.length || scanHistoryCleanupItems.length);
     const homeScanStatusTitle =
       homeScanNotice === 'completed' ? '스캔이 완료됐어요' : homeScanNotice === 'cancelled' ? '스캔이 중단됐어요' : '스캔 진행 중';
     const homeScanStatusDesc =
@@ -4358,6 +4507,9 @@ export default function App() {
         : homeScanNotice === 'cancelled'
           ? '다시 스캔하면 새로 분석을 시작해요.'
           : `${scanSourceLabelRef.current} · ${scanProgress}%`;
+    const isCleanupRunning = deleteJobStatus === 'running';
+    const homeCleanupStatusTitle = '휴지통 이동 중';
+    const homeCleanupStatusDesc = `선택 항목 처리 중 · ${deleteProgress}%`;
 
     switch (screen) {
       case 'initial':
@@ -4583,7 +4735,7 @@ export default function App() {
                 )}
               </Card>
             </Pressable>
-            {homeScanNotice !== 'none' ? (
+            {homeScanNotice !== 'none' && !isCleanupRunning ? (
               <Card style={styles.homeScanStatusCard}>
                 <View style={styles.rowBetween}>
                   <View style={styles.infoMain}>
@@ -4619,6 +4771,28 @@ export default function App() {
                     </Pressable>
                   </View>
                 ) : null}
+              </Card>
+            ) : null}
+            {isCleanupRunning ? (
+              <Card style={styles.homeScanStatusCard}>
+                <View style={styles.rowBetween}>
+                  <View style={styles.infoMain}>
+                    <Text style={styles.cardTitle}>{homeCleanupStatusTitle}</Text>
+                    <Text style={styles.meta}>{homeCleanupStatusDesc}</Text>
+                  </View>
+                  <Text style={styles.homeScanBadge}>진행중</Text>
+                </View>
+                <View style={styles.miniProgressTrack}>
+                  <View style={[styles.miniProgressFill, { width: `${deleteProgress}%` }]} />
+                </View>
+                <View style={styles.scanStatusActions}>
+                  <Pressable style={styles.scanStatusButton} onPress={() => go('deleteProcessing')}>
+                    <Text style={styles.scanStatusButtonText}>진행 화면 보기</Text>
+                  </Pressable>
+                  <Pressable style={styles.scanStatusCancel} onPress={cancelCleanupJob}>
+                    <Text style={styles.scanStatusCancelText}>취소</Text>
+                  </Pressable>
+                </View>
               </Card>
             ) : null}
             <View style={styles.homeActionSpacer} />
@@ -4743,10 +4917,12 @@ export default function App() {
               title={scanSourceEditOnly ? '조건 적용하기' : '다음'}
               onPress={() => {
                 if (scanSourceEditOnly) {
-                  void saveApiScanSettings();
-                  resetSettingsScanFlowNavigation();
-                  setScanSourceEditOnly(false);
-                  replace('defaultScan');
+                  void saveApiScanSettings().then((saved) => {
+                    if (!saved) return;
+                    resetSettingsScanFlowNavigation();
+                    setScanSourceEditOnly(false);
+                    replace('defaultScan');
+                  });
                   return;
                 }
                 setPeriodEditOnly(false);
@@ -4841,10 +5017,12 @@ export default function App() {
               onPress={
                 periodEditOnly
                   ? () => {
-                      void saveApiScanSettings();
-                      resetSettingsScanFlowNavigation();
-                      setPeriodEditOnly(false);
-                      replace('defaultScan');
+                      void saveApiScanSettings().then((saved) => {
+                        if (!saved) return;
+                        resetSettingsScanFlowNavigation();
+                        setPeriodEditOnly(false);
+                        replace('defaultScan');
+                      });
                     }
                   : startScan
               }
@@ -4895,10 +5073,18 @@ export default function App() {
             <View style={styles.scanFullContent}>
               <Card tint style={styles.scanFullPanel}>
                 <Text style={styles.scanFullKicker}>AURA가 분석 중이에요</Text>
-                <ProgressCircle progress={scanProgress} />
+                <ProgressCircle progress={scanProgress} compact />
                 <Text style={styles.scanFullStatusText}>{scanStatusText}</Text>
                 <View style={styles.progressTrack}>
                   <View style={[styles.progressFill, { width: `${scanProgress}%` }]} />
+                </View>
+                <View style={styles.progressActionRow}>
+                  <Pressable style={styles.progressCancelButton} onPress={cancelScan}>
+                    <Text style={styles.progressCancelButtonText}>취소하기</Text>
+                  </Pressable>
+                  <Pressable style={styles.progressHomeButton} onPress={() => replace('home')}>
+                    <Text style={styles.progressHomeButtonText}>홈으로 이동</Text>
+                  </Pressable>
                 </View>
               </Card>
               <View style={styles.scanFullStatusGrid}>
@@ -4915,9 +5101,6 @@ export default function App() {
                   done={scanProgress >= 100}
                 />
               </View>
-              <View style={styles.scanProgressSpacer} />
-              <OutlineButton title="취소하기" onPress={cancelScan} />
-              <PrimaryButton title="홈으로 이동" onPress={() => replace('home')} inline />
             </View>
           </ScreenShell>
         );
@@ -5153,8 +5336,8 @@ export default function App() {
 
       case 'deleteProcessing':
         return (
-          <ScreenShell title="삭제 진행" disableScroll>
-            <ProgressCircle progress={deleteProgress} />
+          <ScreenShell title="휴지통 이동" disableScroll>
+            <ProgressCircle progress={deleteProgress} compact />
             <DeleteStatusRow
               service="gmail"
               title="Gmail"
@@ -5167,10 +5350,18 @@ export default function App() {
               status={deleteProgress >= 100 ? '완료' : '진행'}
               done={deleteProgress >= 100}
             />
-            <Text style={styles.progressLabel}>전체 삭제 진행</Text>
+            <Text style={styles.progressLabel}>전체 이동 진행</Text>
             <Text style={styles.infoDesc}>{deleteStatusText}</Text>
             <View style={styles.progressTrack}>
               <View style={[styles.progressFill, { width: `${deleteProgress}%` }]} />
+            </View>
+            <View style={styles.progressActionRow}>
+              <Pressable style={styles.progressCancelButton} onPress={cancelCleanupJob}>
+                <Text style={styles.progressCancelButtonText}>취소하기</Text>
+              </Pressable>
+              <Pressable style={styles.progressHomeButton} onPress={() => replace('home')}>
+                <Text style={styles.progressHomeButtonText}>홈으로 이동</Text>
+              </Pressable>
             </View>
             <Text style={styles.remainingCapacityText}>현재 남은 용량 {remainingAfterCleanup}</Text>
           </ScreenShell>
@@ -5358,9 +5549,7 @@ export default function App() {
         return (
           <ScreenShell title="계정 및 연결">
             <View style={styles.accountHeroCard}>
-              <View style={styles.avatarCircle}>
-                <Text style={styles.avatarText}>U</Text>
-              </View>
+              <UserAvatar user={currentUser} />
               <View style={styles.infoMain}>
                 <Text style={styles.profileConnectionText}>{currentUser?.name ?? 'AURA 사용자'}</Text>
                 <Text style={styles.infoTitleLarge}>{currentUser?.email ?? 'user@gmail.com'}</Text>
@@ -5413,7 +5602,7 @@ export default function App() {
               right="변경  ›"
               onPress={() => openKeywordSheet('exclude')}
             />
-            <PrimaryButton title="기본 조건 저장" onPress={back} />
+            <PrimaryButton title="기본 조건 저장" onPress={() => void saveDefaultScanSettings()} />
           </ScreenShell>
         );
 
@@ -5511,7 +5700,7 @@ export default function App() {
                     <Text style={styles.rowRight}>전체 보기</Text>
                   </Pressable>
                 </View>
-                {apiCleanupHistoryItems.length || latestScanHistoryForFallback || selectedCandidateCount ? (
+                {scanCleanupHistoryItems.length || latestScanHistoryForFallback ? (
                   <View style={styles.recentCleanupCard}>
                     <View style={styles.recentCleanupTopRow}>
                       <View style={styles.infoMain}>
@@ -5534,9 +5723,9 @@ export default function App() {
       case 'analysisHistoryAll':
         return (
           <ScreenShell title="정리 기록 전체보기">
-            {apiCleanupHistoryItems.length ? (
+            {scanCleanupHistoryItems.length ? (
               <>
-                {apiCleanupHistoryItems.map((item, index) => (
+                {scanCleanupHistoryItems.map((item, index) => (
                   <View style={styles.recentCleanupCard} key={item.history_id ?? item.cleanup_job_id ?? item.completed_at ?? index}>
                     <View style={styles.recentCleanupTopRow}>
                       <View style={styles.infoMain}>
@@ -5548,31 +5737,19 @@ export default function App() {
                   </View>
                 ))}
               </>
-            ) : apiScanHistoryItems.length ? (
+            ) : scanHistoryCleanupItems.length ? (
               <>
-                {apiScanHistoryItems.map((item, index) => (
+                {scanHistoryCleanupItems.map((item, index) => (
                   <View style={styles.recentCleanupCard} key={item.scan_job_id ?? item.created_at ?? index}>
                     <View style={styles.recentCleanupTopRow}>
                       <View style={styles.infoMain}>
                         <Text style={styles.infoTitle}>{formatApiDate(item.created_at)}</Text>
                         <Text style={styles.infoDesc}>{apiScanSourceLabel(item.scan_source)} · 정리 후보 {item.candidate_count ?? 0}개</Text>
                       </View>
-                      <Text style={styles.recentCleanupSizeValue}>{formatBytes(item.estimated_reclaim_bytes ?? item.reclaimed_bytes ?? 0)}</Text>
+                      <Text style={styles.recentCleanupSizeValue}>{formatBytes(item.reclaimed_bytes ?? 0)}</Text>
                     </View>
                   </View>
                 ))}
-              </>
-            ) : lastScan ? (
-              <>
-                <View style={styles.recentCleanupCard}>
-                  <View style={styles.recentCleanupTopRow}>
-                    <View style={styles.infoMain}>
-                      <Text style={styles.infoTitle}>{lastScan.dateLabel}</Text>
-                      <Text style={styles.infoDesc}>Gmail {selectedMailCleanupCount}개 · Drive {selectedDriveCleanupCount}개</Text>
-                    </View>
-                    <Text style={styles.recentCleanupSizeValue}>{checkedCleanupSizeLabel}</Text>
-                  </View>
-                </View>
               </>
             ) : (
               <EmptyState title="아직 정리 기록이 없어요" desc="정리를 완료하면 전체 기록을 볼 수 있어요." />
@@ -5660,6 +5837,11 @@ export default function App() {
       return;
     }
 
+    if (screen === 'deleteProcessing') {
+      if (direction === 'right') replace('home');
+      return;
+    }
+
     if (screen === 'candidateSummary' || screen === 'selectedReview') {
       return;
     }
@@ -5721,7 +5903,7 @@ export default function App() {
           navigate: replace,
           navigateTab,
           back,
-          scanResultPending: homeScanNotice === 'completed' || homeScanNotice === 'running',
+          scanResultPending: homeScanNotice === 'completed' || homeScanNotice === 'running' || deleteJobStatus === 'running',
           connectedInstant: screen === 'connected' && skipConnectedAnimation,
         }}
       >
@@ -7132,6 +7314,86 @@ function ReviewSummaryCard({ title, desc }: { title: string; desc: string }) {
   );
 }
 
+function UserAvatar({ user }: { user?: AuraUser | null }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const profileImageUrl = user?.profileImageUrl?.trim();
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [profileImageUrl]);
+
+  if (profileImageUrl && !imageFailed) {
+    return (
+      <Image
+        source={{ uri: profileImageUrl }}
+        style={styles.avatarImage}
+        onError={() => setImageFailed(true)}
+      />
+    );
+  }
+
+  return (
+    <View style={styles.avatarCircle}>
+      <Text style={styles.avatarText}>{getUserInitial(user)}</Text>
+    </View>
+  );
+}
+
+function MailBodyCard({ bodyText, loading }: { bodyText?: string; loading?: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const previewLineCount = 6;
+  const fallbackText = loading ? '메일 본문 미리보기를 불러오는 중...' : '메일 본문 미리보기를 불러오지 못했어요.';
+  const displayText = bodyText ?? fallbackText;
+  const canExpand = Boolean(bodyText && (bodyText.length > 160 || bodyText.split(/\r\n|\r|\n/).length > previewLineCount));
+
+  return (
+    <View style={[styles.mailBodyCard, expanded && styles.mailBodyCardExpanded]}>
+      <Text
+        style={styles.mailBodyText}
+        numberOfLines={expanded ? undefined : previewLineCount}
+        ellipsizeMode="tail"
+      >
+        {displayText}
+      </Text>
+      {canExpand ? (
+        <Pressable
+          style={styles.mailBodyExpandButton}
+          onPress={() => setExpanded((value) => !value)}
+          accessibilityRole="button"
+          accessibilityLabel={expanded ? '메일 미리보기 접기' : '메일 미리보기 펼치기'}
+          hitSlop={8}
+        >
+          <FontAwesome5 name="ellipsis-v" size={18} color={mutedText} />
+        </Pressable>
+      ) : null}
+    </View>
+  );
+}
+
+function DriveLinkCard({ webViewLink, loading }: { webViewLink?: string; loading?: boolean }) {
+  const openDriveLink = () => {
+    if (!webViewLink) return;
+    void Linking.openURL(webViewLink).catch(() => undefined);
+  };
+
+  return (
+    <View style={styles.driveLinkCard}>
+      <Pressable
+        style={[styles.driveLinkIconButton, !webViewLink && styles.driveLinkIconButtonDisabled]}
+        onPress={openDriveLink}
+        disabled={!webViewLink}
+        accessibilityRole="link"
+      >
+        <FontAwesome5 name="external-link-alt" size={30} color={webViewLink ? navy : mutedText} />
+      </Pressable>
+      <Text style={styles.driveLinkTitle}>Google Drive에서 열기</Text>
+      <Text style={styles.driveLinkDesc}>
+        {webViewLink ? '파일 미리보기는 Drive에서 확인할 수 있어요.' : loading ? 'Drive 링크를 확인하는 중이에요.' : 'Drive 링크를 열 수 없어요.'}
+      </Text>
+    </View>
+  );
+}
+
 function ScanItemDetailScreen({
   title,
   subtitle,
@@ -7182,13 +7444,23 @@ function ScanItemDetailScreen({
     );
   }
 
+  const mailBodyPreview = kind === 'mail'
+    ? pickReadableText(apiDetail?.item?.body_text, apiDetail?.item?.snippet, item.bodyPreview)
+    : undefined;
+  const driveWebViewLink = kind === 'drive'
+    ? pickReadableText(apiDetail?.item?.web_view_link, item.webViewLink, buildGoogleDriveWebViewLink(apiDetail?.item?.external_item_id))
+    : undefined;
+  const detailSubtitle = kind === 'mail' && item.detailSubtitle === mailBodyPreview ? undefined : item.detailSubtitle;
+
   return (
     <ScreenShell title={title} subtitle={subtitle}>
       <Text style={styles.detailMainTitle}>{item.title}</Text>
-      {item.detailSubtitle ? <Text style={styles.detailSubMeta}>{item.detailSubtitle}</Text> : null}
-      <View style={styles.itemPreviewBox}>
-        <Text style={styles.itemPreviewText}>{item.previewLabel ?? (kind === 'mail' ? '메일 본문 미리보기' : 'FILE PREVIEW')}</Text>
-      </View>
+      {detailSubtitle ? <Text style={styles.detailSubMeta}>{detailSubtitle}</Text> : null}
+      {kind === 'mail' ? (
+        <MailBodyCard bodyText={mailBodyPreview} loading={Boolean(apiAccessToken && item.candidateId && !apiDetail && !detailError)} />
+      ) : (
+        <DriveLinkCard webViewLink={driveWebViewLink} loading={Boolean(apiAccessToken && item.candidateId && !apiDetail && !detailError)} />
+      )}
       {kind === 'mail' ? (
         <View style={styles.detailInfoBox}>
           <Text style={styles.detailInfoTitle}>선정 이유</Text>
@@ -7196,32 +7468,12 @@ function ScanItemDetailScreen({
           <View style={styles.thinDivider} />
           <Text style={styles.detailInfoTitle}>분석 메타데이터</Text>
           <Text style={styles.detailInfoText}>용량 {formatDataSize(item.sizeMB)} · 기준 날짜 {item.dateLabel}</Text>
-          {apiDetail ? (
-            <Text style={styles.detailInfoText}>
-              서버 후보 #{apiDetail.candidate_id ?? item.candidateId} · 선택 상태 {apiDetail.selection_status ?? item.selectionStatus ?? 'NONE'}
-              {apiDetail.analysis?.category ? ` · 분류 ${apiDetail.analysis.category}` : ''}
-            </Text>
-          ) : null}
-          {apiDetail?.analysis?.ai_confidence_score !== undefined ? (
-            <Text style={styles.detailInfoText}>AI 신뢰도 {(apiDetail.analysis.ai_confidence_score * 100).toFixed(2)}%</Text>
-          ) : null}
-          {detailError ? <Text style={styles.warningText}>{detailError}</Text> : null}
         </View>
       ) : (
         <View style={styles.detailInfoBox}>
           <Text style={styles.detailInfoTitle}>파일 메타데이터</Text>
           <Text style={styles.detailInfoText}>용량 {formatDataSize(item.sizeMB)} · 기준 날짜 {item.dateLabel}</Text>
-          {apiDetail ? (
-            <Text style={styles.detailInfoText}>
-              서버 후보 #{apiDetail.candidate_id ?? item.candidateId} · 선택 상태 {apiDetail.selection_status ?? item.selectionStatus ?? 'NONE'}
-              {apiDetail.analysis?.category ? ` · 분류 ${apiDetail.analysis.category}` : ''}
-            </Text>
-          ) : null}
           {apiDetail?.item?.folder_path ? <Text style={styles.detailInfoText}>Drive 경로 {apiDetail.item.folder_path}</Text> : null}
-          {apiDetail?.analysis?.ai_confidence_score !== undefined ? (
-            <Text style={styles.detailInfoText}>AI 신뢰도 {(apiDetail.analysis.ai_confidence_score * 100).toFixed(2)}%</Text>
-          ) : null}
-          {detailError ? <Text style={styles.warningText}>{detailError}</Text> : null}
         </View>
       )}
     </ScreenShell>
@@ -7305,13 +7557,14 @@ function RecentResultRow({ title, desc, value }: { title: string; desc?: string;
 function CarbonStatsGraph({ sizeLabel, values, labels }: { sizeLabel: string; values?: number[]; labels?: string[] }) {
   const reveal = useRef(new Animated.Value(0)).current;
   const lastAnimatedGraphKey = useRef('');
-  const current = sizeLabelToMB(sizeLabel) / 1024;
+  const currentBytes = sizeLabelToMB(sizeLabel) * 1024 * 1024;
   const chartWidth = Math.max(260, Dimensions.get('window').width - 96);
-  const rawValues = values?.length ? values : [Math.max(0, current)];
-  const graphKey = `${sizeLabel}|${rawValues.join(',')}|${(labels ?? []).join(',')}`;
+  const rawValues = values?.length ? values : [Math.max(0, currentBytes)];
+  const chartScale = getChartSizeScale(rawValues);
+  const graphKey = `${sizeLabel}|${chartScale.suffix}|${rawValues.join(',')}|${(labels ?? []).join(',')}`;
   const scanValues = rawValues.length === 1
-    ? [0, Math.max(0, rawValues[0])]
-    : rawValues.map((value) => Math.max(0, value));
+    ? [0, Math.max(0, rawValues[0]) / chartScale.divisor]
+    : rawValues.map((value) => Math.max(0, value) / chartScale.divisor);
   const scanLabels = labels?.length === rawValues.length
     ? rawValues.length === 1 ? ['', labels[0]] : labels
     : scanValues.map((_, index) => (index === 0 && rawValues.length === 1 ? '' : `${index + 1}회`));
@@ -7350,13 +7603,15 @@ function CarbonStatsGraph({ sizeLabel, values, labels }: { sizeLabel: string; va
             }}
             width={chartWidth}
             height={180}
-            yAxisSuffix="GB"
+            fromNumber={chartScale.axisMax}
+            yAxisSuffix={chartScale.suffix}
+            yLabelsOffset={8}
             chartConfig={{
               backgroundGradientFrom: '#FFFFFF',
               backgroundGradientTo: '#FFFFFF',
               color: (opacity = 1) => `rgba(82, 190, 116, ${opacity})`,
               labelColor: (opacity = 1) => `rgba(120, 129, 134, ${opacity})`,
-              decimalPlaces: 1,
+              decimalPlaces: chartScale.decimalPlaces,
               propsForBackgroundLines: {
                 stroke: '#E8ECEF',
                 strokeDasharray: '',
@@ -7369,7 +7624,7 @@ function CarbonStatsGraph({ sizeLabel, values, labels }: { sizeLabel: string; va
             }}
             bezier
             fromZero
-            segments={4}
+            segments={chartScale.segments}
             withOuterLines={false}
             withVerticalLines={false}
             style={styles.statsLineChart}
@@ -7537,6 +7792,7 @@ function StorageScreen({
           title: item.title,
           subtitle: item.title,
           meta: item.subtitle,
+          webViewLink: item.webViewLink,
           badge: '복구 가능',
         };
       }
@@ -7574,6 +7830,7 @@ function StorageScreen({
           title: item.title,
           subtitle: item.meta,
           fullPath: getTrashDriveFolderPath(item.meta),
+          webViewLink: item.webViewLink ?? buildGoogleDriveWebViewLink(item.externalItemId),
         };
       })
     : [];
@@ -7749,6 +8006,7 @@ function StorageScreen({
       snapshotTitle: item.snapshotTitle,
       snapshotSizeBytes: item.snapshotSizeBytes,
       itemSource: item.itemSource,
+      snippet: item.snippet,
     });
   const openDriveStorageDetail = (item: StorageDriveItem) =>
     openStorageDetail({
@@ -7760,6 +8018,7 @@ function StorageScreen({
       snapshotTitle: item.snapshotTitle,
       snapshotSizeBytes: item.snapshotSizeBytes,
       itemSource: item.itemSource,
+      webViewLink: item.webViewLink ?? buildGoogleDriveWebViewLink(item.externalItemId),
     });
   const openDriveStorageItem = (item: StorageDriveItem) => {
     if (item.type === 'F' && item.fullPath) {
@@ -7996,6 +8255,9 @@ function StorageScreen({
       hideFloatingScan={selectionMode || Boolean(deleteSheetMode) || restoreSheetVisible}
       floatingAction={storageFloatingActions}
     >
+      {isTrash ? (
+        <Text style={styles.storageTrashNoticeText}>휴지통에 있는 항목들은 30일 이후 자동으로 삭제됩니다.</Text>
+      ) : null}
       <View style={styles.storagePrimaryTabs}>
         <Pressable style={[styles.storagePrimaryTab, !isDrive && styles.storagePrimaryTabActive]} onPress={goMail}>
           <Text style={[styles.storagePrimaryTabText, !isDrive && styles.storagePrimaryTabTextActive]}>메일</Text>
@@ -8886,42 +9148,24 @@ function StorageDetailScreen({ item, apiAccessToken }: { item: StorageDetailItem
     );
   }
 
-  const detailRows = [
-    ['서버 item_id', apiDetail?.item_id ?? item.itemId],
-    ['외부 항목 ID', apiDetail?.external_item_id ?? item.externalItemId],
-    ['항목 출처', apiDetail?.item_source ?? item.itemSource],
-    ['제목', apiDetail?.title ?? item.snapshotTitle],
-    ['용량', formatBytes(apiDetail?.size_bytes ?? item.snapshotSizeBytes)],
-    ['폴더', apiDetail?.folder_path],
-    ['보낸 사람', apiDetail?.sender_email],
-    ['소유자', apiDetail?.owner_email],
-    ['수정일', apiDetail?.modified_time ? formatApiDate(apiDetail.modified_time) : undefined],
-    ['휴지통 여부', apiDetail?.is_trashed === undefined ? undefined : apiDetail.is_trashed ? '예' : '아니오'],
-  ].filter(([, value]) => value !== undefined && value !== null && value !== '');
+  const mailBodyPreview = item.source === 'mail'
+    ? pickReadableText(apiDetail?.body_text, apiDetail?.snippet, item.snippet)
+    : undefined;
+  const driveWebViewLink = item.source === 'drive'
+    ? pickReadableText(apiDetail?.web_view_link, item.webViewLink, buildGoogleDriveWebViewLink(apiDetail?.external_item_id ?? item.externalItemId))
+    : undefined;
 
   return (
     <ScreenShell title="상세 보기">
       <Text style={styles.detailMainTitle}>{item.title}</Text>
-      <View style={styles.itemPreviewBox}>
-        <Text style={styles.itemPreviewText}>{item.source === 'mail' ? 'Gmail 메타데이터' : 'Drive 메타데이터'}</Text>
-      </View>
+      {item.source === 'mail' ? (
+        <MailBodyCard bodyText={mailBodyPreview} loading={detailLoading} />
+      ) : (
+        <DriveLinkCard webViewLink={driveWebViewLink} loading={detailLoading} />
+      )}
       <View style={styles.detailInfoBox}>
         <Text style={styles.detailInfoTitle}>메타데이터</Text>
         <Text style={styles.detailInfoText}>{item.meta}</Text>
-      </View>
-      <View style={styles.detailInfoBox}>
-        <Text style={styles.detailInfoTitle}>서버 상세 정보</Text>
-        {detailLoading ? <Text style={styles.detailInfoText}>상세 정보를 불러오는 중...</Text> : null}
-        {detailRows.length ? (
-          detailRows.map(([label, value]) => (
-            <Text key={label} style={styles.detailInfoText}>
-              {label}: {formatUnknownValue(value)}
-            </Text>
-          ))
-        ) : !detailLoading ? (
-          <Text style={styles.detailInfoText}>서버 상세 정보가 아직 없어요.</Text>
-        ) : null}
-        {detailError ? <Text style={styles.warningText}>{detailError}</Text> : null}
       </View>
     </ScreenShell>
   );
@@ -11384,6 +11628,40 @@ const styles = StyleSheet.create({
     height: '100%',
     backgroundColor: navy,
   },
+  progressActionRow: {
+    width: '100%',
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 2,
+  },
+  progressCancelButton: {
+    flex: 1,
+    height: 42,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: navy,
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  progressCancelButtonText: {
+    color: navy,
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  progressHomeButton: {
+    flex: 1,
+    height: 42,
+    borderRadius: 12,
+    backgroundColor: navy,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  progressHomeButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '900',
+  },
   listNoticeText: {
     color: mutedText,
     fontSize: 13,
@@ -11550,7 +11828,6 @@ const styles = StyleSheet.create({
     ...softShadow,
   },
   statsLineChart: {
-    marginLeft: -18,
     borderRadius: 16,
   },
   statsChartClip: {
@@ -11888,6 +12165,73 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     textAlign: 'center',
   },
+  mailBodyCard: {
+    minHeight: 160,
+    borderWidth: 1,
+    borderColor: '#CFEFDB',
+    borderRadius: 10,
+    backgroundColor: pale,
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    paddingRight: 48,
+    justifyContent: 'flex-start',
+  },
+  mailBodyCardExpanded: {
+    minHeight: 190,
+  },
+  mailBodyText: {
+    color: mutedText,
+    fontSize: 14,
+    lineHeight: 21,
+    fontWeight: '800',
+  },
+  mailBodyExpandButton: {
+    position: 'absolute',
+    right: 12,
+    bottom: 12,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: line,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  driveLinkCard: {
+    minHeight: 160,
+    borderWidth: 1,
+    borderColor: '#CFEFDB',
+    borderRadius: 10,
+    backgroundColor: pale,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+    paddingVertical: 18,
+    gap: 10,
+  },
+  driveLinkIconButton: {
+    width: 70,
+    height: 70,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  driveLinkIconButtonDisabled: {
+    opacity: 0.55,
+  },
+  driveLinkTitle: {
+    color: text,
+    fontSize: 15,
+    fontWeight: '900',
+    textAlign: 'center',
+  },
+  driveLinkDesc: {
+    color: mutedText,
+    fontSize: 12.5,
+    lineHeight: 18,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
   detailInfoBox: {
     borderWidth: 1,
     borderColor: line,
@@ -12155,6 +12499,15 @@ const styles = StyleSheet.create({
   },
   storagePrimaryTabTextActive: {
     color: '#FFFFFF',
+  },
+  storageTrashNoticeText: {
+    color: mutedText,
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '800',
+    marginTop: -4,
+    marginBottom: 8,
+    paddingHorizontal: 2,
   },
   storageSummaryBar: {
     minHeight: 50,
@@ -12810,6 +13163,12 @@ const styles = StyleSheet.create({
     backgroundColor: navy,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  avatarImage: {
+    width: 58,
+    height: 58,
+    borderRadius: 29,
+    backgroundColor: line,
   },
   avatarText: {
     color: '#FFFFFF',

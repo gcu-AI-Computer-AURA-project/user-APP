@@ -174,6 +174,7 @@ export type ApiCandidate = {
   sender_domain?: string;
   label_text?: string;
   snippet?: string;
+  body_text?: string;
   mime_type?: string;
   file_extension?: string;
   size_bytes?: number;
@@ -183,6 +184,7 @@ export type ApiCandidate = {
   modified_time?: string;
   last_opened_time?: string;
   folder_path?: string;
+  web_view_link?: string;
   has_attachment?: boolean;
   is_starred?: boolean;
   is_important?: boolean;
@@ -281,6 +283,7 @@ export type ApiStorageItem = {
   parent_folder_id?: string;
   web_view_link?: string;
   snippet?: string;
+  body_text?: string;
   created_time?: string;
   modified_time?: string;
   last_opened_time?: string;
@@ -337,7 +340,7 @@ export type ApiMonthlyStatistic = {
 export type ApiCleanupHistoryItem = {
   history_id?: number;
   cleanup_job_id?: number;
-  scan_job_id?: number;
+  scan_job_id?: number | null;
   action_type?: string;
   cleaned_item_count?: number;
   reclaimed_bytes?: number;
@@ -354,12 +357,16 @@ export type ApiCleanupJobCreateRequest = {
 
 export type ApiCleanupJob = {
   cleanup_job_id?: number;
+  scan_job_id?: number | null;
   job_status?: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'PARTIAL_FAILED' | 'CANCELED';
   progress_percent?: number;
   action_type?: string;
   selected_mail_count?: number;
   selected_drive_count?: number;
   total_selected_bytes?: number;
+  success_item_count?: number;
+  failed_item_count?: number;
+  error_message?: string;
   approved_at?: string;
   cleaned_item_count?: number;
   reclaimed_bytes?: number;
@@ -663,6 +670,15 @@ export const cleanupApi = {
       })
     );
   },
+  async getRunning(options?: ApiRequestOptions) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<{ cleanup_job?: ApiCleanupJob | null }>>(API_ENDPOINTS.cleanup.running, {
+        method: 'GET',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
   async getDetail(cleanupJobId: string | number, options?: ApiRequestOptions) {
     return unwrap(
       await apiRequest<ApiEnvelope<ApiCleanupJob>>(API_ENDPOINTS.cleanup.detail(cleanupJobId), {
@@ -671,6 +687,13 @@ export const cleanupApi = {
         signal: options?.signal,
       })
     );
+  },
+  async cancel(cleanupJobId: string | number, options?: ApiRequestOptions) {
+    return apiRequest<unknown>(API_ENDPOINTS.cleanup.cancel(cleanupJobId), {
+      method: 'POST',
+      accessToken: options?.accessToken,
+      signal: options?.signal,
+    });
   },
   async getResult(cleanupJobId: string | number, options?: ApiRequestOptions) {
     return unwrap(

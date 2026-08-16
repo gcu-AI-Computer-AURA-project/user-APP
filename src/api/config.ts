@@ -67,7 +67,9 @@ export const API_ENDPOINTS = {
   },
   cleanup: {
     create: '/api/cleanup-jobs',
+    running: '/api/cleanup-jobs/running',
     detail: (cleanupJobId: string | number) => `/api/cleanup-jobs/${cleanupJobId}`,
+    cancel: (cleanupJobId: string | number) => `/api/cleanup-jobs/${cleanupJobId}/cancel`,
     start: (cleanupJobId: string | number) => `/api/cleanup-jobs/${cleanupJobId}/start`,
     items: (cleanupJobId: string | number) => `/api/cleanup-jobs/${cleanupJobId}/items`,
     result: (cleanupJobId: string | number) => `/api/cleanup-jobs/${cleanupJobId}/result`,
