@@ -10,7 +10,6 @@ import {
   KeyboardAvoidingView,
   Linking,
   PanResponder,
-  PermissionsAndroid,
   Platform,
   Pressable,
   ScrollView,
@@ -130,6 +129,9 @@ const loadNotificationsModule = () => {
   notificationsModulePromise ??= import('expo-notifications');
   return notificationsModulePromise;
 };
+
+const AURA_NOTIFICATION_CHANNEL_ID = 'aura-default';
+
 type FloatingButtonVariant = 'scan' | 'delete' | 'trash' | 'restore';
 type FloatingAction = { variant: Exclude<FloatingButtonVariant, 'scan'>; onPress: () => void; small?: boolean };
 type FontAwesome5Name = React.ComponentProps<typeof FontAwesome5>['name'];
@@ -294,6 +296,52 @@ const getAuraAppVersion = () => {
 const isAndroidExpoGo = () => {
   const constants = Constants as unknown as { appOwnership?: string | null };
   return Platform.OS === 'android' && constants.appOwnership === 'expo';
+};
+
+const serializePushTokenData = (data: unknown) => {
+  if (typeof data === 'string') return data.trim();
+  if (data === undefined || data === null) return '';
+
+  try {
+    return JSON.stringify(data);
+  } catch {
+    return String(data);
+  }
+};
+
+const isExpoNotificationPermissionGranted = (
+  permission: { status?: string; ios?: { status?: unknown } },
+  Notifications?: NotificationsModule
+) => {
+  if (permission.status === 'granted') return true;
+
+  const iosStatus = permission.ios?.status;
+  const iosAuthorizationStatus = Notifications?.IosAuthorizationStatus;
+  if (!iosAuthorizationStatus || iosStatus === undefined) return false;
+
+  return (
+    iosStatus === iosAuthorizationStatus.AUTHORIZED ||
+    iosStatus === iosAuthorizationStatus.PROVISIONAL ||
+    iosStatus === iosAuthorizationStatus.EPHEMERAL
+  );
+};
+
+const getNotificationDataRecord = (data: unknown) =>
+  typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : {};
+
+const getNotificationDataString = (data: Record<string, unknown>, keys: string[]) => {
+  for (const key of keys) {
+    const value = data[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number') return String(value);
+  }
+  return '';
+};
+
+const getNotificationDataNumber = (data: Record<string, unknown>, keys: string[]) => {
+  const value = getNotificationDataString(data, keys);
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
 const getErrorMessage = (error: unknown, fallback: string) => {
@@ -1529,6 +1577,7 @@ export default function App() {
   const candidateSummaryLoadAttemptedScanId = useRef<number | null>(null);
   const fcmRegistrationInFlight = useRef(false);
   const registeredFcmTokenRef = useRef('');
+  const handledNotificationResponseIds = useRef<Set<string>>(new Set());
   const loadedDriveFolderPaths = useRef<Set<string>>(new Set());
   const pendingGoogleReconnectServices = useRef<Array<'GMAIL' | 'DRIVE'> | null>(null);
   const handledGoogleOauthCodes = useRef<Set<string>>(new Set());
@@ -2264,7 +2313,7 @@ export default function App() {
     return () => subscription.remove();
   }, [apiAccessToken]);
 
-  const registerFcmTokenWithServer = async () => {
+  const registerFcmTokenWithServer = async (tokenData?: unknown) => {
     if (
       !apiAccessToken ||
       !permissions.alarm ||
@@ -2289,18 +2338,17 @@ export default function App() {
       }
 
       let permission = await Notifications.getPermissionsAsync();
-      if (permission.status !== 'granted') {
+      if (!isExpoNotificationPermissionGranted(permission, Notifications)) {
         permission = await Notifications.requestPermissionsAsync();
       }
-      if (permission.status !== 'granted') return;
+      if (!isExpoNotificationPermissionGranted(permission, Notifications)) return;
 
-      const devicePushToken = await Notifications.getDevicePushTokenAsync();
-      const token =
-        typeof devicePushToken.data === 'string'
-          ? devicePushToken.data
-          : JSON.stringify(devicePushToken.data);
+      const token = serializePushTokenData(
+        tokenData !== undefined ? tokenData : (await Notifications.getDevicePushTokenAsync()).data
+      );
+      const registrationKey = `${apiAccessToken}:${token}`;
 
-      if (!token || registeredFcmTokenRef.current === token) return;
+      if (!token || registeredFcmTokenRef.current === registrationKey) return;
 
       await notificationApi.registerFcmToken(
         {
@@ -2309,7 +2357,7 @@ export default function App() {
         },
         { accessToken: apiAccessToken }
       );
-      registeredFcmTokenRef.current = token;
+      registeredFcmTokenRef.current = registrationKey;
     } catch {
       // 토큰 등록 실패가 알림 설정 저장 자체를 막지는 않게 한다.
     } finally {
@@ -2758,17 +2806,16 @@ export default function App() {
   };
 
   const requestPushPermission = async () => {
-    if (Platform.OS === 'android') {
-      const androidVersion = Number(Platform.Version);
-      const notificationPermission = PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS;
-
-      if (androidVersion < 33 || !notificationPermission) {
-        setPermissions((items) => ({ ...items, alarm: true }));
-        setSettingsToggles((items) => ({ ...items, scanComplete: true, aiNudge: true }));
-        return true;
+    if (Platform.OS !== 'web') {
+      if (isAndroidExpoGo()) {
+        setPermissions((items) => ({ ...items, alarm: false }));
+        setSettingsToggles((items) => ({ ...items, scanComplete: false, aiNudge: false }));
+        showToast('Expo Go에서는 FCM 알림을 테스트할 수 없어요. APK로 확인해주세요');
+        return false;
       }
 
-      const acceptedAppPrompt = await new Promise<boolean>((resolve) => {
+      const acceptedAppPrompt = Platform.OS === 'android'
+        ? await new Promise<boolean>((resolve) => {
         Alert.alert(
           'AURA 푸시 알림',
           '스캔 완료와 정리 권장 알림을 받을 수 있도록 알림 권한을 허용해주세요.',
@@ -2785,7 +2832,8 @@ export default function App() {
           ],
           { cancelable: false }
         );
-      });
+        })
+        : true;
 
       if (!acceptedAppPrompt) {
         setPermissions((items) => ({ ...items, alarm: false }));
@@ -2794,15 +2842,37 @@ export default function App() {
         return false;
       }
 
-      const result = await PermissionsAndroid.request(notificationPermission);
-      const allowed = result === PermissionsAndroid.RESULTS.GRANTED;
+      try {
+        const Notifications = await loadNotificationsModule();
 
-      setPermissions((items) => ({ ...items, alarm: allowed }));
-      setSettingsToggles((items) => ({ ...items, scanComplete: allowed, aiNudge: allowed }));
-      if (!allowed) {
+        if (Platform.OS === 'android') {
+          await Notifications.setNotificationChannelAsync(AURA_NOTIFICATION_CHANNEL_ID, {
+            name: 'AURA',
+            importance: Notifications.AndroidImportance.DEFAULT,
+          });
+        }
+
+        let permission = await Notifications.getPermissionsAsync();
+        if (!isExpoNotificationPermissionGranted(permission, Notifications)) {
+          permission = await Notifications.requestPermissionsAsync();
+        }
+
+        const allowed = isExpoNotificationPermissionGranted(permission, Notifications);
+
+        setPermissions((items) => ({ ...items, alarm: allowed }));
+        setSettingsToggles((items) => ({ ...items, scanComplete: allowed, aiNudge: allowed }));
+        if (allowed) {
+          void registerFcmTokenWithServer();
+        } else {
+          showToast('푸시 알림 권한이 허용되지 않았어요');
+        }
+        return allowed;
+      } catch {
+        setPermissions((items) => ({ ...items, alarm: false }));
+        setSettingsToggles((items) => ({ ...items, scanComplete: false, aiNudge: false }));
         showToast('푸시 알림 권한이 허용되지 않았어요');
+        return false;
       }
-      return allowed;
     }
 
     const maybeNotification = (globalThis as unknown as {
@@ -3042,6 +3112,119 @@ export default function App() {
       setCandidateSummaryLoading(false);
     }
   };
+
+  const handleRemoteNotificationOpen = (rawData?: unknown) => {
+    const data = getNotificationDataRecord(rawData);
+    const type = getNotificationDataString(data, ['type', 'event_type', 'notification_type']).toUpperCase();
+    const target = getNotificationDataString(data, ['screen', 'target', 'route']).toLowerCase();
+    const scanJobId = getNotificationDataNumber(data, ['scan_job_id', 'scanJobId', 'scanId']);
+    const cleanupJobId = getNotificationDataNumber(data, ['cleanup_job_id', 'cleanupJobId', 'cleanupId']);
+
+    if (toastTimer.current) {
+      clearTimeout(toastTimer.current);
+    }
+    setPermissionToast('');
+    setToastTarget(null);
+
+    if (cleanupJobId || type.includes('CLEANUP') || target.includes('cleanup')) {
+      if (cleanupJobId) {
+        setApiCleanupJobId(cleanupJobId);
+        activeApiCleanupJobId.current = cleanupJobId;
+      }
+      setDeleteJobStatus('completed');
+      if (apiAccessToken) {
+        void refreshAuraApis(apiAccessToken);
+      }
+      replace('cleanupComplete');
+      return;
+    }
+
+    if (scanJobId) {
+      setApiScanJobId(scanJobId);
+      activeApiScanJobId.current = scanJobId;
+      setHomeScanNotice('completed');
+      setHasCompletedScan(true);
+
+      if (apiAccessToken) {
+        void fetchApiScanResultBundle(scanJobId, apiAccessToken)
+          .then(({ analysisSummary, candidates }) => {
+            if (analysisSummary || candidates.length) {
+              applyApiCandidateSummary(scanJobId, analysisSummary, candidates);
+            }
+          })
+          .catch(() => undefined);
+      }
+
+      openCompletedScanResult();
+      return;
+    }
+
+    if (type.includes('SCAN') || target.includes('scan') || target.includes('candidate') || getLatestCompletedScanJobId()) {
+      setHomeScanNotice('completed');
+      setHasCompletedScan(true);
+      openCompletedScanResult();
+      return;
+    }
+
+    replace('home');
+  };
+
+  useEffect(() => {
+    if (Platform.OS === 'web' || isAndroidExpoGo()) return undefined;
+
+    let mounted = true;
+    let pushTokenSubscription: { remove: () => void } | undefined;
+    let responseSubscription: { remove: () => void } | undefined;
+
+    const handleNotificationResponse = (response: {
+      notification: { request: { identifier?: string; content: { data?: unknown } } };
+    }) => {
+      const identifier = response.notification.request.identifier;
+      if (identifier && handledNotificationResponseIds.current.has(identifier)) return;
+      if (identifier) handledNotificationResponseIds.current.add(identifier);
+
+      handleRemoteNotificationOpen(response.notification.request.content.data);
+    };
+
+    void loadNotificationsModule().then((Notifications) => {
+      if (!mounted) return;
+
+      Notifications.setNotificationHandler({
+        handleNotification: async () => ({
+          shouldShowBanner: true,
+          shouldShowList: true,
+          shouldPlaySound: false,
+          shouldSetBadge: false,
+        }),
+      });
+
+      pushTokenSubscription = Notifications.addPushTokenListener((token) => {
+        void registerFcmTokenWithServer(token.data);
+      });
+
+      responseSubscription = Notifications.addNotificationResponseReceivedListener(handleNotificationResponse);
+
+      const lastResponse = Notifications.getLastNotificationResponse?.();
+      if (lastResponse) {
+        handleNotificationResponse(lastResponse);
+        Notifications.clearLastNotificationResponse?.();
+      }
+    });
+
+    return () => {
+      mounted = false;
+      pushTokenSubscription?.remove();
+      responseSubscription?.remove();
+    };
+  }, [
+    apiAccessToken,
+    permissions.alarm,
+    settingsToggles.scanComplete,
+    settingsToggles.aiNudge,
+    homeScanNotice,
+    apiScanJobId,
+    apiCleanupJobId,
+  ]);
 
   useEffect(() => {
     if (screen !== 'candidateSummary' && screen !== 'selectedReview') return;

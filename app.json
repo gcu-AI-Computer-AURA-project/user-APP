@@ -31,7 +31,15 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "@react-native-google-signin/google-signin"
+      "@react-native-google-signin/google-signin",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/android-icon-monochrome.png",
+          "color": "#0D3B66",
+          "defaultChannel": "aura-default"
+        }
+      ]
     ],
     "extra": {
       "eas": {
