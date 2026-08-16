@@ -137,6 +137,7 @@ type FloatingAction = { variant: Exclude<FloatingButtonVariant, 'scan'>; onPress
 type FontAwesome5Name = React.ComponentProps<typeof FontAwesome5>['name'];
 type PermissionScreen = 'gmailPermission' | 'drivePermission' | 'notificationPermission';
 type PermissionState = { gmail: boolean; drive: boolean; alarm: boolean };
+type GoogleServiceType = 'GMAIL' | 'DRIVE';
 type SettingsTogglesState = { scanComplete: boolean; aiNudge: boolean; marketing: boolean; autoScan: boolean };
 type MonthRange = { from: number; to: number };
 type ScanListItem = {
@@ -297,6 +298,12 @@ const isAndroidExpoGo = () => {
   const constants = Constants as unknown as { appOwnership?: string | null };
   return Platform.OS === 'android' && constants.appOwnership === 'expo';
 };
+
+const getGoogleServicePermissionKey = (serviceType: GoogleServiceType) =>
+  serviceType === 'GMAIL' ? 'gmail' : 'drive';
+
+const getGoogleServiceLabel = (serviceType: GoogleServiceType) =>
+  serviceType === 'GMAIL' ? 'Gmail' : 'Google Drive';
 
 const serializePushTokenData = (data: unknown) => {
   if (typeof data === 'string') return data.trim();
@@ -1481,6 +1488,7 @@ export default function App() {
   const [privacyChecked, setPrivacyChecked] = useState(false);
   const [privacyDetailChecked, setPrivacyDetailChecked] = useState(false);
   const [permissions, setPermissions] = useState<PermissionState>({ gmail: false, drive: false, alarm: false });
+  const [disabledGooglePermissions, setDisabledGooglePermissions] = useState<{ gmail: boolean; drive: boolean }>({ gmail: false, drive: false });
   const [apiAccessToken, setApiAccessToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<AuraUser | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
@@ -1976,6 +1984,7 @@ export default function App() {
     setPrivacyChecked(false);
     setPrivacyDetailChecked(false);
     setPermissions({ gmail: false, drive: false, alarm: false });
+    setDisabledGooglePermissions({ gmail: false, drive: false });
     setIncludeInput('');
     setExcludeInput('');
     setIncludeKeywords(['광고', '프로모션', '뉴스레터']);
@@ -2100,8 +2109,8 @@ export default function App() {
     if (user.permissions) {
       setPermissions((items) => ({
         ...items,
-        gmail: Boolean(user.permissions?.gmail ?? items.gmail),
-        drive: Boolean(user.permissions?.drive ?? items.drive),
+        gmail: Boolean(user.permissions?.gmail ?? items.gmail) && !disabledGooglePermissions.gmail,
+        drive: Boolean(user.permissions?.drive ?? items.drive) && !disabledGooglePermissions.drive,
         alarm: Boolean(user.permissions?.alarm ?? items.alarm),
       }));
     }
@@ -2219,8 +2228,8 @@ export default function App() {
       const next = getGooglePermissionFlags(response);
       setPermissions((items) => ({
         ...items,
-        gmail: next.hasGmail ? next.gmail : items.gmail,
-        drive: next.hasDrive ? next.drive : items.drive,
+        gmail: next.hasGmail ? next.gmail && !disabledGooglePermissions.gmail : items.gmail,
+        drive: next.hasDrive ? next.drive && !disabledGooglePermissions.drive : items.drive,
       }));
       if (showSuccessToast) {
         showToast('Google 권한 상태를 다시 확인했어요');
@@ -2232,7 +2241,7 @@ export default function App() {
     }
   };
 
-  const requestGoogleReconnect = async (serviceTypes: Array<'GMAIL' | 'DRIVE'>) => {
+  const requestGoogleReconnect = async (serviceTypes: GoogleServiceType[]) => {
     if (!apiAccessToken) {
       showToast('로그인 후 Google 권한을 다시 연결할 수 있어요');
       return false;
@@ -2255,6 +2264,11 @@ export default function App() {
       }
 
       pendingGoogleReconnectServices.current = serviceTypes;
+      setDisabledGooglePermissions((items) => ({
+        ...items,
+        gmail: serviceTypes.includes('GMAIL') ? false : items.gmail,
+        drive: serviceTypes.includes('DRIVE') ? false : items.drive,
+      }));
       await Linking.openURL(reconnectUrl);
       setTimeout(() => void refreshGooglePermissions(undefined, false), 1200);
       return true;
@@ -2266,46 +2280,37 @@ export default function App() {
     }
   };
 
-  const requestGoogleDisconnect = async () => {
-    if (!apiAccessToken) {
-      showToast('로그인 후 Google 연결을 해제할 수 있어요');
-      return false;
-    }
+  const disableGoogleServicePermission = (serviceType: GoogleServiceType) => {
+    const key = getGoogleServicePermissionKey(serviceType);
 
-    setGooglePermissionChecking(true);
-    try {
-      await googleApi.disconnect({ accessToken: apiAccessToken });
-      pendingGoogleReconnectServices.current = null;
-      handledGoogleOauthCodes.current.clear();
-      setPermissions((items) => ({ ...items, gmail: false, drive: false }));
-      setScanSources({ gmail: false, drive: false, folder: false });
+    setDisabledGooglePermissions((items) => ({ ...items, [key]: true }));
+    setPermissions((items) => ({ ...items, [key]: false }));
+
+    if (serviceType === 'GMAIL') {
+      setScanSources((items) => ({ ...items, gmail: false }));
+    } else {
+      setScanSources((items) => ({ ...items, drive: false, folder: false }));
       setSelectedDriveFolders([]);
       setSelectedDriveFiles([]);
       setApiDriveFolderOptions([]);
       setApiDriveFolderIdsByPath({});
       loadedDriveFolderPaths.current.clear();
-      clearStorageServerPageCache();
-      setApiStorageSummary(null);
-      setApiHomeSummary((summary) =>
-        summary
-          ? {
-              ...summary,
-              permissions: {
-                ...(summary.permissions ?? {}),
-                gmail_status: 'DISCONNECTED',
-                drive_status: 'DISCONNECTED',
-              },
-            }
-          : summary
-      );
-      showToast('Google 연결을 해제했어요');
-      return true;
-    } catch {
-      showToast('Google 연결 해제에 실패했어요');
-      return false;
-    } finally {
-      setGooglePermissionChecking(false);
     }
+
+    clearStorageServerPageCache();
+    setApiHomeSummary((summary) =>
+      summary
+        ? {
+            ...summary,
+            permissions: {
+              ...(summary.permissions ?? {}),
+              [serviceType === 'GMAIL' ? 'gmail_status' : 'drive_status']: 'DISCONNECTED',
+            },
+          }
+        : summary
+    );
+    showToast(`${getGoogleServiceLabel(serviceType)} 접근을 해제했어요`);
+    return Promise.resolve(true);
   };
 
   const handleGoogleOAuthRedirect = async (url: string) => {
@@ -2607,8 +2612,8 @@ export default function App() {
       if (homeSummary?.permissions) {
         setPermissions((items) => ({
           ...items,
-          gmail: homeSummary.permissions?.gmail_status === 'CONNECTED',
-          drive: homeSummary.permissions?.drive_status === 'CONNECTED',
+          gmail: homeSummary.permissions?.gmail_status === 'CONNECTED' && !disabledGooglePermissions.gmail,
+          drive: homeSummary.permissions?.drive_status === 'CONNECTED' && !disabledGooglePermissions.drive,
         }));
       }
 
@@ -2616,8 +2621,8 @@ export default function App() {
         const next = getGooglePermissionFlags(googlePermissionsResult.value);
         setPermissions((items) => ({
           ...items,
-          gmail: next.hasGmail ? next.gmail : items.gmail,
-          drive: next.hasDrive ? next.drive : items.drive,
+          gmail: next.hasGmail ? next.gmail && !disabledGooglePermissions.gmail : items.gmail,
+          drive: next.hasDrive ? next.drive && !disabledGooglePermissions.drive : items.drive,
         }));
       }
 
@@ -2704,6 +2709,11 @@ export default function App() {
   }, []);
 
   const syncUserPermissions = async (nextPermissions: Partial<AuraServicePermissions>) => {
+    setDisabledGooglePermissions((items) => ({
+      ...items,
+      gmail: nextPermissions.gmail === true ? false : nextPermissions.gmail === false ? true : items.gmail,
+      drive: nextPermissions.drive === true ? false : nextPermissions.drive === false ? true : items.drive,
+    }));
     setPermissions((items) => ({ ...items, ...nextPermissions }));
   };
 
@@ -4816,7 +4826,7 @@ export default function App() {
             onServicePermissionChange={syncUserPermissions}
             requestPushPermission={requestPushPermission}
             requestGoogleReconnect={requestGoogleReconnect}
-            requestGoogleDisconnect={requestGoogleDisconnect}
+            disableGoogleServicePermission={disableGoogleServicePermission}
           />
         );
 
@@ -7308,14 +7318,14 @@ function PermissionDetail({
   onServicePermissionChange,
   requestPushPermission,
   requestGoogleReconnect,
-  requestGoogleDisconnect,
+  disableGoogleServicePermission,
 }: {
   screen: PermissionScreen;
   back: () => void;
   onServicePermissionChange: (nextPermissions: Partial<AuraServicePermissions>) => Promise<void>;
   requestPushPermission: () => Promise<boolean>;
-  requestGoogleReconnect: (serviceTypes: Array<'GMAIL' | 'DRIVE'>) => Promise<boolean>;
-  requestGoogleDisconnect: () => Promise<boolean>;
+  requestGoogleReconnect: (serviceTypes: GoogleServiceType[]) => Promise<boolean>;
+  disableGoogleServicePermission: (serviceType: GoogleServiceType) => Promise<boolean>;
 }) {
   const info = {
     gmailPermission: {
@@ -7445,8 +7455,9 @@ function PermissionDetail({
         <OutlineButton
           title="지금은 허용하지 않기"
           onPress={() => {
-            void requestGoogleDisconnect().then((disconnected) => {
-              if (disconnected) {
+            const serviceType = info.key === 'gmail' ? 'GMAIL' : 'DRIVE';
+            void disableGoogleServicePermission(serviceType).then((disabled) => {
+              if (disabled) {
                 back();
               }
             });
