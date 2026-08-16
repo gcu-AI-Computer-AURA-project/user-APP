@@ -2266,6 +2266,48 @@ export default function App() {
     }
   };
 
+  const requestGoogleDisconnect = async () => {
+    if (!apiAccessToken) {
+      showToast('로그인 후 Google 연결을 해제할 수 있어요');
+      return false;
+    }
+
+    setGooglePermissionChecking(true);
+    try {
+      await googleApi.disconnect({ accessToken: apiAccessToken });
+      pendingGoogleReconnectServices.current = null;
+      handledGoogleOauthCodes.current.clear();
+      setPermissions((items) => ({ ...items, gmail: false, drive: false }));
+      setScanSources({ gmail: false, drive: false, folder: false });
+      setSelectedDriveFolders([]);
+      setSelectedDriveFiles([]);
+      setApiDriveFolderOptions([]);
+      setApiDriveFolderIdsByPath({});
+      loadedDriveFolderPaths.current.clear();
+      clearStorageServerPageCache();
+      setApiStorageSummary(null);
+      setApiHomeSummary((summary) =>
+        summary
+          ? {
+              ...summary,
+              permissions: {
+                ...(summary.permissions ?? {}),
+                gmail_status: 'DISCONNECTED',
+                drive_status: 'DISCONNECTED',
+              },
+            }
+          : summary
+      );
+      showToast('Google 연결을 해제했어요');
+      return true;
+    } catch {
+      showToast('Google 연결 해제에 실패했어요');
+      return false;
+    } finally {
+      setGooglePermissionChecking(false);
+    }
+  };
+
   const handleGoogleOAuthRedirect = async (url: string) => {
     if (!url.startsWith(GOOGLE_OAUTH_REDIRECT_URI)) return;
 
@@ -4774,6 +4816,7 @@ export default function App() {
             onServicePermissionChange={syncUserPermissions}
             requestPushPermission={requestPushPermission}
             requestGoogleReconnect={requestGoogleReconnect}
+            requestGoogleDisconnect={requestGoogleDisconnect}
           />
         );
 
@@ -7265,12 +7308,14 @@ function PermissionDetail({
   onServicePermissionChange,
   requestPushPermission,
   requestGoogleReconnect,
+  requestGoogleDisconnect,
 }: {
   screen: PermissionScreen;
   back: () => void;
   onServicePermissionChange: (nextPermissions: Partial<AuraServicePermissions>) => Promise<void>;
   requestPushPermission: () => Promise<boolean>;
   requestGoogleReconnect: (serviceTypes: Array<'GMAIL' | 'DRIVE'>) => Promise<boolean>;
+  requestGoogleDisconnect: () => Promise<boolean>;
 }) {
   const info = {
     gmailPermission: {
@@ -7396,7 +7441,18 @@ function PermissionDetail({
           });
         }}
       />
-      {info.key !== 'alarm' ? <OutlineButton title="지금은 허용하지 않기" onPress={back} /> : null}
+      {info.key !== 'alarm' ? (
+        <OutlineButton
+          title="지금은 허용하지 않기"
+          onPress={() => {
+            void requestGoogleDisconnect().then((disconnected) => {
+              if (disconnected) {
+                back();
+              }
+            });
+          }}
+        />
+      ) : null}
       <Text style={styles.helperText}>{info.guide}</Text>
     </ScreenShell>
   );
