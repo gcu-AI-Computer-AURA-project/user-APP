@@ -174,6 +174,9 @@ const storageServerPageCache: Record<string, StorageServerPageState> = {};
 const clearStorageServerPageCache = () => {
   Object.keys(storageServerPageCache).forEach((key) => delete storageServerPageCache[key]);
 };
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const isTerminalCleanupJobStatus = (status?: ApiCleanupJob['job_status']) =>
+  status === 'COMPLETED' || status === 'PARTIAL_FAILED' || status === 'FAILED' || status === 'CANCELED';
 type StorageDriveMoveTargets = Record<string, string>;
 type DriveFolderOption = { id?: string; name: string; meta?: string; parentId?: string };
 type ScanSummary = {
@@ -3021,6 +3024,17 @@ export default function App() {
         selection_version: Number(item.selectionVersion ?? 0),
       }));
   };
+  const getFreshSelectedApiCandidatePayloads = async (scanJobId: number, candidateIds: number[]) => {
+    if (!apiAccessToken) return [];
+    const requestedCandidateIds = new Set(candidateIds);
+    const response = await scanApi.getSelectedCandidates(scanJobId, { accessToken: apiAccessToken });
+    return (response.items ?? [])
+      .filter((candidate) => candidate.candidate_id !== undefined && requestedCandidateIds.has(candidate.candidate_id))
+      .map((candidate) => ({
+        candidate_id: Number(candidate.candidate_id),
+        selection_version: Number(candidate.selection_version ?? 0),
+      }));
+  };
 
   const openSelectedReviewFromSummary = () => {
     const scanJobId = getLatestCompletedScanJobId();
@@ -3429,6 +3443,7 @@ export default function App() {
   const startDeleteJob = () => {
     if (apiAccessToken && activeApiScanJobId.current) {
       const candidates = getSelectedApiCandidatePayloads();
+      const scanJobId = activeApiScanJobId.current;
 
       if (!candidates.length) {
         showToast('서버에 전달할 선택 후보가 없어요');
@@ -3442,41 +3457,43 @@ export default function App() {
       activeApiCleanupJobId.current = null;
       go('deleteProcessing');
 
-      void scanApi
-        .updateCandidateSelections(
-          activeApiScanJobId.current,
+      void (async () => {
+        await scanApi.updateCandidateSelections(
+          scanJobId,
           {
             candidate_ids: candidates.map((candidate) => candidate.candidate_id),
             selection_status: 'SELECTED',
             exclude_protected: true,
           },
           { accessToken: apiAccessToken }
-        )
-        .then(() => {
-          if (!activeApiScanJobId.current) throw new Error('No active scan job');
-          return cleanupApi.create(
-            {
-              scan_job_id: activeApiScanJobId.current,
-              action_type: 'MOVE_TO_TRASH',
-              candidates,
-              approval_confirmed: true,
-            },
-            { accessToken: apiAccessToken }
-          );
-        })
-        .then((job) => {
-          if (!job?.cleanup_job_id) throw new Error('No cleanup job created');
-          activeApiCleanupJobId.current = job.cleanup_job_id;
-          setApiCleanupJobId(job.cleanup_job_id);
-        })
-        .catch(() => {
-          setDeleteJobStatus('failed');
-          setDeleteStatusText('정리 요청에 실패했어요');
-          if (screenRef.current === 'deleteProcessing') {
-            replace('selectedReview');
-          }
-          showToast('백엔드 휴지통 이동 요청 실패: 권한 또는 서버 상태를 확인해주세요', undefined, 3200);
-        });
+        );
+        const freshCandidates = await getFreshSelectedApiCandidatePayloads(
+          scanJobId,
+          candidates.map((candidate) => candidate.candidate_id)
+        );
+        if (freshCandidates.length !== candidates.length) {
+          throw new Error('Selected cleanup candidates were not synchronized');
+        }
+        const job = await cleanupApi.create(
+          {
+            scan_job_id: scanJobId,
+            action_type: 'MOVE_TO_TRASH',
+            candidates: freshCandidates,
+            approval_confirmed: true,
+          },
+          { accessToken: apiAccessToken }
+        );
+        if (!job?.cleanup_job_id) throw new Error('No cleanup job created');
+        activeApiCleanupJobId.current = job.cleanup_job_id;
+        setApiCleanupJobId(job.cleanup_job_id);
+      })().catch((error) => {
+        setDeleteJobStatus('failed');
+        setDeleteStatusText('정리 요청에 실패했어요');
+        if (screenRef.current === 'deleteProcessing') {
+          replace('selectedReview');
+        }
+        showToast(getErrorMessage(error, '백엔드 휴지통 이동 요청 실패: 권한 또는 서버 상태를 확인해주세요'), undefined, 3200);
+      });
       return;
     }
     setDeleteProgress(0);
@@ -7829,11 +7846,53 @@ function StorageScreen({
           ...(item.snapshotSizeBytes !== undefined ? { snapshot_size_bytes: item.snapshotSizeBytes } : {}),
         };
       });
+  const waitForStorageCleanupJob = async (job?: ApiCleanupJob) => {
+    if (!apiAccessToken || !job?.cleanup_job_id || isTerminalCleanupJobStatus(job.job_status)) return job;
+
+    let latestJob = job;
+    for (let attempt = 0; attempt < 15; attempt += 1) {
+      await wait(1200);
+      latestJob = await cleanupApi.getDetail(job.cleanup_job_id, { accessToken: apiAccessToken });
+      if (isTerminalCleanupJobStatus(latestJob.job_status)) return latestJob;
+    }
+    return latestJob;
+  };
   const refreshStorageServerAfterAction = () => {
     clearStorageServerPageCache();
     serverPageCacheRef.current = storageServerPageCache;
+    setServerPage(null);
     onServerStorageChanged?.();
     loadStorageServerPage(safeStoragePage);
+  };
+  const clearCompletedStorageActionKeys = (selectedKeys: string[], action: 'move' | 'permanent' | 'restore') => {
+    if (action === 'move') {
+      setStorageTrashMovedKeys((items) => items.filter((key) => !selectedKeys.includes(key)));
+      return;
+    }
+    if (action === 'permanent') {
+      setStorageDeletedKeys((items) => items.filter((key) => !selectedKeys.includes(key)));
+      return;
+    }
+    setStorageRestoredKeys((items) => items.filter((key) => !selectedKeys.includes(key)));
+  };
+  const refreshStorageServerAfterCleanupJob = (job: ApiCleanupJob | undefined, selectedKeys: string[], action: 'move' | 'permanent' | 'restore') => {
+    void waitForStorageCleanupJob(job)
+      .then((finishedJob) => {
+        refreshStorageServerAfterAction();
+        if (!finishedJob?.cleanup_job_id || isTerminalCleanupJobStatus(finishedJob.job_status)) {
+          clearCompletedStorageActionKeys(selectedKeys, action);
+        }
+        if (finishedJob?.job_status === 'PARTIAL_FAILED') {
+          showToast('일부 항목 처리에 실패했어요. 목록을 다시 확인해주세요', undefined, 3200);
+        }
+        if (finishedJob?.job_status === 'FAILED' || finishedJob?.job_status === 'CANCELED') {
+          showToast('항목 처리 작업이 완료되지 못했어요', undefined, 3200);
+        }
+      })
+      .catch(() => {
+        refreshStorageServerAfterAction();
+        showToast('작업 완료 상태 확인에 실패했어요. 목록을 다시 불러왔습니다', undefined, 3000);
+      });
   };
 
   const confirmStorageDelete = async () => {
@@ -7852,27 +7911,30 @@ function StorageScreen({
     }
 
     try {
+      let cleanupJob: ApiCleanupJob | undefined;
       if (apiAccessToken) {
         if (permanent) {
-          await storageApi.permanentDelete(apiItems, { accessToken: apiAccessToken });
+          cleanupJob = await storageApi.permanentDelete(apiItems, { accessToken: apiAccessToken });
         } else {
-          await storageApi.moveToTrash(apiItems, { accessToken: apiAccessToken });
+          cleanupJob = await storageApi.moveToTrash(apiItems, { accessToken: apiAccessToken });
         }
-        refreshStorageServerAfterAction();
       }
 
       closeDeleteSheet();
 
       if (!permanent) {
         setStorageTrashMovedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
-        showToast('선택 항목을 휴지통으로 이동했어요');
+        showToast(apiAccessToken ? '휴지통 이동 요청을 처리 중이에요' : '선택 항목을 휴지통으로 이동했어요');
       } else {
         setStorageDeletedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
-        showToast('영구 삭제가 완료됐어요');
+        showToast(apiAccessToken ? '영구 삭제 요청을 처리 중이에요' : '영구 삭제가 완료됐어요');
       }
 
       clearSelectionPrefix(prefix);
       setSelectionMode(false);
+      if (apiAccessToken) {
+        refreshStorageServerAfterCleanupJob(cleanupJob, selectedKeys, permanent ? 'permanent' : 'move');
+      }
     } catch (error) {
       showToast(getErrorMessage(error, permanent ? '영구 삭제 요청에 실패했어요' : '휴지통 이동 요청에 실패했어요'), undefined, 3000);
     }
@@ -7895,9 +7957,9 @@ function StorageScreen({
     }
 
     try {
+      let cleanupJob: ApiCleanupJob | undefined;
       if (apiAccessToken) {
-        await storageApi.restore(apiItems, { accessToken: apiAccessToken });
-        refreshStorageServerAfterAction();
+        cleanupJob = await storageApi.restore(apiItems, { accessToken: apiAccessToken });
       }
 
       closeRestoreSheet();
@@ -7907,7 +7969,10 @@ function StorageScreen({
       }
       clearSelectionPrefix(prefix);
       setSelectionMode(false);
-      showToast('선택 항목을 정리함으로 복구했어요');
+      showToast(apiAccessToken ? '복구 요청을 처리 중이에요' : '선택 항목을 정리함으로 복구했어요');
+      if (apiAccessToken) {
+        refreshStorageServerAfterCleanupJob(cleanupJob, selectedKeys, 'restore');
+      }
     } catch (error) {
       showToast(getErrorMessage(error, '복구 요청에 실패했어요'), undefined, 3000);
     }
