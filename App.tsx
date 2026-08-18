@@ -5060,13 +5060,20 @@ export default function App() {
       : latestScanHistoryForFallback
         ? `${apiScanSourceLabel(latestScanHistoryForFallback.scan_source)} · 정리 후보 ${latestScanHistoryForFallback.candidate_count ?? 0}개`
       : `Gmail ${selectedMailCleanupCount}개 · Drive ${selectedDriveCleanupCount}개`;
-    const historyGraphValues = scanCleanupHistoryItems.length
+    const historyGraphBaseValues = scanCleanupHistoryItems.length
       ? [...scanCleanupHistoryItems].reverse().map((item) => item.reclaimed_bytes ?? 0)
       : scanHistoryCleanupItems.length
         ? [...scanHistoryCleanupItems].reverse().map((item) => item.reclaimed_bytes ?? 0)
         : undefined;
+    const cumulativeHistoryGraphValues = historyGraphBaseValues?.reduce<number[]>((values, bytes) => {
+      const previous = values[values.length - 1] ?? 0;
+      values.push(previous + Math.max(0, bytes));
+      return values;
+    }, []);
+    const historyGraphStartIndex = Math.max(0, (cumulativeHistoryGraphValues?.length ?? 0) - 10);
+    const historyGraphValues = cumulativeHistoryGraphValues?.slice(historyGraphStartIndex);
     const historyGraphLabels = historyGraphValues
-      ? historyGraphValues.map((_, index) => `${index + 1}회`)
+      ? historyGraphValues.map((_, index) => `${historyGraphStartIndex + index + 1}회`)
       : undefined;
     const hasHistoryData = Boolean(scanCleanupHistoryItems.length || scanHistoryCleanupItems.length);
     const homeScanStatusTitle =
@@ -5233,7 +5240,7 @@ export default function App() {
               <View style={styles.onboardingDescriptionIcon}>
                 <FontAwesome5 name="chart-line" size={28} color={navy} />
               </View>
-              <Text style={[styles.centerBody, styles.onboardingDescriptionText]}>정리한 클라우드 용량을 스캔별 그래프로 확인해요.</Text>
+              <Text style={[styles.centerBody, styles.onboardingDescriptionText]}>정리한 클라우드 용량을 누적 그래프로 확인해요.</Text>
             </View>
             <View style={styles.auraFeelReveal}>
               <View style={styles.auraFeelTextRow}>
@@ -6287,7 +6294,7 @@ export default function App() {
                     <Text style={styles.monthCarbonText}>최근 스캔 +{latestCleanupSizeLabel}</Text>
                   </View>
                 </View>
-                <SectionTitle>스캔별 확보 용량 현황</SectionTitle>
+                <SectionTitle>누적 확보 용량 현황</SectionTitle>
                 <CarbonStatsGraph sizeLabel={latestCleanupSizeLabel} values={historyGraphValues} labels={historyGraphLabels} />
                 <View style={styles.rowBetween}>
                   <SectionTitle>최근 정리 기록</SectionTitle>
@@ -9761,7 +9768,7 @@ function CarbonSaveAnimation({ onDone, skip }: { onDone: () => void; skip?: bool
           <Text style={styles.historyMiniPillText}>최근 스캔 +620MB</Text>
         </View>
       </View>
-      <SectionTitle>스캔별 확보 용량 현황</SectionTitle>
+      <SectionTitle>누적 확보 용량 현황</SectionTitle>
       <CarbonStatsGraph
         sizeLabel="1.8GB"
         values={[240, 520, 980, 1840].map((value) => value * 1024 * 1024)}
