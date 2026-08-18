@@ -131,7 +131,7 @@ const loadNotificationsModule = () => {
   return notificationsModulePromise;
 };
 
-const AURA_NOTIFICATION_CHANNEL_ID = 'aura-default';
+const AURA_NOTIFICATION_CHANNEL_ID = 'aura-high-priority';
 const AURA_AUTH_SESSION_KEY = 'aura.auth.session.v1';
 
 type StoredAuthSession = {
@@ -349,6 +349,19 @@ const getAuraAppVersion = () => {
 const isAndroidExpoGo = () => {
   const constants = Constants as unknown as { appOwnership?: string | null };
   return Platform.OS === 'android' && constants.appOwnership === 'expo';
+};
+
+const configureAuraNotificationChannel = async (Notifications: NotificationsModule) => {
+  if (Platform.OS !== 'android') return;
+
+  await Notifications.setNotificationChannelAsync(AURA_NOTIFICATION_CHANNEL_ID, {
+    name: 'AURA 알림',
+    importance: Notifications.AndroidImportance.MAX,
+    sound: 'default',
+    enableVibrate: true,
+    vibrationPattern: [0, 250, 250, 250],
+    lightColor: '#74C987',
+  });
 };
 
 const getGoogleServicePermissionKey = (serviceType: GoogleServiceType) =>
@@ -1646,6 +1659,7 @@ export default function App() {
   const devAccessTokenApplied = useRef(false);
   const authRestoreAttempted = useRef(false);
   const latestRefreshTokenRef = useRef<string | null>(null);
+  const disabledGooglePermissionsRef = useRef<{ gmail: boolean; drive: boolean }>({ gmail: false, drive: false });
   const screenRef = useRef<Screen>('initial');
   const scanSourceLabelRef = useRef('Gmail + Drive');
   const scanResultRef = useRef<ScanSummary>(emptyScanSummary);
@@ -1752,6 +1766,13 @@ export default function App() {
     return getResolvedBackFallback(target);
   };
 
+  const clearHomeScanCompletionNotice = () => {
+    setHomeScanNotice('none');
+    setHasCompletedScan(false);
+    setApiScanJobId(null);
+    activeApiScanJobId.current = null;
+  };
+
   const getHistoryBackIndex = () => {
     const currentTab = getResolvedTabForScreen(screen);
 
@@ -1779,6 +1800,10 @@ export default function App() {
   };
 
   const navigateTab = (tab: MainTab) => {
+    if (tab === 'home' && deleteJobStatus === 'completed') {
+      clearHomeScanCompletionNotice();
+    }
+
     if (tab === 'history') {
       setAnalysisHistoryReturnTarget('home');
     }
@@ -2053,7 +2078,7 @@ export default function App() {
     setPrivacyChecked(false);
     setPrivacyDetailChecked(false);
     setPermissions({ gmail: false, drive: false, alarm: false });
-    setDisabledGooglePermissions({ gmail: false, drive: false });
+    updateDisabledGooglePermissions({ gmail: false, drive: false });
     setApiAccessToken(null);
     setCurrentUser(null);
     latestRefreshTokenRef.current = null;
@@ -2180,10 +2205,11 @@ export default function App() {
     }
 
     if (user.permissions) {
+      const disabled = disabledGooglePermissionsRef.current;
       setPermissions((items) => ({
         ...items,
-        gmail: Boolean(user.permissions?.gmail ?? items.gmail) && !disabledGooglePermissions.gmail,
-        drive: Boolean(user.permissions?.drive ?? items.drive) && !disabledGooglePermissions.drive,
+        gmail: Boolean(user.permissions?.gmail ?? items.gmail) && !disabled.gmail,
+        drive: Boolean(user.permissions?.drive ?? items.drive) && !disabled.drive,
         alarm: Boolean(user.permissions?.alarm ?? items.alarm),
       }));
     }
@@ -2252,6 +2278,17 @@ export default function App() {
 
   const getSelectedDriveFolderId = () =>
     selectedDriveFolders.map((folderPath) => apiDriveFolderIdsByPath[folderPath]).find(Boolean) ?? selectedDriveFolders[0];
+
+  const updateDisabledGooglePermissions = (
+    updater:
+      | { gmail: boolean; drive: boolean }
+      | ((items: { gmail: boolean; drive: boolean }) => { gmail: boolean; drive: boolean })
+  ) => {
+    const next = typeof updater === 'function' ? updater(disabledGooglePermissionsRef.current) : updater;
+    disabledGooglePermissionsRef.current = next;
+    setDisabledGooglePermissions(next);
+    return next;
+  };
 
   const mergeDriveFolderOptions = (incoming: DriveFolderOption[]) => {
     if (!incoming.length) return;
@@ -2324,8 +2361,10 @@ export default function App() {
       if (showSuccessToast) {
         showToast('Google 권한 상태를 다시 확인했어요');
       }
+      return next;
     } catch {
       showToast('Google 권한 상태 확인에 실패했어요');
+      return null;
     } finally {
       setGooglePermissionChecking(false);
     }
@@ -2353,6 +2392,11 @@ export default function App() {
               platform: getAuraPlatform(),
             });
             const nextAccessToken = session.accessToken ?? apiAccessToken;
+            updateDisabledGooglePermissions((items) => ({
+              ...items,
+              gmail: serviceTypes.includes('GMAIL') ? false : items.gmail,
+              drive: serviceTypes.includes('DRIVE') ? false : items.drive,
+            }));
             rememberAuthSession(nextAccessToken, session.refreshToken, session.user);
 
             if (session.accessToken) {
@@ -2367,11 +2411,6 @@ export default function App() {
             }
 
             pendingGoogleReconnectServices.current = null;
-            setDisabledGooglePermissions((items) => ({
-              ...items,
-              gmail: serviceTypes.includes('GMAIL') ? false : items.gmail,
-              drive: serviceTypes.includes('DRIVE') ? false : items.drive,
-            }));
             showToast('Google 권한 연결을 확인했어요');
             return true;
           }
@@ -2395,7 +2434,7 @@ export default function App() {
       }
 
       pendingGoogleReconnectServices.current = serviceTypes;
-      setDisabledGooglePermissions((items) => ({
+      updateDisabledGooglePermissions((items) => ({
         ...items,
         gmail: serviceTypes.includes('GMAIL') ? false : items.gmail,
         drive: serviceTypes.includes('DRIVE') ? false : items.drive,
@@ -2420,21 +2459,19 @@ export default function App() {
 
     setGooglePermissionChecking(true);
     try {
-      const response = await googleApi.updatePermission(
+      await googleApi.updatePermission(
         serviceType,
         { is_connected: true },
         { accessToken: apiAccessToken }
       );
-      const next = getGooglePermissionFlags(response);
-      const isConnected = serviceType === 'GMAIL' ? next.gmail : next.drive;
-
-      setDisabledGooglePermissions((items) => ({ ...items, [key]: false }));
-      setPermissions((items) => ({ ...items, [key]: isConnected }));
+      updateDisabledGooglePermissions((items) => ({ ...items, [key]: false }));
       clearStorageServerPageCache();
-      await refreshGooglePermissions(apiAccessToken, false);
+      const rechecked = await refreshGooglePermissions(apiAccessToken, false);
+      const isConnected = serviceType === 'GMAIL' ? Boolean(rechecked?.gmail) : Boolean(rechecked?.drive);
       void refreshAuraApis(apiAccessToken);
 
       if (!isConnected) {
+        setPermissions((items) => ({ ...items, [key]: false }));
         showToast(`${getGoogleServiceLabel(serviceType)} 권한 재연결이 필요해요`, undefined, 2600);
         return false;
       }
@@ -2465,7 +2502,7 @@ export default function App() {
         { accessToken: apiAccessToken }
       );
 
-      setDisabledGooglePermissions((items) => ({ ...items, [key]: true }));
+      updateDisabledGooglePermissions((items) => ({ ...items, [key]: true }));
       setPermissions((items) => ({ ...items, [key]: false }));
 
       if (serviceType === 'GMAIL') {
@@ -2519,6 +2556,14 @@ export default function App() {
         platform: getAuraPlatform(),
       });
       const nextAccessToken = session.accessToken ?? apiAccessToken;
+      const reconnectServices = pendingGoogleReconnectServices.current;
+      if (reconnectServices?.length) {
+        updateDisabledGooglePermissions((items) => ({
+          ...items,
+          gmail: reconnectServices.includes('GMAIL') ? false : items.gmail,
+          drive: reconnectServices.includes('DRIVE') ? false : items.drive,
+        }));
+      }
       rememberAuthSession(nextAccessToken, session.refreshToken, session.user);
 
       if (session.accessToken) {
@@ -2569,13 +2614,7 @@ export default function App() {
       if (!Device.isDevice) return;
 
       const Notifications = await loadNotificationsModule();
-
-      if (Platform.OS === 'android') {
-        await Notifications.setNotificationChannelAsync('aura-default', {
-          name: 'AURA',
-          importance: Notifications.AndroidImportance.DEFAULT,
-        });
-      }
+      await configureAuraNotificationChannel(Notifications);
 
       let permission = await Notifications.getPermissionsAsync();
       if (!isExpoNotificationPermissionGranted(permission, Notifications)) {
@@ -2802,19 +2841,21 @@ export default function App() {
       setApiCleanupHistoryItems(cleanupHistoriesResult.status === 'fulfilled' ? cleanupHistoriesResult.value.content ?? [] : []);
 
       if (homeSummary?.permissions) {
+        const disabled = disabledGooglePermissionsRef.current;
         setPermissions((items) => ({
           ...items,
-          gmail: homeSummary.permissions?.gmail_status === 'CONNECTED' && !disabledGooglePermissions.gmail,
-          drive: homeSummary.permissions?.drive_status === 'CONNECTED' && !disabledGooglePermissions.drive,
+          gmail: homeSummary.permissions?.gmail_status === 'CONNECTED' && !disabled.gmail,
+          drive: homeSummary.permissions?.drive_status === 'CONNECTED' && !disabled.drive,
         }));
       }
 
       if (googlePermissionsResult.status === 'fulfilled') {
         const next = getGooglePermissionFlags(googlePermissionsResult.value);
+        const disabled = disabledGooglePermissionsRef.current;
         setPermissions((items) => ({
           ...items,
-          gmail: next.hasGmail ? next.gmail && !disabledGooglePermissions.gmail : items.gmail,
-          drive: next.hasDrive ? next.drive && !disabledGooglePermissions.drive : items.drive,
+          gmail: next.hasGmail ? next.gmail && !disabled.gmail : items.gmail,
+          drive: next.hasDrive ? next.drive && !disabled.drive : items.drive,
         }));
       }
 
@@ -2972,7 +3013,7 @@ export default function App() {
   }, []);
 
   const syncUserPermissions = async (nextPermissions: Partial<AuraServicePermissions>) => {
-    setDisabledGooglePermissions((items) => ({
+    updateDisabledGooglePermissions((items) => ({
       ...items,
       gmail: nextPermissions.gmail === true ? false : nextPermissions.gmail === false ? true : items.gmail,
       drive: nextPermissions.drive === true ? false : nextPermissions.drive === false ? true : items.drive,
@@ -3165,13 +3206,7 @@ export default function App() {
 
       try {
         const Notifications = await loadNotificationsModule();
-
-        if (Platform.OS === 'android') {
-          await Notifications.setNotificationChannelAsync(AURA_NOTIFICATION_CHANNEL_ID, {
-            name: 'AURA',
-            importance: Notifications.AndroidImportance.DEFAULT,
-          });
-        }
+        await configureAuraNotificationChannel(Notifications);
 
         let permission = await Notifications.getPermissionsAsync();
         if (!isExpoNotificationPermissionGranted(permission, Notifications)) {
@@ -3453,6 +3488,7 @@ export default function App() {
         activeApiCleanupJobId.current = cleanupJobId;
       }
       setDeleteJobStatus('completed');
+      clearHomeScanCompletionNotice();
       if (apiAccessToken) {
         void refreshAuraApis(apiAccessToken);
       }
@@ -3514,10 +3550,11 @@ export default function App() {
         handleNotification: async () => ({
           shouldShowBanner: true,
           shouldShowList: true,
-          shouldPlaySound: false,
+          shouldPlaySound: true,
           shouldSetBadge: false,
         }),
       });
+      void configureAuraNotificationChannel(Notifications);
 
       pushTokenSubscription = Notifications.addPushTokenListener((token) => {
         void registerFcmTokenWithServer(token.data);
@@ -4043,7 +4080,7 @@ export default function App() {
     }
     setPermissionToast('');
     setToastTarget(null);
-    setHomeScanNotice('none');
+    clearHomeScanCompletionNotice();
     replace('cleanupComplete');
   };
 
@@ -4528,6 +4565,9 @@ export default function App() {
         setApiCleanupJobId(null);
         activeApiCleanupJobId.current = null;
         setHomeScanNotice('none');
+        setHasCompletedScan(false);
+        setApiScanJobId(null);
+        activeApiScanJobId.current = null;
         if (job.job_status === 'PARTIAL_FAILED') {
           setDeleteStatusText(failedItemCount ? `일부 항목 ${failedItemCount}개 이동 실패` : '일부 항목 이동 실패');
           showToast('일부 항목 이동에 실패했어요. 결과를 확인해주세요', undefined, 3600);
@@ -4649,6 +4689,9 @@ export default function App() {
             }
             activeApiCleanupJobId.current = null;
             setHomeScanNotice('none');
+            setHasCompletedScan(false);
+            setApiScanJobId(null);
+            activeApiScanJobId.current = null;
             if (screenRef.current === 'deleteProcessing') {
               replace('cleanupComplete');
             } else {
@@ -5193,6 +5236,14 @@ export default function App() {
         );
 
       case 'home':
+        if (apiBootstrapLoading) {
+          return (
+            <ScreenShell title="홈" titleIcon="home" hideBack tightBottom disableScroll hideFloatingScan>
+              <ServerDataLoadingState />
+            </ScreenShell>
+          );
+        }
+
         return (
           <ScreenShell title="홈" titleIcon="home" hideBack tightBottom hideFloatingScan={homeScanNotice === 'completed'}>
             <Card tint style={styles.capacityCard}>
@@ -5931,7 +5982,10 @@ export default function App() {
               }} />
               <OutlineButton title="휴지통으로 이동" half onPress={() => replace('storageTrash')} />
             </View>
-            <PrimaryButton title="홈 화면 돌아가기" onPress={() => replace('home')} />
+            <PrimaryButton title="홈 화면 돌아가기" onPress={() => {
+              clearHomeScanCompletionNotice();
+              replace('home');
+            }} />
           </ScreenShell>
         );
 
@@ -6080,9 +6134,9 @@ export default function App() {
                 hitSlop={8}
               >
                 {googlePermissionChecking ? (
-                  <ActivityIndicator size="small" color="#74C987" />
+                  <ActivityIndicator size="small" color={mutedText} />
                 ) : (
-                  <Feather name="refresh-cw" size={18} color="#74C987" />
+                  <FontAwesome5 name="redo" size={17} color={mutedText} />
                 )}
               </Pressable>
             </View>
@@ -6644,6 +6698,7 @@ function ScreenShell({
   hideFloatingScan,
   floatingAction,
   tintBackground,
+  largeTitle,
 }: {
   title?: string;
   subtitle?: string;
@@ -6659,6 +6714,7 @@ function ScreenShell({
   hideFloatingScan?: boolean;
   floatingAction?: FloatingAction | FloatingAction[];
   tintBackground?: boolean;
+  largeTitle?: boolean;
 }) {
   const navigation = useContext(NavigationContext);
   const handleBack = hideBack ? undefined : onBack ?? navigation?.back;
@@ -6676,7 +6732,14 @@ function ScreenShell({
       {title ? (
         <View style={[styles.header, hideBack && styles.headerNoBack]}>
           <DeviceStatusBar compact />
-          <View style={[styles.headerTitleRow, hideBack && styles.headerTitleRowNoBack, !subtitle && styles.headerTitleRowSingle]}>
+          <View
+            style={[
+              styles.headerTitleRow,
+              hideBack && styles.headerTitleRowNoBack,
+              !subtitle && styles.headerTitleRowSingle,
+              largeTitle && styles.headerTitleRowLarge,
+            ]}
+          >
             {handleBack ? (
               <Pressable style={styles.backButton} onPress={handleBack}>
                 <Text style={styles.backGlyph}>{closeIcon ? '×' : '‹'}</Text>
@@ -6691,7 +6754,14 @@ function ScreenShell({
                     <NavIcon type={titleIcon} active />
                   </View>
                 ) : null}
-                <Text style={styles.title} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.65}>{title}</Text>
+                <Text
+                  style={[styles.title, largeTitle && styles.titleLarge]}
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                  minimumFontScale={0.65}
+                >
+                  {title}
+                </Text>
               </View>
               {subtitle ? <Text style={styles.subtitle}>{subtitle}</Text> : null}
             </View>
@@ -8829,15 +8899,14 @@ function StorageScreen({
     <View style={styles.modalScreenRoot}>
     <ScreenShell
       title={screenTitle}
+      subtitle={isTrash ? '휴지통에 있는 항목들은 30일 이후 자동으로 삭제됩니다.' : undefined}
+      largeTitle={isTrash}
       titleIcon={isTrash ? 'trash' : 'storage'}
       hideBack
       tightBottom
       hideFloatingScan={selectionMode || Boolean(deleteSheetMode) || restoreSheetVisible}
       floatingAction={storageFloatingActions}
     >
-      {isTrash ? (
-        <Text style={styles.storageTrashNoticeText}>휴지통에 있는 항목들은 30일 이후 자동으로 삭제됩니다.</Text>
-      ) : null}
       <View style={styles.storagePrimaryTabs}>
         <Pressable style={[styles.storagePrimaryTab, !isDrive && styles.storagePrimaryTabActive]} onPress={goMail}>
           <Text style={[styles.storagePrimaryTabText, !isDrive && styles.storagePrimaryTabTextActive]}>메일</Text>
@@ -9601,6 +9670,15 @@ function EmptyState({ title, desc }: { title: string; desc: string }) {
   );
 }
 
+function ServerDataLoadingState() {
+  return (
+    <View style={styles.serverDataLoadingState}>
+      <ActivityIndicator size="large" color="#74C987" />
+      <Text style={styles.serverDataLoadingText}>서버 데이터를 불러오는 중이에요</Text>
+    </View>
+  );
+}
+
 function GhostScanAnimation({ onDone, skip }: { onDone: () => void; skip?: boolean }) {
   const doneCalled = useRef(false);
 
@@ -10177,10 +10255,13 @@ const styles = StyleSheet.create({
     backgroundColor: text,
   },
   headerTitleRow: {
-    height: 38,
+    minHeight: 38,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 18,
+  },
+  headerTitleRowLarge: {
+    minHeight: 48,
   },
   headerTitleRowNoBack: {
     marginLeft: 8,
@@ -10230,6 +10311,11 @@ const styles = StyleSheet.create({
     lineHeight: 27,
     fontWeight: '800',
   },
+  titleLarge: {
+    fontSize: 24,
+    lineHeight: 31,
+    fontWeight: '900',
+  },
   subtitle: {
     marginTop: 5,
     color: mutedText,
@@ -10271,6 +10357,20 @@ const styles = StyleSheet.create({
     color: mutedText,
     fontSize: 15,
     fontWeight: '900',
+  },
+  serverDataLoadingState: {
+    flex: 1,
+    minHeight: 520,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 18,
+  },
+  serverDataLoadingText: {
+    color: mutedText,
+    fontSize: 18,
+    lineHeight: 24,
+    fontWeight: '900',
+    textAlign: 'center',
   },
   heroSpacer: {
     height: 78,
@@ -10648,12 +10748,8 @@ const styles = StyleSheet.create({
   sectionRefreshButton: {
     width: 36,
     height: 36,
-    borderRadius: 18,
     alignItems: 'center',
     justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: line,
-    backgroundColor: '#FFFFFF',
   },
   sectionRefreshButtonDisabled: {
     opacity: 0.55,
@@ -13101,15 +13197,6 @@ const styles = StyleSheet.create({
   },
   storagePrimaryTabTextActive: {
     color: '#FFFFFF',
-  },
-  storageTrashNoticeText: {
-    color: mutedText,
-    fontSize: 12,
-    lineHeight: 17,
-    fontWeight: '800',
-    marginTop: -4,
-    marginBottom: 8,
-    paddingHorizontal: 2,
   },
   storageSummaryBar: {
     minHeight: 50,

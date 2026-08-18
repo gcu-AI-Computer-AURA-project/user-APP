@@ -38,7 +38,7 @@
         {
           "icon": "./assets/android-icon-monochrome.png",
           "color": "#0D3B66",
-          "defaultChannel": "aura-default"
+          "defaultChannel": "aura-high-priority"
         }
       ],
       "expo-secure-store"
