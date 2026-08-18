@@ -172,6 +172,23 @@ const loadNotificationsModule = () => {
   return notificationsModulePromise;
 };
 
+const googleSigninScopes = [
+  'openid',
+  'email',
+  'profile',
+  'https://mail.google.com/',
+  'https://www.googleapis.com/auth/drive',
+];
+
+const configureGoogleSignin = (GoogleSignin: GoogleSignInModule['GoogleSignin']) => {
+  GoogleSignin.configure({
+    webClientId: GOOGLE_WEB_CLIENT_ID,
+    offlineAccess: true,
+    forceCodeForRefreshToken: true,
+    scopes: googleSigninScopes,
+  });
+};
+
 const AURA_NOTIFICATION_CHANNEL_ID = 'aura-high-priority';
 const AURA_AUTH_SESSION_KEY = 'aura.auth.session.v1';
 
@@ -841,22 +858,9 @@ export default function App() {
   });
 
   useEffect(() => {
-    if (DEV_AURA_ACCESS_TOKEN) return;
-
     void loadGoogleSignInModule()
       .then(({ GoogleSignin }) => {
-        GoogleSignin.configure({
-          webClientId: GOOGLE_WEB_CLIENT_ID,
-          offlineAccess: true,
-          forceCodeForRefreshToken: true,
-          scopes: [
-            'openid',
-            'email',
-            'profile',
-            'https://mail.google.com/',
-            'https://www.googleapis.com/auth/drive',
-          ],
-        });
+        configureGoogleSignin(GoogleSignin);
       })
       .catch(() => {
         // Expo Go에는 Google Sign-In 네이티브 모듈이 포함되지 않는다.
@@ -1530,6 +1534,7 @@ export default function App() {
         try {
           const googleSignInModule = await loadGoogleSignInModule();
           const { GoogleSignin } = googleSignInModule;
+          configureGoogleSignin(GoogleSignin);
           await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
           const googleSession = await GoogleSignin.signIn();
           const serverAuthCode = extractServerAuthCode(googleSession);
@@ -2253,6 +2258,7 @@ export default function App() {
       isGoogleSignInError = googleSignInModule.isErrorWithCode;
       googleStatusCodes = googleSignInModule.statusCodes;
 
+      configureGoogleSignin(GoogleSignin);
       await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
       const googleSession = await GoogleSignin.signIn();
       const serverAuthCode = extractServerAuthCode(googleSession);
@@ -2298,7 +2304,7 @@ export default function App() {
       go('permissions');
     } catch (error) {
       if (isGoogleSignInError?.(error) && googleStatusCodes) {
-        const googleError = error as { code: string };
+        const googleError = error as { code?: string; message?: string };
 
         if (googleError.code === googleStatusCodes.SIGN_IN_CANCELLED) {
           return;
@@ -2310,7 +2316,9 @@ export default function App() {
         }
       }
 
-      showToast('Google login failed.');
+      const googleError = error as { code?: string; message?: string };
+      const errorDetail = [googleError.code, googleError.message].filter(Boolean).join(' / ');
+      showToast(errorDetail ? `Google 로그인 실패: ${errorDetail}` : 'Google 로그인에 실패했어요.');
     } finally {
       setAuthLoading(false);
     }
