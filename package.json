@@ -33,7 +33,8 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "build:apk": "npx --yes eas-cli@latest build -p android --profile preview"
+    "build:apk": "npx --yes eas-cli@latest build -p android --profile preview",
+    "build:android:internal": "npx --yes eas-cli@latest build -p android --profile preview"
   },
   "private": true
 }
