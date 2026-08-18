@@ -2052,10 +2052,10 @@ export default function App() {
     return '선택된 서비스 없음';
   };
 
-  const getSimpleScanSourceLabel = () => {
-    if (scanSources.gmail && (scanSources.drive || scanSources.folder)) return 'Gmail + Drive';
-    if (scanSources.gmail) return 'Gmail';
-    if (scanSources.drive || scanSources.folder) return 'Drive';
+  const getSimpleScanSourceLabel = (sourceState = scanSources) => {
+    if (sourceState.gmail && (sourceState.drive || sourceState.folder)) return 'Gmail + Drive';
+    if (sourceState.gmail) return 'Gmail';
+    if (sourceState.drive || sourceState.folder) return 'Drive';
     return '선택된 서비스 없음';
   };
 
@@ -2476,6 +2476,11 @@ export default function App() {
         return false;
       }
 
+      setScanSources((items) =>
+        serviceType === 'GMAIL'
+          ? { ...items, gmail: true }
+          : { ...items, drive: true }
+      );
       showToast(`${getGoogleServiceLabel(serviceType)} 접근을 허용했어요`);
       return true;
     } catch (error) {
@@ -3766,11 +3771,11 @@ export default function App() {
     }
   };
 
-  const getApiScanSource = () => {
-    if (scanSources.gmail && (scanSources.drive || scanSources.folder)) return 'MAIL_AND_DRIVE' as const;
-    if (scanSources.gmail) return 'MAIL' as const;
-    if (scanSources.folder) return 'DRIVE_FOLDER' as const;
-    if (scanSources.drive) return 'DRIVE_ALL' as const;
+  const getApiScanSource = (sourceState = scanSources) => {
+    if (sourceState.gmail && (sourceState.drive || sourceState.folder)) return 'MAIL_AND_DRIVE' as const;
+    if (sourceState.gmail) return 'MAIL' as const;
+    if (sourceState.folder) return 'DRIVE_FOLDER' as const;
+    if (sourceState.drive) return 'DRIVE_ALL' as const;
     return 'MAIL_AND_DRIVE' as const;
   };
 
@@ -3822,8 +3827,8 @@ export default function App() {
     return leftList.length === rightList.length && leftList.every((item, index) => item === rightList[index]);
   };
 
-  const getApiScanSettingsPayload = (): ApiScanSettingRequest => ({
-    scan_source: getApiScanSource(),
+  const getApiScanSettingsPayload = (sourceState = scanSources): ApiScanSettingRequest => ({
+    scan_source: getApiScanSource(sourceState),
     drive_folder_id: getSelectedDriveFolderId() || undefined,
     include_subfolders: includeSubFolders,
     last_opened_before_months: lastOpenedBeforeMonths,
@@ -3881,11 +3886,19 @@ export default function App() {
   };
 
   const startScan = () => {
-    if (!scanSources.gmail && !scanSources.drive && !scanSources.folder) {
+    const activeScanSources = !scanSources.gmail && !scanSources.drive && !scanSources.folder && (permissions.gmail || permissions.drive)
+      ? { gmail: permissions.gmail, drive: permissions.drive, folder: false }
+      : scanSources;
+
+    if (activeScanSources !== scanSources) {
+      setScanSources(activeScanSources);
+    }
+
+    if (!activeScanSources.gmail && !activeScanSources.drive && !activeScanSources.folder) {
       showPermissionToast();
       return;
     }
-    if (scanSources.folder && !selectedDriveFolders.length && !selectedDriveFiles.length) {
+    if (activeScanSources.folder && !selectedDriveFolders.length && !selectedDriveFiles.length) {
       showToast('분석할 Drive 폴더를 선택해주세요');
       go('scanFlowFolder');
       return;
@@ -3894,7 +3907,7 @@ export default function App() {
       showToast('로그인 후 서버 스캔을 실행할 수 있어요', undefined, 3200);
       return;
     }
-    scanSourceLabelRef.current = getSimpleScanSourceLabel();
+    scanSourceLabelRef.current = getSimpleScanSourceLabel(activeScanSources);
     scanResultRef.current = emptyScanSummary;
     setApiStorageSummary(emptyScanSummary);
     setScanProgress(0);
@@ -3904,7 +3917,7 @@ export default function App() {
     setHomeScanNotice('running');
     go('scanProgress');
 
-    const scanSettingsPayload = getApiScanSettingsPayload();
+    const scanSettingsPayload = getApiScanSettingsPayload(activeScanSources);
     const shouldUseSavedScanSettings =
       hasCompletedScan &&
       settingsToggles.autoScan &&
@@ -6698,7 +6711,6 @@ function ScreenShell({
   hideFloatingScan,
   floatingAction,
   tintBackground,
-  largeTitle,
 }: {
   title?: string;
   subtitle?: string;
@@ -6714,7 +6726,6 @@ function ScreenShell({
   hideFloatingScan?: boolean;
   floatingAction?: FloatingAction | FloatingAction[];
   tintBackground?: boolean;
-  largeTitle?: boolean;
 }) {
   const navigation = useContext(NavigationContext);
   const handleBack = hideBack ? undefined : onBack ?? navigation?.back;
@@ -6737,7 +6748,6 @@ function ScreenShell({
               styles.headerTitleRow,
               hideBack && styles.headerTitleRowNoBack,
               !subtitle && styles.headerTitleRowSingle,
-              largeTitle && styles.headerTitleRowLarge,
             ]}
           >
             {handleBack ? (
@@ -6755,7 +6765,7 @@ function ScreenShell({
                   </View>
                 ) : null}
                 <Text
-                  style={[styles.title, largeTitle && styles.titleLarge]}
+                  style={styles.title}
                   numberOfLines={1}
                   adjustsFontSizeToFit
                   minimumFontScale={0.65}
@@ -8899,8 +8909,6 @@ function StorageScreen({
     <View style={styles.modalScreenRoot}>
     <ScreenShell
       title={screenTitle}
-      subtitle={isTrash ? '휴지통에 있는 항목들은 30일 이후 자동으로 삭제됩니다.' : undefined}
-      largeTitle={isTrash}
       titleIcon={isTrash ? 'trash' : 'storage'}
       hideBack
       tightBottom
@@ -8915,12 +8923,17 @@ function StorageScreen({
           <Text style={[styles.storagePrimaryTabText, isDrive && styles.storagePrimaryTabTextActive]}>Drive</Text>
         </Pressable>
       </View>
+      {isTrash ? (
+        <View style={styles.storageTrashNoticeBlock}>
+          <Text style={styles.storageTrashNoticeText}>휴지통에 있는 항목들은 30일 이후 자동으로 삭제됩니다.</Text>
+        </View>
+      ) : null}
       {!googlePermissionChecking && !serviceConnected ? (
         <PermissionRevokedCard onPress={onReconnect} />
       ) : (
         <View style={styles.storageLooseList}>
           {isDrive ? (
-            <View style={styles.storagePathCard}>
+            <View style={[styles.storagePathCard, isTrash && styles.storagePathCardAfterTrashNotice]}>
               <View style={styles.storageBreadcrumbRow}>
                 {storageDriveBreadcrumbs.map((crumb, index) => (
                   <React.Fragment key={crumb.path}>
@@ -8947,7 +8960,7 @@ function StorageScreen({
 
             </View>
           ) : (
-            <View style={[styles.storagePathCard, styles.storagePagerCard]}>
+            <View style={[styles.storagePathCard, isTrash && styles.storagePathCardAfterTrashNotice, styles.storagePagerCard]}>
               <Text style={styles.storagePagerText}>
                 메일 {pageRangeTotal}개 중 {mailPageRangeStart}~{mailPageRangeEnd}개
               </Text>
@@ -10260,9 +10273,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 18,
   },
-  headerTitleRowLarge: {
-    minHeight: 48,
-  },
   headerTitleRowNoBack: {
     marginLeft: 8,
   },
@@ -10310,11 +10320,6 @@ const styles = StyleSheet.create({
     fontSize: 21,
     lineHeight: 27,
     fontWeight: '800',
-  },
-  titleLarge: {
-    fontSize: 24,
-    lineHeight: 31,
-    fontWeight: '900',
   },
   subtitle: {
     marginTop: 5,
@@ -13198,6 +13203,18 @@ const styles = StyleSheet.create({
   storagePrimaryTabTextActive: {
     color: '#FFFFFF',
   },
+  storageTrashNoticeBlock: {
+    borderTopWidth: 1,
+    borderColor: line,
+    paddingTop: 12,
+    paddingHorizontal: 2,
+  },
+  storageTrashNoticeText: {
+    color: mutedText,
+    fontSize: 12.5,
+    lineHeight: 18,
+    fontWeight: '900',
+  },
   storageSummaryBar: {
     minHeight: 50,
     borderWidth: 0,
@@ -13235,6 +13252,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 10,
+  },
+  storagePathCardAfterTrashNotice: {
+    borderTopWidth: 0,
+    paddingTop: 0,
   },
   storageLooseList: {
     gap: 10,
