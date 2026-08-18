@@ -5126,7 +5126,6 @@ export default function App() {
                 <Text style={styles.progressHomeButtonText}>홈으로 이동</Text>
               </Pressable>
             </View>
-            <Text style={styles.remainingCapacityText}>현재 남은 용량 {remainingAfterCleanup}</Text>
           </ScreenShell>
         );
 
