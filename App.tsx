@@ -819,6 +819,7 @@ export default function App() {
   const loadedDriveFolderPaths = useRef<Set<string>>(new Set());
   const pendingGoogleReconnectServices = useRef<Array<'GMAIL' | 'DRIVE'> | null>(null);
   const handledGoogleOauthCodes = useRef<Set<string>>(new Set());
+  const storageSheetBackHandlerRef = useRef<(() => boolean) | null>(null);
   const [withdrawSheetVisible, setWithdrawSheetVisible] = useState(false);
   const [filterSheetVisible, setFilterSheetVisible] = useState(false);
   const [carbonHelpVisible, setCarbonHelpVisible] = useState(false);
@@ -3366,6 +3367,10 @@ export default function App() {
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (storageSheetBackHandlerRef.current?.()) {
+        return true;
+      }
+
       if (withdrawSheetVisible) {
         closeWithdrawSheet();
         return true;
@@ -5246,6 +5251,7 @@ export default function App() {
             }}
             onLoadDriveFolders={loadApiDriveFolders}
             onServerStorageChanged={apiAccessToken ? () => void refreshAuraApis(apiAccessToken) : undefined}
+            storageSheetBackHandlerRef={storageSheetBackHandlerRef}
           />
         );
 

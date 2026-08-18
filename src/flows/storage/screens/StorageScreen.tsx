@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, Text, View } from 'react-native';
-import { cleanupApi, storageApi, type ApiCleanupJob } from '../../../api/features';
+import { ActivityIndicator, Animated, Pressable, Text, View } from 'react-native';
+import { cleanupApi, storageApi, type ApiCleanupJob, type ApiStorageActionItem } from '../../../api/features';
 import { OutlineButton, PrimaryButton } from '../../../components/AppButtons';
 import { CheckBox } from '../../../components/CheckBox';
 import { ScreenShell } from '../../../components/layout';
@@ -50,6 +50,7 @@ export function StorageScreen({
   openStorageDetail,
   onLoadDriveFolders,
   onServerStorageChanged,
+  storageSheetBackHandlerRef,
 }: {
   mode: 'storageMail' | 'storageDrive' | 'storageTrash' | 'storageDriveTrash';
   scan: ScanRecord | null;
@@ -82,6 +83,7 @@ export function StorageScreen({
   openStorageDetail: (item: StorageDetailItem) => void;
   onLoadDriveFolders: (parentPath?: string) => Promise<void>;
   onServerStorageChanged?: () => void;
+  storageSheetBackHandlerRef?: React.MutableRefObject<(() => boolean) | null>;
 }) {
   const isDrive = mode === 'storageDrive' || mode === 'storageDriveTrash';
   const isTrash = mode === 'storageTrash' || mode === 'storageDriveTrash';
@@ -91,6 +93,8 @@ export function StorageScreen({
   const [restoreSheetVisible, setRestoreSheetVisible] = useState(false);
   const [deleteConfirmChecked, setDeleteConfirmChecked] = useState(false);
   const [restoreConfirmChecked, setRestoreConfirmChecked] = useState(false);
+  const deleteSheetMotion = useRef(new Animated.Value(1)).current;
+  const restoreSheetMotion = useRef(new Animated.Value(1)).current;
   const [storageDriveTrashFolder, setStorageDriveTrashFolder] = useState(driveRootPath);
   const [storagePage, setStoragePage] = useState(0);
   const prefix = mode === 'storageDriveTrash' ? 'storageDriveTrash' : isTrash ? 'storageTrash' : isDrive ? 'storageDrive' : 'storageMail';
@@ -478,6 +482,12 @@ export function StorageScreen({
     }
     setDeleteConfirmChecked(false);
     setDeleteSheetMode(modeToOpen);
+    deleteSheetMotion.setValue(1);
+    Animated.timing(deleteSheetMotion, {
+      toValue: 0,
+      duration: 240,
+      useNativeDriver: true,
+    }).start();
   };
   const openRestoreSheet = () => {
     if (!selectedItems.length) {
@@ -486,42 +496,97 @@ export function StorageScreen({
     }
     setRestoreConfirmChecked(false);
     setRestoreSheetVisible(true);
+    restoreSheetMotion.setValue(1);
+    Animated.timing(restoreSheetMotion, {
+      toValue: 0,
+      duration: 240,
+      useNativeDriver: true,
+    }).start();
   };
   const closeDeleteSheet = () => {
-    setDeleteSheetMode(null);
-    setDeleteConfirmChecked(false);
+    Animated.timing(deleteSheetMotion, {
+      toValue: 1,
+      duration: 210,
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (finished) {
+        setDeleteSheetMode(null);
+        setDeleteConfirmChecked(false);
+      }
+    });
   };
   const closeRestoreSheet = () => {
-    setRestoreSheetVisible(false);
-    setRestoreConfirmChecked(false);
+    Animated.timing(restoreSheetMotion, {
+      toValue: 1,
+      duration: 210,
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (finished) {
+        setRestoreSheetVisible(false);
+        setRestoreConfirmChecked(false);
+      }
+    });
   };
+  useEffect(() => {
+    if (!storageSheetBackHandlerRef) return undefined;
+
+    if (!deleteSheetMode && !restoreSheetVisible) {
+      storageSheetBackHandlerRef.current = null;
+      return undefined;
+    }
+
+    storageSheetBackHandlerRef.current = () => {
+      if (restoreSheetVisible) {
+        closeRestoreSheet();
+        return true;
+      }
+      if (deleteSheetMode) {
+        closeDeleteSheet();
+        return true;
+      }
+      return false;
+    };
+
+    return () => {
+      storageSheetBackHandlerRef.current = null;
+    };
+  }, [deleteSheetMode, restoreSheetVisible, storageSheetBackHandlerRef]);
   const getMovedTrashOriginalKey = (id: string) => {
     if (id.startsWith('trash-mail-moved-')) return `storageMail:${id.replace('trash-mail-moved-', '')}`;
     if (id.startsWith('trash-drive-moved-')) return `storageDrive:${id.replace('trash-drive-moved-', '')}`;
     return null;
   };
-  const getApiStorageActionItems = () =>
+  const normalizeActionExternalItemId = (value?: string) => {
+    const trimmed = value?.trim();
+    if (!trimmed || trimmed === 'undefined' || trimmed === 'null') return '';
+    return trimmed;
+  };
+  const getFallbackActionExternalItemId = (id: string) =>
+    normalizeActionExternalItemId(
+      id
+        .replace(/^api-storage-(?:mail|drive)-/, '')
+        .replace(/^trash-(?:mail|drive)-api-/, '')
+        .replace(/^trash-drive-file-/, '')
+        .replace(/^trash-mail-moved-/, '')
+        .replace(/^trash-drive-moved-/, '')
+        .replace(/^storage-/, '')
+    );
+  const getApiStorageActionItems = (): ApiStorageActionItem[] =>
     selectedItems
-      .filter((item) => !apiAccessToken || item.itemId !== undefined || Boolean(item.externalItemId))
       .map((item) => {
-        const externalItemId =
-          item.externalItemId ??
-          item.id
-          .replace(/^api-storage-(?:mail|drive)-/, '')
-          .replace(/^trash-(?:mail|drive)-api-/, '')
-          .replace(/^trash-drive-file-/, '')
-          .replace(/^trash-mail-moved-/, '')
-          .replace(/^trash-drive-moved-/, '')
-          .replace(/^storage-/, '');
+        const externalItemId = normalizeActionExternalItemId(item.externalItemId) || getFallbackActionExternalItemId(item.id);
+        const snapshotTitle = item.snapshotTitle || item.title;
+        if (!externalItemId) return null;
 
         return {
           item_source: item.itemSource ?? (isDrive ? ('DRIVE' as const) : ('GMAIL' as const)),
           external_item_id: externalItemId,
           ...(item.itemId !== undefined ? { item_id: item.itemId } : {}),
-          ...(item.snapshotTitle ? { snapshot_title: item.snapshotTitle } : {}),
+          ...(snapshotTitle ? { snapshot_title: snapshotTitle } : {}),
           ...(item.snapshotSizeBytes !== undefined ? { snapshot_size_bytes: item.snapshotSizeBytes } : {}),
         };
-      });
+      })
+      .filter((item): item is ApiStorageActionItem => Boolean(item));
   const waitForStorageCleanupJob = async (job?: ApiCleanupJob) => {
     if (!apiAccessToken || !job?.cleanup_job_id || isTerminalCleanupJobStatus(job.job_status)) return job;
 
@@ -532,6 +597,17 @@ export function StorageScreen({
       if (isTerminalCleanupJobStatus(latestJob.job_status)) return latestJob;
     }
     return latestJob;
+  };
+  const getStorageCleanupFailureMessage = async (job: ApiCleanupJob | undefined, fallback: string) => {
+    if (!apiAccessToken || !job?.cleanup_job_id) return job?.error_message || fallback;
+
+    try {
+      const itemList = await cleanupApi.getItems(job.cleanup_job_id, { accessToken: apiAccessToken });
+      const failedItem = itemList.items?.find((item) => item.process_status === 'FAILED');
+      return failedItem?.failure_reason || job.error_message || fallback;
+    } catch {
+      return job.error_message || fallback;
+    }
   };
   const refreshStorageServerAfterAction = () => {
     clearStorageServerPageCache();
@@ -560,10 +636,12 @@ export function StorageScreen({
           clearCompletedStorageActionKeys(selectedKeys, action);
         }
         if (finishedJob?.job_status === 'PARTIAL_FAILED') {
-          showToast('일부 항목 처리에 실패했어요. 목록을 다시 확인해주세요', undefined, 3200);
+          const message = await getStorageCleanupFailureMessage(finishedJob, '일부 항목 처리에 실패했어요. 목록을 다시 확인해주세요');
+          showToast(message, undefined, 3600);
         }
         if (finishedJob?.job_status === 'FAILED' || finishedJob?.job_status === 'CANCELED') {
-          showToast('항목 처리 작업이 완료되지 못했어요', undefined, 3200);
+          const message = await getStorageCleanupFailureMessage(finishedJob, '항목 처리 작업이 완료되지 못했어요');
+          showToast(message, undefined, 3600);
         }
       })
       .catch(async () => {
@@ -841,6 +919,7 @@ export function StorageScreen({
         permanent={deleteSheetMode === 'permanent'}
         count={selectedItems.length}
         checked={deleteConfirmChecked}
+        motion={deleteSheetMotion}
         onToggle={() => setDeleteConfirmChecked((value) => !value)}
         onCancel={closeDeleteSheet}
         onConfirm={confirmStorageDelete}
@@ -850,6 +929,7 @@ export function StorageScreen({
       <StorageRestoreSheet
         count={selectedItems.length}
         checked={restoreConfirmChecked}
+        motion={restoreSheetMotion}
         onToggle={() => setRestoreConfirmChecked((value) => !value)}
         onCancel={closeRestoreSheet}
         onConfirm={confirmStorageRestore}

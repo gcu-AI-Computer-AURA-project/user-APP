@@ -25,6 +25,7 @@ export function StorageDeleteSheet({
   permanent,
   count,
   checked,
+  motion,
   onToggle,
   onCancel,
   onConfirm,
@@ -32,25 +33,15 @@ export function StorageDeleteSheet({
   permanent: boolean;
   count: number;
   checked: boolean;
+  motion: Animated.Value;
   onToggle: () => void;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
-  const sheetMotion = useRef(new Animated.Value(1)).current;
-
-  useEffect(() => {
-    sheetMotion.setValue(1);
-    Animated.timing(sheetMotion, {
-      toValue: 0,
-      duration: 240,
-      useNativeDriver: false,
-    }).start();
-  }, [sheetMotion]);
-
   return (
     <View style={styles.storageDeleteOverlay}>
       <Pressable style={StyleSheet.absoluteFill} onPress={onCancel} />
-      <BottomSheetPanel motion={sheetMotion} outputRange={[0, 360]} style={styles.storageDeleteSheet} onClose={onCancel}>
+      <BottomSheetPanel motion={motion} outputRange={[0, 360]} style={styles.storageDeleteSheet} onClose={onCancel}>
         <Text style={styles.storageDeleteTitle}>{permanent ? '영구 삭제할까요?' : '휴지통으로 이동할까요?'}</Text>
         <View style={permanent ? styles.storageDeleteWarningBox : styles.storageDeleteInfoBox}>
           <Text style={styles.storageDeleteWarningTitle}>{permanent ? '이 작업은 되돌릴 수 없습니다' : '휴지통으로 이동합니다'}</Text>
@@ -77,31 +68,22 @@ export function StorageDeleteSheet({
 export function StorageRestoreSheet({
   count,
   checked,
+  motion,
   onToggle,
   onCancel,
   onConfirm,
 }: {
   count: number;
   checked: boolean;
+  motion: Animated.Value;
   onToggle: () => void;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
-  const sheetMotion = useRef(new Animated.Value(1)).current;
-
-  useEffect(() => {
-    sheetMotion.setValue(1);
-    Animated.timing(sheetMotion, {
-      toValue: 0,
-      duration: 240,
-      useNativeDriver: false,
-    }).start();
-  }, [sheetMotion]);
-
   return (
     <View style={styles.storageDeleteOverlay}>
       <Pressable style={StyleSheet.absoluteFill} onPress={onCancel} />
-      <BottomSheetPanel motion={sheetMotion} outputRange={[0, 360]} style={styles.storageDeleteSheet} onClose={onCancel}>
+      <BottomSheetPanel motion={motion} outputRange={[0, 360]} style={styles.storageDeleteSheet} onClose={onCancel}>
         <Text style={styles.storageDeleteTitle}>정리함으로 복구할까요?</Text>
         <View style={styles.storageRestoreInfoBox}>
           <Text style={styles.storageDeleteWarningTitle}>정리함으로 다시 이동합니다</Text>
