@@ -1,3 +1,9 @@
+import type { ApiStorageItem } from '../../api/features';
+
+export type PermissionState = { gmail: boolean; drive: boolean; alarm: boolean };
+
+export type DriveFolderOption = { id?: string; name: string; meta?: string; parentId?: string };
+
 export type StorageApiFields = {
   itemId?: number;
   externalItemId?: string;
@@ -29,3 +35,13 @@ export type StorageDetailItem = StorageApiFields & {
   meta: string;
   source: 'mail' | 'drive';
 };
+
+export type StorageServerPageState = {
+  items: ApiStorageItem[];
+  page: number;
+  size: number;
+  totalElements: number;
+  totalPages: number;
+};
+
+export type StorageDriveMoveTargets = Record<string, string>;

@@ -1,3 +1,15 @@
+export { isTerminalCleanupJobStatus } from './cleanupStatus';
+export {
+  applyResultFilterSort,
+  carbonLabelToGram,
+  formatFolderMeta,
+  formatMonthDuration,
+  getDriveFolderMatch,
+  isOlderThanYears,
+  parseDateValue,
+  sizeLabelToMB,
+  sumScanItemSize,
+} from './scanUtils';
 export { FilterSortSheet, KeywordBottomSheet, PeriodMonthSheet, YearRangeSheet } from './components/ScanSheets';
 export {
   CarbonBasisLine,

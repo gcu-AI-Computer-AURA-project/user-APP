@@ -25,13 +25,13 @@ export function getStorageSizeLabel(textValue: string) {
 }
 
 export function splitStorageMeta(textValue: string) {
-  return textValue.split(/\s*(?:·|쨌|›|>)\s*/).map((part) => part.trim()).filter(Boolean);
+  return textValue.split(/\s*(?:·|쨌)\s*/).map((part) => part.trim()).filter(Boolean);
 }
 
 export function getTrashDriveFolderPath(meta: string) {
   const parts = splitStorageMeta(meta);
-  const path = parts.find((part) => part.includes('Drive'));
+  const path = parts.find((part) => part.includes('Drive ›') || part === '내 Drive');
   if (path) return path;
-  const folderOnly = meta.replace(/\s*(?:·|쨌|›|>)\s*(?:폴더|파일)?\s*$/, '').trim();
+  const folderOnly = meta.replace(/\s*(?:·|쨌)\s*(?:폴더|\?대뜑)$/, '').trim();
   return folderOnly || '내 Drive';
 }

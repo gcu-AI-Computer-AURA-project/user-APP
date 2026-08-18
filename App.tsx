@@ -13,7 +13,6 @@ import {
   StyleSheet,
   StatusBar,
   Text,
-  TextInput,
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
@@ -49,8 +48,11 @@ import {
   CarbonBasisLine,
   CleanupMetricCard,
   DeleteStatusRow,
+  applyResultFilterSort,
   FilterSortSheet,
+  formatMonthDuration,
   FolderRow,
+  isTerminalCleanupJobStatus,
   KeywordBottomSheet,
   KeywordEditor,
   MonthConditionRow,
@@ -62,11 +64,29 @@ import {
   ListScreen,
   ScanItemDetailScreen,
   ScanSourceCard,
+  sizeLabelToMB,
+  sumScanItemSize,
+  type ScanListItem,
+  type ScanRecord,
+  type ScanSummary,
   YearRangeSheet,
 } from './src/flows/scan';
 import { ServiceLinkRow, ToggleRow, UserAvatar } from './src/flows/settings';
 import * as StorageFlow from './src/flows/storage';
+import {
+  NavigationContext,
+  defaultTabScreens,
+  getBackFallbackForScreen,
+  getMainTabForScreen,
+  loginFlowScreens,
+  mainTabOrder,
+  scanFlowScreens,
+  type MainTab,
+  type Screen,
+} from './src/navigation/AppNavigationContext';
 import { styles } from './src/styles/appStyles';
+import { bytesToMB, formatApiDate, formatApiDateOnly, formatBytes, formatDataSize, formatScanDateOnly } from './src/utils/formatters';
+import { getErrorMessage, wait } from './src/utils/runtime';
 
 const {
   announcementApi,
@@ -104,65 +124,37 @@ type ApiStorageItem = Features.ApiStorageItem;
 const {
   FileOutlineIcon,
   FolderOutlineIcon,
-  PermissionRevokedCard,
-  StorageDeleteSheet,
   StorageDetailScreen,
-  StorageDriveCard,
-  StorageMailCard,
-  StorageRestoreSheet,
+  StorageScreen,
   TrashOutlineIcon,
+  apiDriveFolderToStorageItemFromApi,
+  apiStorageItemToDrive,
+  apiStorageItemToDriveFromApi,
+  apiStorageItemToMail,
+  apiStorageItemToTrash,
+  buildGoogleDriveWebViewLink,
+  dedupeStorageDriveItems,
+  dedupeStorageMailItems,
+  driveRootPath,
+  extractStorageSizeMB,
+  getAllStorageDriveItems,
+  getAllStorageDriveTrashItems,
+  getDirectDriveFolders,
+  getDriveAncestorFolders,
+  getDriveFileSelectionGroup,
+  getDriveFolderName,
+  getDriveFolderSelected,
+  getDriveFolderSelectionGroup,
+  getDriveParentPath,
+  getStorageDriveItemsForFolder,
+  getStorageDriveTrashItemsForFolder,
+  getVisibleDriveFolders,
+  hasDriveFolderChildren,
+  normalizeServerDrivePath,
+  storageServerPageCache,
+  clearStorageServerPageCache,
+  splitDrivePath,
 } = StorageFlow;
-
-type Screen =
-  | 'initial'
-  | 'privacy'
-  | 'permissions'
-  | 'gmailPermission'
-  | 'drivePermission'
-  | 'notificationPermission'
-  | 'connected'
-  | 'onboardingIntro'
-  | 'onboardingGhost'
-  | 'onboardingCarbon'
-  | 'home'
-  | 'recentDetail'
-  | 'keywordFile'
-  | 'includeKeyword'
-  | 'excludeKeyword'
-  | 'scanFlowSource'
-  | 'scanFlowFolder'
-  | 'scanFlowPeriod'
-  | 'scanSource'
-  | 'driveFolder'
-  | 'period'
-  | 'scanProgress'
-  | 'candidateSummary'
-  | 'mailList'
-  | 'driveList'
-  | 'largeList'
-  | 'protectedList'
-  | 'mailDetail'
-  | 'fileDetail'
-  | 'selectedReview'
-  | 'deleteConfirm'
-  | 'deleteProcessing'
-  | 'cleanupComplete'
-  | 'carbonBasis'
-  | 'storageMail'
-  | 'storageDrive'
-  | 'storageDetail'
-  | 'storageTrash'
-  | 'storageDriveTrash'
-  | 'settings'
-  | 'account'
-  | 'defaultScan'
-  | 'privacyData'
-  | 'analysisHistory'
-  | 'analysisHistoryAll'
-  | 'serviceWithdraw'
-  | 'notice';
-
-type MainTab = 'home' | 'storage' | 'trash' | 'history' | 'settings';
 
 type GoogleSignInModule = typeof import('@react-native-google-signin/google-signin');
 type NotificationsModule = typeof import('expo-notifications');
@@ -236,84 +228,16 @@ const clearStoredAuthSession = async () => {
 type FloatingButtonVariant = 'scan' | 'delete' | 'trash' | 'restore';
 type FloatingAction = { variant: Exclude<FloatingButtonVariant, 'scan'>; onPress: () => void; small?: boolean };
 type PermissionScreen = 'gmailPermission' | 'drivePermission' | 'notificationPermission';
-type PermissionState = { gmail: boolean; drive: boolean; alarm: boolean };
+type PermissionState = StorageFlow.PermissionState;
 type GoogleServiceType = 'GMAIL' | 'DRIVE';
 type SettingsTogglesState = { scanComplete: boolean; aiNudge: boolean; marketing: boolean; autoScan: boolean };
 type MonthRange = { from: number; to: number };
-type ScanListItem = {
-  id: string;
-  candidateId?: number;
-  selectionVersion?: number;
-  selectionStatus?: ApiCandidateSelectionStatus;
-  title: string;
-  desc?: string;
-  sizeMB: number;
-  dateLabel: string;
-  sortText: string;
-  source: 'mail' | 'drive';
-  previewLabel?: string;
-  bodyPreview?: string;
-  webViewLink?: string;
-  detailTitle?: string;
-  detailSubtitle?: string;
-};
-type StorageApiFields = {
-  itemId?: number;
-  externalItemId?: string;
-  snapshotTitle?: string;
-  snapshotSizeBytes?: number;
-  itemSource?: 'GMAIL' | 'DRIVE';
-  snippet?: string;
-  webViewLink?: string;
-};
-type StorageMailItem = StorageApiFields & { id: string; title: string; subtitle: string; meta: string; badge?: string };
-type StorageDriveItem = StorageApiFields & { id: string; type: string; title: string; subtitle: string; fullPath?: string };
-type StorageDetailItem = StorageApiFields & { title: string; meta: string; source: 'mail' | 'drive' };
-type StorageServerPageState = {
-  items: ApiStorageItem[];
-  page: number;
-  size: number;
-  totalElements: number;
-  totalPages: number;
-};
-const storageServerPageCache: Record<string, StorageServerPageState> = {};
-
-const clearStorageServerPageCache = () => {
-  Object.keys(storageServerPageCache).forEach((key) => delete storageServerPageCache[key]);
-};
-const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-const isTerminalCleanupJobStatus = (status?: ApiCleanupJob['job_status']) =>
-  status === 'COMPLETED' || status === 'PARTIAL_FAILED' || status === 'FAILED' || status === 'CANCELED';
-type StorageDriveMoveTargets = Record<string, string>;
-type DriveFolderOption = { id?: string; name: string; meta?: string; parentId?: string };
-type ScanSummary = {
-  mailItems: ScanListItem[];
-  driveItems: ScanListItem[];
-  largeItems: ScanListItem[];
-  protectedItems: ScanListItem[];
-  categorySummaries: Array<{
-    category?: ApiCandidateCategory;
-    itemCount: number;
-    estimatedBytes: number;
-    selectedCount?: number;
-  }>;
-  storageMailItems: StorageMailItem[];
-  storageDriveItems: StorageDriveItem[];
-  storageTrashItems: StorageMailItem[];
-  mailSizeLabel: string;
-  driveSizeLabel: string;
-  largeSizeLabel: string;
-  totalSizeLabel: string;
-  carbonLabel: string;
-  candidateCount: number;
-  folderLabel: string;
-};
-type ScanRecord = {
-  dateLabel: string;
-  sourceLabel: string;
-  conditionLabel: string;
-  result: ScanSummary;
-};
+type StorageMailItem = StorageFlow.StorageMailItem;
+type StorageDriveItem = StorageFlow.StorageDriveItem;
+type StorageDetailItem = StorageFlow.StorageDetailItem;
+type StorageServerPageState = StorageFlow.StorageServerPageState;
+type StorageDriveMoveTargets = StorageFlow.StorageDriveMoveTargets;
+type DriveFolderOption = StorageFlow.DriveFolderOption;
 const navy = '#57C879';
 const line = '#E8EAED';
 const pale = '#F4FFF7';
@@ -445,12 +369,6 @@ const getNotificationDataNumber = (data: Record<string, unknown>, keys: string[]
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
-const getErrorMessage = (error: unknown, fallback: string) => {
-  if (error instanceof Error && error.message) return error.message;
-  if (typeof error === 'object' && error && 'message' in error) return String((error as { message?: unknown }).message);
-  return fallback;
-};
-
 const getUrlQueryParam = (url: string, key: string) => {
   const query = url.split('?')[1]?.split('#')[0];
   if (!query) return null;
@@ -503,12 +421,6 @@ const getUserInitial = (user?: AuraUser | null) => {
   return profileText ? profileText.charAt(0).toUpperCase() : 'A';
 };
 
-const buildGoogleDriveWebViewLink = (externalItemId?: string | null) => {
-  const fileId = externalItemId?.trim();
-  if (!fileId) return undefined;
-  return `https://drive.google.com/open?id=${encodeURIComponent(fileId)}`;
-};
-
 const extractServerAuthCode = (response: unknown) => {
   if (!response || typeof response !== 'object') return null;
 
@@ -520,131 +432,6 @@ const extractServerAuthCode = (response: unknown) => {
   return data.serverAuthCode ?? data.data?.serverAuthCode ?? null;
 };
 
-const getMainTabForScreen = (screen: Screen): MainTab | null => {
-  if (
-    screen === 'storageMail' ||
-    screen === 'storageDrive' ||
-    screen === 'storageDetail'
-  ) {
-    return 'storage';
-  }
-
-  if (
-    screen === 'storageTrash' ||
-    screen === 'storageDriveTrash'
-  ) {
-    return 'trash';
-  }
-
-  if (
-    screen === 'settings' ||
-    screen === 'account' ||
-    screen === 'defaultScan' ||
-    screen === 'privacyData' ||
-    screen === 'serviceWithdraw' ||
-    screen === 'notice'
-  ) {
-    return 'settings';
-  }
-
-  if (
-    screen === 'home' ||
-    screen === 'recentDetail' ||
-    screen === 'keywordFile' ||
-    screen === 'includeKeyword' ||
-    screen === 'excludeKeyword' ||
-    screen === 'scanFlowSource' ||
-    screen === 'scanFlowFolder' ||
-    screen === 'scanFlowPeriod' ||
-    screen === 'scanSource' ||
-    screen === 'driveFolder' ||
-    screen === 'period' ||
-    screen === 'scanProgress' ||
-    screen === 'candidateSummary' ||
-    screen === 'mailList' ||
-    screen === 'driveList' ||
-    screen === 'largeList' ||
-    screen === 'protectedList' ||
-    screen === 'mailDetail' ||
-    screen === 'fileDetail' ||
-    screen === 'selectedReview' ||
-    screen === 'deleteConfirm' ||
-    screen === 'deleteProcessing' ||
-    screen === 'cleanupComplete' ||
-    screen === 'carbonBasis'
-  ) {
-    return 'home';
-  }
-
-  if (
-    screen === 'analysisHistory' ||
-    screen === 'analysisHistoryAll'
-  ) {
-    return 'history';
-  }
-
-  return null;
-};
-
-const getBackFallbackForScreen = (screen: Screen): Screen => {
-  if (
-    screen === 'settings' ||
-    screen === 'account' ||
-    screen === 'defaultScan' ||
-    screen === 'privacyData' ||
-    screen === 'serviceWithdraw' ||
-    screen === 'notice'
-  ) {
-    return 'settings';
-  }
-
-  if (screen === 'storageDriveTrash') return 'storageDrive';
-  if (screen === 'storageTrash') return 'storageMail';
-  if (screen === 'storageMail' || screen === 'storageDrive') return 'storageMail';
-
-  return 'home';
-};
-
-const defaultTabScreens: Record<MainTab, Screen> = {
-  home: 'home',
-  storage: 'storageMail',
-  trash: 'storageTrash',
-  history: 'analysisHistory',
-  settings: 'settings',
-};
-const loginFlowScreens: Screen[] = ['initial', 'privacy', 'permissions', 'connected', 'onboardingIntro', 'onboardingGhost', 'onboardingCarbon'];
-const mainTabOrder: MainTab[] = ['home', 'storage', 'trash', 'history', 'settings'];
-const scanFlowScreens = new Set<Screen>([
-  'scanFlowSource',
-  'scanFlowFolder',
-  'scanFlowPeriod',
-  'scanSource',
-  'driveFolder',
-  'period',
-  'scanProgress',
-  'candidateSummary',
-  'mailList',
-  'driveList',
-  'largeList',
-  'protectedList',
-  'mailDetail',
-  'fileDetail',
-  'selectedReview',
-  'deleteConfirm',
-  'deleteProcessing',
-  'cleanupComplete',
-]);
-
-const NavigationContext = React.createContext<{
-  current: Screen;
-  currentTab: MainTab | null;
-  navigate: (screen: Screen) => void;
-  navigateTab: (tab: MainTab) => void;
-  back: () => void;
-  scanResultPending?: boolean;
-  connectedInstant?: boolean;
-} | null>(null);
-
 const storageSelectionPrefixes = new Set(['storageMail', 'storageDrive', 'storageTrash', 'storageDriveTrash']);
 const isDefaultCandidateSelected = (_prefix?: string, _id?: string) => true;
 const isDefaultSelectionForKey = (key: string) => {
@@ -652,56 +439,6 @@ const isDefaultSelectionForKey = (key: string) => {
   if (!/^(mail|drive|large|storageMail|storageDrive|storageTrash|storageDriveTrash)$/.test(prefix)) return false;
   return !storageSelectionPrefixes.has(prefix);
 };
-const driveRootPath = '내 Drive';
-const splitDrivePath = (path: string) => path.split(/\s*›\s*/).map((part) => part.trim()).filter(Boolean);
-const getDriveParentPath = (path: string) => {
-  const parts = splitDrivePath(path);
-  if (parts.length <= 1) return null;
-  return parts.slice(0, -1).join(' › ');
-};
-const getDriveAncestorFolders = (path: string) => {
-  const parts = splitDrivePath(path);
-  if (parts.length <= 1) return [];
-  return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join(' › '));
-};
-const getDriveFolderName = (path: string) => splitDrivePath(path).at(-1) ?? path;
-const getDirectDriveFolders = (parentPath: string, options: DriveFolderOption[] = []) => {
-  const parentParts = splitDrivePath(parentPath);
-  return options.filter((folder) => {
-    const parts = splitDrivePath(folder.name);
-    return parts.length === parentParts.length + 1 && parentParts.every((part, index) => parts[index] === part);
-  });
-};
-const getVisibleDriveFolders = (currentPath: string, search: string, options: DriveFolderOption[] = []) => {
-  const query = search.trim().toLowerCase();
-  if (query) {
-    return options.filter((folder) => folder.name.toLowerCase().includes(query));
-  }
-
-  return getDirectDriveFolders(currentPath, options);
-};
-const hasDriveFolderChildren = (path: string, options: DriveFolderOption[] = []) => getDirectDriveFolders(path, options).length > 0;
-const getDriveDescendantFolders = (path: string, options: DriveFolderOption[] = []) => options.filter((folder) => folder.name.startsWith(`${path} ›`));
-const getDriveFolderSelectionGroup = (path: string, options: DriveFolderOption[] = []) => [path, ...getDriveDescendantFolders(path, options).map((folder) => folder.name)];
-const getDriveFileSelectionGroup = (_folderPath: string): Array<{ id: string }> => [];
-const getDriveFolderSelected = (path: string, selectedFolders: string[], selectedFiles: string[], options: DriveFolderOption[] = []) => {
-  const folderGroup = getDriveFolderSelectionGroup(path, options);
-  const hasSelectableChildren = folderGroup.length > 0 || selectedFiles.length > 0;
-
-  return hasSelectableChildren && folderGroup.every((folder) => selectedFolders.includes(folder));
-};
-const getStorageDriveItemsForFolder = (folderPath: string): StorageDriveItem[] =>
-  getDirectDriveFolders(folderPath).map((folder) => ({
-    id: `storage-folder-${folder.name}`,
-    type: 'F',
-    title: getDriveFolderName(folder.name),
-    subtitle: `${folder.name} · 폴더`,
-    fullPath: folder.name,
-  }));
-const getAllStorageDriveItems = (): StorageDriveItem[] => [];
-const getStorageDriveTrashItemsForFolder = (_folderPath?: string): StorageDriveItem[] => [];
-const getAllStorageDriveTrashItems = (): StorageDriveItem[] => [];
-
 function createEmptyScanSummary(folderLabel = '전체 Drive'): ScanSummary {
   return {
     mailItems: [],
@@ -722,25 +459,6 @@ function createEmptyScanSummary(folderLabel = '전체 Drive'): ScanSummary {
   };
 }
 const emptyScanSummary: ScanSummary = createEmptyScanSummary();
-
-function formatDataSize(sizeMB: number) {
-  if (sizeMB >= 1024 * 1024) {
-    return `${Math.round(sizeMB / 1024 / 1024)}TB`;
-  }
-  if (sizeMB >= 1024) {
-    return `${Math.round(sizeMB / 1024)}GB`;
-  }
-  if (sizeMB < 1) return `${sizeMB.toFixed(1)}MB`;
-  return `${Math.round(sizeMB)}MB`;
-}
-
-function bytesToMB(bytes?: number | null) {
-  return Math.max(0, Number(bytes ?? 0) / 1024 / 1024);
-}
-
-function formatBytes(bytes?: number | null) {
-  return formatDataSize(bytesToMB(bytes));
-}
 
 function getNiceChartTickStep(targetStep: number, suffix: string) {
   if (!Number.isFinite(targetStep) || targetStep <= 0) return 1;
@@ -786,35 +504,12 @@ function getChartSizeScale(valuesInBytes: number[]) {
 }
 
 const DEFAULT_GOOGLE_DRIVE_TOTAL_BYTES = 15 * 1024 * 1024 * 1024;
-const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
-
 function pickValidByteValue(...values: Array<number | null | undefined>) {
   for (const value of values) {
     const numeric = Number(value);
     if (Number.isFinite(numeric) && numeric >= 0) return numeric;
   }
   return undefined;
-}
-
-function formatApiDate(value?: string | null) {
-  const pad = (target: number) => `${target}`.padStart(2, '0');
-  const toKstLabel = (date: Date) => {
-    const kstDate = new Date(date.getTime() + KST_OFFSET_MS);
-    return `${kstDate.getUTCFullYear()}.${pad(kstDate.getUTCMonth() + 1)}.${pad(kstDate.getUTCDate())} ${pad(kstDate.getUTCHours())}:${pad(kstDate.getUTCMinutes())}`;
-  };
-  const parseApiDate = (dateValue: string) => {
-    const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(dateValue);
-    return new Date(hasTimezone ? dateValue : `${dateValue}Z`);
-  };
-
-  if (!value) return toKstLabel(new Date());
-  const date = parseApiDate(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return toKstLabel(date);
-}
-
-function formatApiDateOnly(value?: string | null) {
-  return formatScanDateOnly(formatApiDate(value));
 }
 
 function apiScanSourceLabel(source?: string | null) {
@@ -834,87 +529,6 @@ function apiCategoryDesc(category?: string, fallback?: string) {
   if (category === 'TEMP_OR_BACKUP') return '임시·백업 파일';
   if (category === 'PROTECTED') return '보호 항목';
   return fallback || '분석 후보';
-}
-
-function apiStorageItemToMail(item: ApiStorageItem): StorageMailItem {
-  const date = formatApiDateOnly(item.trashed_at || item.modified_time || item.last_opened_time);
-  return {
-    id: `api-storage-mail-${item.item_id ?? item.external_item_id ?? item.title}`,
-    itemId: item.item_id,
-    externalItemId: item.external_item_id,
-    snapshotTitle: item.title,
-    snapshotSizeBytes: item.size_bytes,
-    itemSource: item.item_source ?? 'GMAIL',
-    snippet: item.snippet,
-    title: item.title || item.external_item_id || 'Gmail 항목',
-    subtitle: item.title || '메일 항목',
-    meta: `받은날짜 ${date} · Gmail · ${formatBytes(item.size_bytes)}`,
-    badge: item.recoverable === false ? '만료 임박' : undefined,
-  };
-}
-
-function dedupeStorageMailItems(items: StorageMailItem[]) {
-  const map = new Map<string, StorageMailItem>();
-  items.forEach((item) => {
-    map.set(`${item.itemSource ?? 'GMAIL'}:${item.externalItemId ?? item.itemId ?? item.id}`, item);
-  });
-  return Array.from(map.values());
-}
-
-function getApiMetadataString(item: ApiStorageItem, key: string) {
-  const value = item.metadata?.[key];
-  return typeof value === 'string' ? value : undefined;
-}
-
-function normalizeApiDrivePath(path?: string | null) {
-  const raw = path?.trim();
-  if (!raw || raw === '/' || raw === driveRootPath) return driveRootPath;
-  if (raw.startsWith(driveRootPath)) {
-    return raw.replace(/\s*>\s*/g, ' › ').replace(/\s*›\s*/g, ' › ');
-  }
-
-  const normalized = raw
-    .replace(/[\\/]+/g, ' › ')
-    .replace(/\s*>\s*/g, ' › ')
-    .replace(/\s*›\s*/g, ' › ')
-    .replace(/^내\s*Drive\s*›\s*/i, '')
-    .replace(/^Drive\s*›\s*/i, '')
-    .trim();
-
-  return normalized ? `${driveRootPath} › ${normalized}` : driveRootPath;
-}
-
-function isApiStorageFolder(item: ApiStorageItem) {
-  return item.is_folder === true || item.item_type === 'FOLDER' || item.mime_type === 'application/vnd.google-apps.folder';
-}
-
-function getApiStorageFolderPath(item: ApiStorageItem) {
-  return normalizeApiDrivePath(item.folder_path ?? getApiMetadataString(item, 'folder_path') ?? getApiMetadataString(item, 'path'));
-}
-
-function apiDriveFolderToStorageItem(folder: DriveFolderOption): StorageDriveItem {
-  const fullPath = normalizeApiDrivePath(folder.name);
-  const parts = fullPath.split('›').map((part) => part.trim()).filter(Boolean);
-  const title = parts[parts.length - 1] ?? folder.name ?? 'Drive';
-  const parentPath = normalizeApiDrivePath(folder.parentId);
-
-  return {
-    id: `api-storage-folder-${folder.id ?? fullPath}`,
-    externalItemId: folder.id,
-    itemSource: 'DRIVE',
-    type: 'F',
-    title,
-    subtitle: `${parentPath} · 폴더`,
-    fullPath,
-  };
-}
-
-function dedupeStorageDriveItems(items: StorageDriveItem[]) {
-  const map = new Map<string, StorageDriveItem>();
-  items.forEach((item) => {
-    map.set(item.externalItemId ?? item.fullPath ?? item.id, item);
-  });
-  return Array.from(map.values());
 }
 
 function isCompletedScanStatus(status?: string | null) {
@@ -972,109 +586,6 @@ async function fetchAllScanCandidates(scanJobId: number, accessToken: string) {
   ]);
 
   return mergeApiCandidates([...cleanupCandidates, ...protectedCandidates]);
-}
-
-function normalizeServerDrivePath(path?: string | null) {
-  const raw = path?.trim();
-  if (!raw || raw === '/' || raw === driveRootPath) return driveRootPath;
-
-  const parts = raw
-    .replace(/[\\/]+/g, '›')
-    .replace(/\s*>\s*/g, '›')
-    .replace(/\s*›\s*/g, '›')
-    .split('›')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .filter((part, index) => !(index === 0 && /^(내\s*)?drive$/i.test(part)));
-
-  return parts.length ? `${driveRootPath} › ${parts.join(' › ')}` : driveRootPath;
-}
-
-function apiDriveFolderToStorageItemFromApi(folder: DriveFolderOption): StorageDriveItem {
-  const fullPath = normalizeServerDrivePath(folder.name);
-  const parts = splitDrivePath(fullPath);
-  const title = parts[parts.length - 1] ?? folder.name ?? 'Drive';
-  const parentPath = normalizeServerDrivePath(folder.parentId);
-
-  return {
-    id: `api-storage-folder-${folder.id ?? fullPath}`,
-    externalItemId: folder.id,
-    itemSource: 'DRIVE',
-    type: 'F',
-    title,
-    subtitle: `${parentPath} · 폴더`,
-    fullPath,
-  };
-}
-
-function apiStorageItemToDriveFromApi(item: ApiStorageItem, folders: DriveFolderOption[] = []): StorageDriveItem {
-  const isFolder = isApiStorageFolder(item);
-  const extension = isFolder ? 'F' : (item.file_extension || item.mime_type || 'FILE').replace(/^\./, '').toUpperCase();
-  const date = formatApiDateOnly(item.modified_time || item.last_opened_time || item.trashed_at || item.created_time);
-  const metadataPath = item.folder_path ?? getApiMetadataString(item, 'folder_path') ?? getApiMetadataString(item, 'path');
-  const parentFolder = item.parent_folder_id ? folders.find((folder) => folder.id === item.parent_folder_id) : undefined;
-  const parentPath = normalizeServerDrivePath(metadataPath ?? parentFolder?.name ?? driveRootPath);
-  const title = item.title || item.external_item_id || (isFolder ? 'Drive 폴더' : 'Drive 파일');
-
-  return {
-    id: `api-storage-drive-${item.item_id ?? item.external_item_id ?? title}`,
-    itemId: item.item_id,
-    externalItemId: item.external_item_id,
-    snapshotTitle: title,
-    snapshotSizeBytes: item.size_bytes,
-    itemSource: item.item_source ?? 'DRIVE',
-    type: extension || 'FILE',
-    title,
-    subtitle: isFolder ? `${parentPath} · 폴더` : `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · Drive`,
-    fullPath: isFolder ? normalizeServerDrivePath(`${parentPath} › ${title}`) : parentPath,
-    webViewLink: item.web_view_link ?? buildGoogleDriveWebViewLink(item.external_item_id),
-  };
-}
-
-function apiStorageItemToDrive(item: ApiStorageItem): StorageDriveItem {
-  const isFolder = isApiStorageFolder(item);
-  const extension = isFolder ? 'F' : (item.file_extension || item.mime_type || 'FILE').replace(/^\./, '').toUpperCase();
-  const date = formatApiDateOnly(item.modified_time || item.last_opened_time || item.trashed_at || item.created_time);
-  const parentPath = getApiStorageFolderPath(item);
-  const title = item.title || item.external_item_id || (isFolder ? 'Drive 폴더' : 'Drive 파일');
-  return {
-    id: `api-storage-drive-${item.item_id ?? item.external_item_id ?? item.title}`,
-    itemId: item.item_id,
-    externalItemId: item.external_item_id,
-    snapshotTitle: item.title,
-    snapshotSizeBytes: item.size_bytes,
-    itemSource: item.item_source ?? 'DRIVE',
-    type: extension || 'FILE',
-    title: item.title || item.external_item_id || 'Drive 파일',
-    subtitle: `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · Drive`,
-    fullPath: isFolder ? normalizeApiDrivePath(`${parentPath} › ${title}`) : parentPath,
-    webViewLink: item.web_view_link ?? buildGoogleDriveWebViewLink(item.external_item_id),
-  };
-}
-
-function apiStorageItemToTrash(item: ApiStorageItem): StorageMailItem {
-  const source = item.item_source ?? 'GMAIL';
-  const extension = (item.file_extension || item.mime_type || 'FILE').replace(/^\./, '').toUpperCase();
-  const date = formatApiDateOnly(item.trashed_at || item.modified_time || item.last_opened_time);
-  const idSeed = item.item_id ?? item.external_item_id ?? item.title;
-
-  return {
-    id: source === 'DRIVE' ? `trash-drive-api-${idSeed}` : `trash-mail-api-${idSeed}`,
-    itemId: item.item_id,
-    externalItemId: item.external_item_id,
-    snapshotTitle: item.title,
-    snapshotSizeBytes: item.size_bytes,
-    itemSource: source,
-    snippet: item.snippet,
-    webViewLink: source === 'DRIVE' ? item.web_view_link ?? buildGoogleDriveWebViewLink(item.external_item_id) : undefined,
-    title: item.title || item.external_item_id || (source === 'DRIVE' ? 'Drive 파일' : 'Gmail 항목'),
-    subtitle: item.title || (source === 'DRIVE' ? 'Drive 파일' : '메일 항목'),
-    meta:
-      source === 'DRIVE'
-        ? `${extension || 'FILE'} · ${formatBytes(item.size_bytes)} · 휴지통 ${date} · 내 Drive`
-        : `받은날짜 ${date} · Gmail · ${formatBytes(item.size_bytes)}`,
-    badge: item.recoverable === false ? '복구 불가' : undefined,
-  };
 }
 
 function apiCandidateToScanItem(candidate: ApiCandidate): ScanListItem {
@@ -1160,99 +671,6 @@ function buildApiScanSummary(params: {
     candidateCount: (params.candidateCount ?? categoryCandidateCount) || candidateItems.length,
     folderLabel: params.folderLabel ?? '전체 Drive',
   };
-}
-
-function formatScanDateOnly(dateLabel: string) {
-  return dateLabel.split(/\s+/)[0] || dateLabel;
-}
-
-function formatMonthDuration(months: number) {
-  const years = Math.floor(months / 12);
-  const restMonths = months % 12;
-  if (years <= 0) return `${restMonths}개월`;
-  if (restMonths <= 0) return `${years}년`;
-  return `${years}년 ${restMonths}개월`;
-}
-
-function sizeLabelToMB(label: string) {
-  const value = Number.parseFloat(label.replace(/[^0-9.]/g, '')) || 0;
-  const unit = label.toUpperCase();
-  if (unit.includes('TB')) return value * 1024 * 1024;
-  if (unit.includes('GB')) return value * 1024;
-  return value;
-}
-
-function extractStorageSizeMB(textValue: string) {
-  const match = textValue.match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB)/i);
-  if (!match) return 0;
-  const value = Number.parseFloat(match[1]) || 0;
-  const unit = match[2].toUpperCase();
-  if (unit === 'TB') return value * 1024 * 1024;
-  if (unit === 'GB') return value * 1024;
-  return value;
-}
-
-function getStorageSizeLabel(textValue: string) {
-  const sizeMB = extractStorageSizeMB(textValue);
-  return sizeMB > 0 ? formatDataSize(sizeMB) : '';
-}
-
-function splitStorageMeta(textValue: string) {
-  return textValue.split(/\s*(?:·|쨌)\s*/).map((part) => part.trim()).filter(Boolean);
-}
-
-function getTrashDriveFolderPath(meta: string) {
-  const parts = splitStorageMeta(meta);
-  const path = parts.find((part) => part.includes('Drive ›') || part === '내 Drive');
-  if (path) return path;
-  const folderOnly = meta.replace(/\s*(?:·|쨌)\s*(?:폴더|\?대뜑)$/, '').trim();
-  return folderOnly || '내 Drive';
-}
-
-function formatFolderMeta(meta: string) {
-  const match = meta.match(/(\d+(?:\.\d+)?\s*(?:GB|MB))/i);
-  return match?.[1] ?? meta;
-}
-
-function carbonLabelToGram(label: string) {
-  return Number.parseFloat(label.replace(/[^0-9.]/g, '')) || 0;
-}
-
-function parseDateValue(label: string) {
-  const [year, month, day] = label.split('.').map((part) => Number.parseInt(part, 10));
-  return new Date(year || 2000, (month || 1) - 1, day || 1).getTime();
-}
-
-function isOlderThanYears(label: string, years: number) {
-  const target = new Date();
-  target.setFullYear(target.getFullYear() - years);
-  return parseDateValue(label) <= target.getTime();
-}
-
-function applyResultFilterSort(items: ScanListItem[], filterDate: string, filterSize: string, sortMode: string) {
-  const minSize =
-    filterSize === '1GB 이상' ? 1024 : filterSize === '500MB 이상' ? 500 : filterSize === '100MB 이상' ? 100 : 0;
-  const minYears = filterDate === '5년 이상' ? 5 : filterDate === '3년 이상' ? 3 : filterDate === '1년 이상' ? 1 : 0;
-
-  return [...items]
-    .filter((item) => item.sizeMB >= minSize)
-    .filter((item) => (minYears ? isOlderThanYears(item.dateLabel, minYears) : true))
-    .sort((a, b) => {
-      if (sortMode === '용량순') return b.sizeMB - a.sizeMB;
-      if (sortMode === '발신자순' || sortMode === '이름순') {
-        return a.sortText.localeCompare(b.sortText, 'ko') || a.title.localeCompare(b.title, 'ko');
-      }
-      return parseDateValue(a.dateLabel) - parseDateValue(b.dateLabel);
-    });
-}
-
-function sumScanItemSize(items: ScanListItem[]) {
-  return items.reduce((sum, item) => sum + item.sizeMB, 0);
-}
-
-function getDriveFolderMatch(filePath: string, selectedFolders: string[], includeSubFolders: boolean) {
-  if (!selectedFolders.length) return true;
-  return selectedFolders.some((folder) => filePath === folder || (includeSubFolders && filePath.startsWith(`${folder} ›`)));
 }
 
 function buildScanResult({
@@ -5796,6 +5214,8 @@ export default function App() {
           <StorageScreen
             mode={screen}
             scan={storageBackedScan}
+            emptyScanSummary={emptyScanSummary}
+            defaultStorageSummary={defaultStorageSummary}
             apiAccessToken={apiAccessToken}
             apiBootstrapLoading={apiBootstrapLoading}
             googlePermissionChecking={googlePermissionChecking}
@@ -6452,842 +5872,5 @@ export default function App() {
         </SafeAreaView>
       </NavigationContext.Provider>
     </SafeAreaProvider>
-  );
-}
-
-function StorageScreen({
-  mode,
-  scan,
-  apiAccessToken,
-  apiBootstrapLoading,
-  googlePermissionChecking,
-  driveFolders,
-  permissions,
-  checked,
-  toggle,
-  setAll,
-  clearSelectionPrefix,
-  showToast,
-  onReconnect,
-  goMail,
-  goDrive,
-  goTrash,
-  storageDriveFolder,
-  setStorageDriveFolder,
-  storageTrashMovedKeys,
-  storageDeletedKeys,
-  storageRestoredKeys,
-  storageDriveMoveTargets,
-  setStorageTrashMovedKeys,
-  setStorageDeletedKeys,
-  setStorageRestoredKeys,
-  setStorageDriveMoveTargets,
-  openStorageDetail,
-  onLoadDriveFolders,
-  onServerStorageChanged,
-}: {
-  mode: 'storageMail' | 'storageDrive' | 'storageTrash' | 'storageDriveTrash';
-  scan: ScanRecord | null;
-  apiAccessToken: string | null;
-  apiBootstrapLoading: boolean;
-  googlePermissionChecking: boolean;
-  driveFolders: DriveFolderOption[];
-  permissions: { gmail: boolean; drive: boolean; alarm: boolean };
-  checked: Record<string, boolean>;
-  toggle: (key: string) => void;
-  setAll: (prefix: string, keys: string[]) => void;
-  clearSelectionPrefix: (prefix: string) => void;
-  showToast: (message: string, target?: Screen, duration?: number) => void;
-  onReconnect: () => void;
-  goMail: () => void;
-  goDrive: () => void;
-  goTrash: () => void;
-  storageDriveFolder: string;
-  setStorageDriveFolder: (folder: string) => void;
-  storageTrashMovedKeys: string[];
-  storageDeletedKeys: string[];
-  storageRestoredKeys: string[];
-  storageDriveMoveTargets: StorageDriveMoveTargets;
-  setStorageTrashMovedKeys: React.Dispatch<React.SetStateAction<string[]>>;
-  setStorageDeletedKeys: React.Dispatch<React.SetStateAction<string[]>>;
-  setStorageRestoredKeys: React.Dispatch<React.SetStateAction<string[]>>;
-  setStorageDriveMoveTargets: React.Dispatch<React.SetStateAction<StorageDriveMoveTargets>>;
-  openStorageDetail: (item: StorageDetailItem) => void;
-  onLoadDriveFolders: (parentPath?: string) => Promise<void>;
-  onServerStorageChanged?: () => void;
-}) {
-  const isDrive = mode === 'storageDrive' || mode === 'storageDriveTrash';
-  const isTrash = mode === 'storageTrash' || mode === 'storageDriveTrash';
-  const screenTitle = isTrash ? '휴지통' : '정리함';
-  const [selectionMode, setSelectionMode] = useState(false);
-  const [deleteSheetMode, setDeleteSheetMode] = useState<'trash' | 'permanent' | null>(null);
-  const [restoreSheetVisible, setRestoreSheetVisible] = useState(false);
-  const [deleteConfirmChecked, setDeleteConfirmChecked] = useState(false);
-  const [restoreConfirmChecked, setRestoreConfirmChecked] = useState(false);
-  const [storageDriveTrashFolder, setStorageDriveTrashFolder] = useState(driveRootPath);
-  const [storagePage, setStoragePage] = useState(0);
-  const prefix = mode === 'storageDriveTrash' ? 'storageDriveTrash' : isTrash ? 'storageTrash' : isDrive ? 'storageDrive' : 'storageMail';
-  const shouldUseServerPagination = Boolean(apiAccessToken);
-  const storageServerSource = isDrive ? ('DRIVE' as const) : ('GMAIL' as const);
-  const storageApiPageSize = 20;
-  const [serverPage, setServerPage] = useState<StorageServerPageState | null>(null);
-  const [serverPageLoading, setServerPageLoading] = useState(false);
-  const [storageActionRefreshing, setStorageActionRefreshing] = useState(false);
-  const [serverPageError, setServerPageError] = useState('');
-  const serverPageRequestId = useRef(0);
-  const serverPageCacheRef = useRef<Record<string, StorageServerPageState>>(storageServerPageCache);
-  const summary = scan?.result ?? (apiAccessToken ? emptyScanSummary : defaultStorageSummary);
-  const serverMailItems = serverPage?.items.map(apiStorageItemToMail) ?? [];
-  const serverDriveItems = serverPage?.items.map((item) => apiStorageItemToDriveFromApi(item, driveFolders)) ?? [];
-  const serverTrashItems = serverPage?.items.map(apiStorageItemToTrash) ?? [];
-  const cachedServerItems = shouldUseServerPagination && apiAccessToken
-    ? Object.entries(serverPageCacheRef.current)
-        .filter(([key]) => key.startsWith(`${apiAccessToken}:${mode}:${storageServerSource}:`))
-        .flatMap(([, page]) => page.items)
-    : [];
-  const cachedServerDriveItems = mode === 'storageDrive' && shouldUseServerPagination
-    ? cachedServerItems.map((item) => apiStorageItemToDriveFromApi(item, driveFolders))
-    : [];
-  const mailItems = shouldUseServerPagination && mode === 'storageMail' ? serverMailItems : summary.storageMailItems;
-  const allStorageDriveItems = getAllStorageDriveItems();
-  const hasApiStorageDriveItems =
-    (shouldUseServerPagination && mode === 'storageDrive') ||
-    summary.storageDriveItems.some((item) => item.externalItemId || item.id.startsWith('api-storage-drive-'));
-  const applyDriveMove = (item: StorageDriveItem): StorageDriveItem => {
-    const targetFolder = storageDriveMoveTargets[item.id];
-    if (!targetFolder) return item;
-    const fullPath = item.type === 'F' ? `${targetFolder} › ${item.title}` : targetFolder;
-    const meta = item.subtitle.split(' · ').slice(0, -1).join(' · ') || item.subtitle;
-    return {
-      ...item,
-      fullPath,
-      subtitle: item.type === 'F' ? `${fullPath} · 폴더` : `${meta} · ${targetFolder}`,
-    };
-  };
-  const normalizedStorageDriveFolder = normalizeServerDrivePath(storageDriveFolder);
-  const apiStorageFolderItems =
-    shouldUseServerPagination && mode === 'storageDrive'
-      ? driveFolders
-          .filter((folder) => normalizeServerDrivePath(folder.parentId) === normalizedStorageDriveFolder)
-          .map(apiDriveFolderToStorageItemFromApi)
-      : [];
-  const storageDriveUniverse = (shouldUseServerPagination && mode === 'storageDrive'
-    ? dedupeStorageDriveItems([...apiStorageFolderItems, ...cachedServerDriveItems, ...serverDriveItems])
-    : hasApiStorageDriveItems
-      ? summary.storageDriveItems
-      : allStorageDriveItems).map(applyDriveMove);
-  const currentStorageDriveItems = storageDriveUniverse
-    .filter((item) => {
-      const itemPath = item.fullPath ?? '';
-      if (item.type === 'F') return getDriveParentPath(itemPath) === normalizedStorageDriveFolder;
-      return normalizeServerDrivePath(itemPath) === normalizedStorageDriveFolder;
-    });
-  const driveItems = isDrive && !isTrash ? currentStorageDriveItems : summary.storageDriveItems;
-  const activeDriveFolder = mode === 'storageDriveTrash' ? storageDriveTrashFolder : storageDriveFolder;
-  const storageDriveBreadcrumbs = splitDrivePath(activeDriveFolder).map((part, index, parts) => ({
-    label: mode === 'storageDriveTrash' && index === 0 ? '휴지통' : part,
-    path: parts.slice(0, index + 1).join(' › '),
-  }));
-  const movedTrashItems: StorageMailItem[] = storageTrashMovedKeys
-    .map((key): StorageMailItem | null => {
-      const [sourcePrefix, ...idParts] = key.split(':');
-      const id = idParts.join(':');
-      if (sourcePrefix === 'storageMail') {
-        const item = mailItems.find((mail) => mail.id === id);
-        if (!item) return null;
-        return {
-          id: `trash-mail-moved-${item.id}`,
-          itemId: item.itemId,
-          externalItemId: item.externalItemId,
-          snapshotTitle: item.snapshotTitle,
-          snapshotSizeBytes: item.snapshotSizeBytes,
-          itemSource: item.itemSource,
-          title: item.title,
-          subtitle: item.subtitle,
-          meta: item.meta,
-          badge: '복구 가능',
-        };
-      }
-      if (sourcePrefix === 'storageDrive') {
-        const item = allStorageDriveItems.map(applyDriveMove).find((drive) => drive.id === id);
-        if (!item) return null;
-        return {
-          id: `trash-drive-moved-${item.id}`,
-          itemId: item.itemId,
-          externalItemId: item.externalItemId,
-          snapshotTitle: item.snapshotTitle,
-          snapshotSizeBytes: item.snapshotSizeBytes,
-          itemSource: item.itemSource,
-          title: item.title,
-          subtitle: item.title,
-          meta: item.subtitle,
-          webViewLink: item.webViewLink,
-          badge: '복구 가능',
-        };
-      }
-      return null;
-    })
-    .filter((item): item is StorageMailItem => Boolean(item));
-  const combinedTrashItems = [...(shouldUseServerPagination && isTrash ? serverTrashItems : summary.storageTrashItems), ...movedTrashItems];
-  const rawTrashItems = isTrash
-    ? combinedTrashItems.filter((item) => mode === 'storageDriveTrash' ? item.id.startsWith('trash-drive-') : !item.id.startsWith('trash-drive-'))
-    : combinedTrashItems;
-  const itemStorageKey = (id: string) => `${prefix}:${id}`;
-  const isHiddenFromCurrentList = (id: string) => {
-    const key = itemStorageKey(id);
-    return storageDeletedKeys.includes(key) || storageRestoredKeys.includes(key) || (!isTrash && storageTrashMovedKeys.includes(key));
-  };
-  const trashItems = rawTrashItems.filter((item) => !isHiddenFromCurrentList(item.id));
-  const visibleMailItems = mailItems.filter((item) => !isHiddenFromCurrentList(item.id));
-  const visibleDriveItems = driveItems.filter((item) => !isHiddenFromCurrentList(item.id));
-  const serviceConnected = mode === 'storageDriveTrash' ? permissions.drive : isTrash ? permissions.gmail : isDrive ? permissions.drive : permissions.gmail;
-  const toDriveTrashItem = (item: StorageMailItem): StorageDriveItem => {
-    const metaParts = splitStorageMeta(item.meta);
-    const isFolder =
-      item.id.startsWith('trash-drive-folder-') ||
-      item.id.startsWith('trash-drive-moved-storage-folder-') ||
-      metaParts.some((part) => part === '폴더' || part === '?대뜑');
-    return {
-      id: item.id,
-      itemId: item.itemId,
-      externalItemId: item.externalItemId,
-      snapshotTitle: item.snapshotTitle,
-      snapshotSizeBytes: item.snapshotSizeBytes,
-      itemSource: item.itemSource,
-      type: isFolder ? 'F' : metaParts[0] || 'DOC',
-      title: item.title,
-      subtitle: item.meta,
-      fullPath: getTrashDriveFolderPath(item.meta),
-      webViewLink: item.webViewLink ?? buildGoogleDriveWebViewLink(item.externalItemId),
-    };
-  };
-  const mappedSummaryDriveTrashItems: StorageDriveItem[] = mode === 'storageDriveTrash'
-    ? trashItems.map(toDriveTrashItem)
-    : [];
-  const cachedDriveTrashItems: StorageDriveItem[] = mode === 'storageDriveTrash' && shouldUseServerPagination
-    ? cachedServerItems
-        .map(apiStorageItemToTrash)
-        .filter((item) => item.id.startsWith('trash-drive-'))
-        .map(toDriveTrashItem)
-    : [];
-  const movedDriveTrashItems = storageDriveTrashFolder === driveRootPath ? mappedSummaryDriveTrashItems : [];
-  const driveTrashUniverse = dedupeStorageDriveItems([
-    ...(shouldUseServerPagination ? [] : getAllStorageDriveTrashItems()),
-    ...cachedDriveTrashItems,
-    ...mappedSummaryDriveTrashItems,
-  ])
-    .filter((item) => !isHiddenFromCurrentList(item.id));
-  const driveTrashItems: StorageDriveItem[] = mode === 'storageDriveTrash'
-    ? [...(shouldUseServerPagination ? [] : getStorageDriveTrashItemsForFolder(storageDriveTrashFolder)), ...movedDriveTrashItems]
-        .filter((item) => !isHiddenFromCurrentList(item.id))
-    : [];
-  const activeItems = mode === 'storageDriveTrash' ? driveTrashItems : isTrash ? trashItems : isDrive ? visibleDriveItems : visibleMailItems;
-  const mailPagedSourceItems = !isDrive ? (isTrash ? trashItems : visibleMailItems) : [];
-  const mailPageSize = 20;
-  const serverTotalElements = serverPage?.totalElements ?? activeItems.length;
-  const serverTotalPages = Math.max(1, serverPage?.totalPages ?? 1);
-  const mailPageCount = shouldUseServerPagination
-    ? serverTotalPages
-    : Math.max(1, Math.ceil(mailPagedSourceItems.length / mailPageSize));
-  const safeStoragePage = Math.min(storagePage, mailPageCount - 1);
-  const mailPageStart = shouldUseServerPagination ? safeStoragePage * storageApiPageSize : safeStoragePage * mailPageSize;
-  const mailPageEnd = shouldUseServerPagination
-    ? Math.min(mailPageStart + activeItems.length, serverTotalElements)
-    : Math.min(mailPageStart + mailPageSize, mailPagedSourceItems.length);
-  const mailPagedItems = shouldUseServerPagination ? mailPagedSourceItems : mailPagedSourceItems.slice(mailPageStart, mailPageEnd);
-  const cachedMailSelectionItems = !isDrive && shouldUseServerPagination
-    ? cachedServerItems.map((item) => isTrash ? apiStorageItemToTrash(item) : apiStorageItemToMail(item))
-    : [];
-  const mailSelectionUniverse = !isDrive
-    ? dedupeStorageMailItems([...cachedMailSelectionItems, ...mailPagedSourceItems])
-        .filter((item) => !isHiddenFromCurrentList(item.id))
-    : [];
-  const pageRangeTotal = shouldUseServerPagination ? serverTotalElements : mailPagedSourceItems.length;
-  const mailPageRangeStart = pageRangeTotal ? mailPageStart + 1 : 0;
-  const mailPageRangeEnd = pageRangeTotal ? mailPageEnd : 0;
-  const ids = activeItems.map((item) => item.id);
-  const isItemChecked = (id: string) => checked[`${prefix}:${id}`] ?? false;
-  const getStorageDriveSelectionIds = (item: StorageDriveItem) => {
-    if (item.type !== 'F' || !item.fullPath) return [item.id];
-    return storageDriveUniverse
-      .filter((candidate) => candidate.id === item.id || Boolean(candidate.fullPath && (candidate.fullPath === item.fullPath || candidate.fullPath.startsWith(`${item.fullPath} ›`))))
-      .map((candidate) => candidate.id);
-  };
-  const isStorageDriveItemChecked = (item: StorageDriveItem) => {
-    const selectionIds = getStorageDriveSelectionIds(item);
-    if (item.type === 'F' && item.fullPath) {
-      const descendantIds = storageDriveUniverse
-        .filter((candidate) => candidate.id !== item.id && Boolean(candidate.fullPath && candidate.fullPath.startsWith(`${item.fullPath} ›`)))
-        .map((candidate) => candidate.id);
-      if (descendantIds.length > 0 && descendantIds.every(isItemChecked)) return true;
-    }
-    return selectionIds.every(isItemChecked);
-  };
-  const getStorageDriveTrashSelectionIds = (item: StorageDriveItem) => {
-    if (item.type !== 'F' || !item.fullPath) return [item.id];
-    return driveTrashUniverse
-      .filter((candidate) => candidate.id === item.id || Boolean(candidate.fullPath && (candidate.fullPath === item.fullPath || candidate.fullPath.startsWith(`${item.fullPath} ›`))))
-      .map((candidate) => candidate.id);
-  };
-  const isStorageDriveTrashItemChecked = (item: StorageDriveItem) => {
-    const selectionIds = getStorageDriveTrashSelectionIds(item);
-    if (item.type === 'F' && item.fullPath) {
-      const descendantIds = driveTrashUniverse
-        .filter((candidate) => candidate.id !== item.id && Boolean(candidate.fullPath && candidate.fullPath.startsWith(`${item.fullPath} ›`)))
-        .map((candidate) => candidate.id);
-      if (descendantIds.length > 0 && descendantIds.every(isItemChecked)) return true;
-    }
-    return selectionIds.every(isItemChecked);
-  };
-  const activeSelectionIds = isDrive && !isTrash
-    ? Array.from(new Set((activeItems as StorageDriveItem[]).flatMap(getStorageDriveSelectionIds)))
-    : mode === 'storageDriveTrash'
-      ? Array.from(new Set((activeItems as StorageDriveItem[]).flatMap(getStorageDriveTrashSelectionIds)))
-      : mailPagedItems.map((item) => item.id);
-  const allChecked = activeSelectionIds.length > 0 && activeSelectionIds.every(isItemChecked);
-  const selectedItems = isDrive && !isTrash
-    ? storageDriveUniverse.filter((item) => !isHiddenFromCurrentList(item.id) && isItemChecked(item.id))
-    : mode === 'storageDriveTrash'
-      ? driveTrashUniverse.filter((item) => !isHiddenFromCurrentList(item.id) && isItemChecked(item.id))
-    : mailSelectionUniverse.filter((item) => isItemChecked(item.id));
-  const selectedActiveItemCount = selectedItems.length;
-  const isStorageLoading = googlePermissionChecking || apiBootstrapLoading || serverPageLoading || storageActionRefreshing;
-  const shouldShowStorageLoading = shouldUseServerPagination && isStorageLoading;
-  const storageDriveParentId =
-    storageServerSource === 'DRIVE' && !isTrash && normalizedStorageDriveFolder !== driveRootPath
-      ? driveFolders.find((folder) => normalizeServerDrivePath(folder.name) === normalizedStorageDriveFolder)?.id
-      : undefined;
-
-  const loadStorageServerPage = (page: number, force = false): Promise<void> => {
-    if (!apiAccessToken || !shouldUseServerPagination) return Promise.resolve();
-    if (storageServerSource === 'DRIVE' && !isTrash && normalizedStorageDriveFolder !== driveRootPath && !storageDriveParentId) {
-      return Promise.resolve();
-    }
-
-    const cacheKey = `${apiAccessToken}:${mode}:${storageServerSource}:${page}:${storageDriveParentId ?? 'root'}`;
-    const cachedPage = serverPageCacheRef.current[cacheKey];
-    if (cachedPage && !force) {
-      setServerPage(cachedPage);
-      setServerPageError('');
-      setServerPageLoading(false);
-      return Promise.resolve();
-    }
-
-    const requestId = serverPageRequestId.current + 1;
-    serverPageRequestId.current = requestId;
-    setServerPageLoading(true);
-    setServerPageError('');
-    const request = isTrash
-      ? storageApi.getTrash({ item_source: storageServerSource, page, size: storageApiPageSize }, { accessToken: apiAccessToken })
-      : storageApi.getItems(
-          { item_source: storageServerSource, page, size: storageApiPageSize, parent_id: storageDriveParentId },
-          { accessToken: apiAccessToken }
-        );
-
-    return request
-      .then((result) => {
-        if (serverPageRequestId.current !== requestId) return;
-        const nextPage = {
-          items: result.content ?? [],
-          page: result.page ?? page,
-          size: result.size ?? storageApiPageSize,
-          totalElements: result.total_elements ?? result.content?.length ?? 0,
-          totalPages: result.total_pages ?? 1,
-        };
-        serverPageCacheRef.current[cacheKey] = nextPage;
-        storageServerPageCache[cacheKey] = nextPage;
-        setServerPage(nextPage);
-      })
-      .catch((error) => {
-        if (serverPageRequestId.current !== requestId) return;
-        setServerPageError(getErrorMessage(error, '저장소 목록을 불러오지 못했어요'));
-      })
-      .finally(() => {
-        if (serverPageRequestId.current !== requestId) return;
-        setServerPageLoading(false);
-      });
-  };
-
-  useEffect(() => {
-    serverPageRequestId.current += 1;
-    serverPageCacheRef.current = storageServerPageCache;
-    setServerPage(null);
-    setServerPageError('');
-    setServerPageLoading(false);
-  }, [apiAccessToken, mode, storageDriveFolder]);
-
-  useEffect(() => {
-    if (!shouldUseServerPagination || !apiAccessToken) return;
-    void loadStorageServerPage(storagePage);
-  }, [apiAccessToken, mode, shouldUseServerPagination, storagePage, storageDriveFolder, storageDriveParentId]);
-
-  useEffect(() => {
-    if (!apiAccessToken || mode !== 'storageDrive' || !permissions.drive) return;
-    void onLoadDriveFolders(storageDriveFolder);
-  }, [apiAccessToken, mode, permissions.drive, storageDriveFolder]);
-
-  useEffect(() => {
-    setStoragePage(0);
-  }, [mode, storageDriveFolder, storageDriveTrashFolder]);
-
-  useEffect(() => {
-    if (storagePage !== safeStoragePage) {
-      setStoragePage(safeStoragePage);
-    }
-  }, [safeStoragePage, storagePage]);
-
-  useEffect(() => {
-    if (!selectionMode && selectedActiveItemCount > 0) {
-      setSelectionMode(true);
-      return;
-    }
-    if (selectionMode && !selectedActiveItemCount) {
-      setSelectionMode(false);
-    }
-  }, [selectionMode, selectedActiveItemCount]);
-
-  const openMailStorageDetail = (item: StorageMailItem) =>
-    openStorageDetail({
-      title: item.subtitle,
-      meta: item.meta,
-      source: 'mail',
-      itemId: item.itemId,
-      externalItemId: item.externalItemId,
-      snapshotTitle: item.snapshotTitle,
-      snapshotSizeBytes: item.snapshotSizeBytes,
-      itemSource: item.itemSource,
-      snippet: item.snippet,
-    });
-  const openDriveStorageDetail = (item: StorageDriveItem) =>
-    openStorageDetail({
-      title: item.title,
-      meta: item.subtitle,
-      source: 'drive',
-      itemId: item.itemId,
-      externalItemId: item.externalItemId,
-      snapshotTitle: item.snapshotTitle,
-      snapshotSizeBytes: item.snapshotSizeBytes,
-      itemSource: item.itemSource,
-      webViewLink: item.webViewLink ?? buildGoogleDriveWebViewLink(item.externalItemId),
-    });
-  const openDriveStorageItem = (item: StorageDriveItem) => {
-    if (item.type === 'F' && item.fullPath) {
-      setStorageDriveFolder(item.fullPath);
-      return;
-    }
-    openDriveStorageDetail(item);
-  };
-  const openDriveTrashItem = (item: StorageDriveItem) => {
-    if (item.type === 'F' && item.fullPath) {
-      setStorageDriveTrashFolder(item.fullPath);
-      return;
-    }
-    openDriveStorageDetail(item);
-  };
-  const enterSelectionMode = (id: string) => {
-    setSelectionMode(true);
-    toggle(`${prefix}:${id}`);
-  };
-  const toggleStorageDriveItemSelection = (item: StorageDriveItem) => {
-    const selectionIds = getStorageDriveSelectionIds(item);
-    setSelectionMode(true);
-    setAll(prefix, selectionIds);
-  };
-  const toggleStorageDriveTrashItemSelection = (item: StorageDriveItem) => {
-    const selectionIds = getStorageDriveTrashSelectionIds(item);
-    setSelectionMode(true);
-    setAll(prefix, selectionIds);
-  };
-  const toggleAllActiveStorageItems = () => {
-    setAll(prefix, activeSelectionIds);
-    if (allChecked) {
-      setSelectionMode(false);
-    }
-  };
-  const openDeleteSheet = (modeToOpen: 'trash' | 'permanent') => {
-    if (!selectedItems.length) {
-      showToast('삭제할 항목을 선택해주세요');
-      return;
-    }
-    setDeleteConfirmChecked(false);
-    setDeleteSheetMode(modeToOpen);
-  };
-  const openRestoreSheet = () => {
-    if (!selectedItems.length) {
-      showToast('복구할 항목을 선택해주세요');
-      return;
-    }
-    setRestoreConfirmChecked(false);
-    setRestoreSheetVisible(true);
-  };
-  const closeDeleteSheet = () => {
-    setDeleteSheetMode(null);
-    setDeleteConfirmChecked(false);
-  };
-  const closeRestoreSheet = () => {
-    setRestoreSheetVisible(false);
-    setRestoreConfirmChecked(false);
-  };
-  const getMovedTrashOriginalKey = (id: string) => {
-    if (id.startsWith('trash-mail-moved-')) return `storageMail:${id.replace('trash-mail-moved-', '')}`;
-    if (id.startsWith('trash-drive-moved-')) return `storageDrive:${id.replace('trash-drive-moved-', '')}`;
-    return null;
-  };
-  const getApiStorageActionItems = () =>
-    selectedItems
-      .filter((item) => !apiAccessToken || item.itemId !== undefined || Boolean(item.externalItemId))
-      .map((item) => {
-        const externalItemId =
-          item.externalItemId ??
-          item.id
-          .replace(/^api-storage-(?:mail|drive)-/, '')
-          .replace(/^trash-(?:mail|drive)-api-/, '')
-          .replace(/^trash-drive-file-/, '')
-          .replace(/^trash-mail-moved-/, '')
-          .replace(/^trash-drive-moved-/, '')
-          .replace(/^storage-/, '');
-
-        return {
-          item_source: item.itemSource ?? (isDrive ? ('DRIVE' as const) : ('GMAIL' as const)),
-          external_item_id: externalItemId,
-          ...(item.itemId !== undefined ? { item_id: item.itemId } : {}),
-          ...(item.snapshotTitle ? { snapshot_title: item.snapshotTitle } : {}),
-          ...(item.snapshotSizeBytes !== undefined ? { snapshot_size_bytes: item.snapshotSizeBytes } : {}),
-        };
-      });
-  const waitForStorageCleanupJob = async (job?: ApiCleanupJob) => {
-    if (!apiAccessToken || !job?.cleanup_job_id || isTerminalCleanupJobStatus(job.job_status)) return job;
-
-    let latestJob = job;
-    for (let attempt = 0; attempt < 15; attempt += 1) {
-      await wait(1200);
-      latestJob = await cleanupApi.getDetail(job.cleanup_job_id, { accessToken: apiAccessToken });
-      if (isTerminalCleanupJobStatus(latestJob.job_status)) return latestJob;
-    }
-    return latestJob;
-  };
-  const refreshStorageServerAfterAction = () => {
-    clearStorageServerPageCache();
-    serverPageCacheRef.current = storageServerPageCache;
-    setServerPage(null);
-    onServerStorageChanged?.();
-    return loadStorageServerPage(safeStoragePage, true);
-  };
-  const clearCompletedStorageActionKeys = (selectedKeys: string[], action: 'move' | 'permanent' | 'restore') => {
-    if (action === 'move') {
-      setStorageTrashMovedKeys((items) => items.filter((key) => !selectedKeys.includes(key)));
-      return;
-    }
-    if (action === 'permanent') {
-      setStorageDeletedKeys((items) => items.filter((key) => !selectedKeys.includes(key)));
-      return;
-    }
-    setStorageRestoredKeys((items) => items.filter((key) => !selectedKeys.includes(key)));
-  };
-  const refreshStorageServerAfterCleanupJob = (job: ApiCleanupJob | undefined, selectedKeys: string[], action: 'move' | 'permanent' | 'restore') => {
-    setStorageActionRefreshing(true);
-    void waitForStorageCleanupJob(job)
-      .then(async (finishedJob) => {
-        await refreshStorageServerAfterAction();
-        if (!finishedJob?.cleanup_job_id || isTerminalCleanupJobStatus(finishedJob.job_status)) {
-          clearCompletedStorageActionKeys(selectedKeys, action);
-        }
-        if (finishedJob?.job_status === 'PARTIAL_FAILED') {
-          showToast('일부 항목 처리에 실패했어요. 목록을 다시 확인해주세요', undefined, 3200);
-        }
-        if (finishedJob?.job_status === 'FAILED' || finishedJob?.job_status === 'CANCELED') {
-          showToast('항목 처리 작업이 완료되지 못했어요', undefined, 3200);
-        }
-      })
-      .catch(async () => {
-        await refreshStorageServerAfterAction();
-        showToast('작업 완료 상태 확인에 실패했어요. 목록을 다시 불러왔습니다', undefined, 3000);
-      })
-      .finally(() => {
-        setStorageActionRefreshing(false);
-      });
-  };
-
-  const confirmStorageDelete = async () => {
-    if (!deleteConfirmChecked) {
-      showToast('삭제 확인 체크가 필요합니다');
-      return;
-    }
-
-    const permanent = deleteSheetMode === 'permanent';
-    const selectedKeys = selectedItems.map((item) => itemStorageKey(item.id));
-    const apiItems = getApiStorageActionItems();
-
-    if (apiAccessToken && !apiItems.length) {
-      showToast('서버에 전달할 항목 정보가 없어요');
-      return;
-    }
-
-    try {
-      let cleanupJob: ApiCleanupJob | undefined;
-      if (apiAccessToken) {
-        if (permanent) {
-          cleanupJob = await storageApi.permanentDelete(apiItems, { accessToken: apiAccessToken });
-        } else {
-          cleanupJob = await storageApi.moveToTrash(apiItems, { accessToken: apiAccessToken });
-        }
-      }
-
-      closeDeleteSheet();
-
-      if (!permanent) {
-        setStorageTrashMovedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
-        showToast(apiAccessToken ? '휴지통 이동 요청을 처리 중이에요' : '선택 항목을 휴지통으로 이동했어요');
-      } else {
-        setStorageDeletedKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
-        showToast(apiAccessToken ? '영구 삭제 요청을 처리 중이에요' : '영구 삭제가 완료됐어요');
-      }
-
-      clearSelectionPrefix(prefix);
-      setSelectionMode(false);
-      if (apiAccessToken) {
-        refreshStorageServerAfterCleanupJob(cleanupJob, selectedKeys, permanent ? 'permanent' : 'move');
-      }
-    } catch (error) {
-      showToast(getErrorMessage(error, permanent ? '영구 삭제 요청에 실패했어요' : '휴지통 이동 요청에 실패했어요'), undefined, 3000);
-    }
-  };
-  const confirmStorageRestore = async () => {
-    if (!restoreConfirmChecked) {
-      showToast('복구 확인 체크가 필요합니다');
-      return;
-    }
-
-    const selectedKeys = selectedItems.map((item) => itemStorageKey(item.id));
-    const movedSourceKeys = selectedItems
-      .map((item) => getMovedTrashOriginalKey(item.id))
-      .filter((key): key is string => Boolean(key));
-    const apiItems = getApiStorageActionItems();
-
-    if (apiAccessToken && !apiItems.length) {
-      showToast('서버에 전달할 항목 정보가 없어요');
-      return;
-    }
-
-    try {
-      let cleanupJob: ApiCleanupJob | undefined;
-      if (apiAccessToken) {
-        cleanupJob = await storageApi.restore(apiItems, { accessToken: apiAccessToken });
-      }
-
-      closeRestoreSheet();
-      setStorageRestoredKeys((items) => Array.from(new Set([...items, ...selectedKeys])));
-      if (movedSourceKeys.length) {
-        setStorageTrashMovedKeys((items) => items.filter((key) => !movedSourceKeys.includes(key)));
-      }
-      clearSelectionPrefix(prefix);
-      setSelectionMode(false);
-      showToast(apiAccessToken ? '복구 요청을 처리 중이에요' : '선택 항목을 정리함으로 복구했어요');
-      if (apiAccessToken) {
-        refreshStorageServerAfterCleanupJob(cleanupJob, selectedKeys, 'restore');
-      }
-    } catch (error) {
-      showToast(getErrorMessage(error, '복구 요청에 실패했어요'), undefined, 3000);
-    }
-  };
-  const storageFloatingActions: FloatingAction[] | undefined = selectionMode && !deleteSheetMode && !restoreSheetVisible
-    ? isTrash
-      ? [
-          { variant: 'restore', onPress: openRestoreSheet, small: true },
-          { variant: 'trash', onPress: () => openDeleteSheet('permanent') },
-        ]
-      : [{ variant: 'delete', onPress: () => openDeleteSheet('trash') }]
-    : undefined;
-
-  return (
-    <View style={styles.modalScreenRoot}>
-    <ScreenShell
-      title={screenTitle}
-      titleIcon={isTrash ? 'trash' : 'storage'}
-      hideBack
-      tightBottom
-      hideFloatingScan={selectionMode || Boolean(deleteSheetMode) || restoreSheetVisible}
-      floatingAction={storageFloatingActions}
-    >
-      <View style={styles.storagePrimaryTabs}>
-        <Pressable style={[styles.storagePrimaryTab, !isDrive && styles.storagePrimaryTabActive]} onPress={goMail}>
-          <Text style={[styles.storagePrimaryTabText, !isDrive && styles.storagePrimaryTabTextActive]}>메일</Text>
-        </Pressable>
-        <Pressable style={[styles.storagePrimaryTab, isDrive && styles.storagePrimaryTabActive]} onPress={goDrive}>
-          <Text style={[styles.storagePrimaryTabText, isDrive && styles.storagePrimaryTabTextActive]}>Drive</Text>
-        </Pressable>
-      </View>
-      {isTrash ? (
-        <View style={styles.storageTrashNoticeBlock}>
-          <Text style={styles.storageTrashNoticeText}>휴지통에 있는 항목들은 30일 이후 자동으로 삭제됩니다.</Text>
-        </View>
-      ) : null}
-      {!googlePermissionChecking && !serviceConnected ? (
-        <PermissionRevokedCard onPress={onReconnect} />
-      ) : (
-        <View style={styles.storageLooseList}>
-          {isDrive ? (
-            <View style={[styles.storagePathCard, isTrash && styles.storagePathCardAfterTrashNotice]}>
-              <View style={styles.storageBreadcrumbRow}>
-                {storageDriveBreadcrumbs.map((crumb, index) => (
-                  <React.Fragment key={crumb.path}>
-                    <Pressable
-                      style={styles.storageBreadcrumbPressable}
-                      onPress={() => {
-                        if (mode === 'storageDriveTrash') {
-                          setStorageDriveTrashFolder(crumb.path);
-                          return;
-                        }
-                        setStorageDriveFolder(crumb.path);
-                      }}
-                      hitSlop={8}
-                    >
-                      <Text style={[styles.storageBreadcrumbText, index === storageDriveBreadcrumbs.length - 1 && styles.storageBreadcrumbCurrent]}>
-                        {crumb.label}
-                      </Text>
-                    </Pressable>
-                    {index < storageDriveBreadcrumbs.length - 1 ? <Text style={styles.storageBreadcrumbDivider}>›</Text> : null}
-                  </React.Fragment>
-                ))}
-              </View>
-              <Text style={styles.storagePathCountText}>{activeItems.length}개</Text>
-
-            </View>
-          ) : (
-            <View style={[styles.storagePathCard, isTrash && styles.storagePathCardAfterTrashNotice, styles.storagePagerCard]}>
-              <Text style={styles.storagePagerText}>
-                메일 {pageRangeTotal}개 중 {mailPageRangeStart}~{mailPageRangeEnd}개
-              </Text>
-              <View style={styles.storagePagerButtons}>
-                <Pressable
-                  style={[styles.storagePagerButton, safeStoragePage <= 0 && styles.storagePagerButtonDisabled]}
-                  disabled={safeStoragePage <= 0}
-                  onPress={() => setStoragePage((page) => Math.max(0, page - 1))}
-                >
-                  <Text style={[styles.storagePagerGlyph, safeStoragePage <= 0 && styles.storagePagerGlyphDisabled]}>‹</Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.storagePagerButton, safeStoragePage >= mailPageCount - 1 && styles.storagePagerButtonDisabled]}
-                  disabled={safeStoragePage >= mailPageCount - 1}
-                  onPress={() => setStoragePage((page) => Math.min(mailPageCount - 1, page + 1))}
-                >
-                  <Text style={[styles.storagePagerGlyph, safeStoragePage >= mailPageCount - 1 && styles.storagePagerGlyphDisabled]}>›</Text>
-                </Pressable>
-              </View>
-            </View>
-          )}
-          {serverPageError && !shouldShowStorageLoading ? (
-            <View style={styles.warningCard}>
-              <Text style={styles.warningText}>{serverPageError}</Text>
-              <View style={styles.twoButtons}>
-                <OutlineButton title="재시도" onPress={() => void loadStorageServerPage(safeStoragePage, true)} half />
-                <PrimaryButton title="권한 재연결" onPress={onReconnect} half />
-              </View>
-            </View>
-          ) : null}
-          {activeItems.length > 0 && selectionMode && !shouldShowStorageLoading ? (
-            <Pressable style={styles.storageSelectAllRowInBox} onPress={toggleAllActiveStorageItems}>
-              <CheckBox checked={allChecked} onPress={toggleAllActiveStorageItems} compact />
-              <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택'}</Text>
-            </Pressable>
-          ) : null}
-          {shouldShowStorageLoading ? (
-            <View style={styles.storageLoadingCard}>
-              <ActivityIndicator color="#74C987" />
-              <Text style={styles.infoDesc}>서버 데이터를 불러오는 중이에요</Text>
-            </View>
-          ) : activeItems.length ? (
-            <View style={styles.storageListContent}>
-                  {mode === 'storageDriveTrash'
-                    ? driveTrashItems.map((item) => (
-                        <StorageDriveCard
-                          key={item.id}
-                          prefix={prefix}
-                          item={item}
-                          checked={isStorageDriveTrashItemChecked(item)}
-                          toggle={toggle}
-                          selectionMode={selectionMode}
-                          onOpen={() => openDriveTrashItem(item)}
-                          onLongSelect={() => toggleStorageDriveTrashItemSelection(item)}
-                          onSelect={() => toggleStorageDriveTrashItemSelection(item)}
-                          descriptionOverride={getTrashDriveFolderPath(item.subtitle)}
-                          rightSizeLabel={getStorageSizeLabel(item.subtitle)}
-                          rightSizeDanger={extractStorageSizeMB(item.subtitle) >= 500}
-                          compact
-                        />
-                      ))
-                    : isTrash
-                    ? mailPagedItems.map((item) => (
-                        <StorageMailCard
-                          key={item.id}
-                          prefix={prefix}
-                          item={item}
-                          checked={isItemChecked(item.id)}
-                          toggle={toggle}
-                          selectionMode={selectionMode}
-                          onOpen={openMailStorageDetail}
-                          onLongSelect={enterSelectionMode}
-                          compact
-                          trashMode="mail"
-                        />
-                      ))
-                    : isDrive
-                      ? visibleDriveItems.map((item) => (
-                        <StorageDriveCard
-                          key={item.id}
-                          prefix={prefix}
-                          item={item}
-                          checked={isStorageDriveItemChecked(item)}
-                          toggle={toggle}
-                          selectionMode={selectionMode}
-                          onOpen={() => openDriveStorageItem(item)}
-                          onLongSelect={() => toggleStorageDriveItemSelection(item)}
-                          onSelect={() => toggleStorageDriveItemSelection(item)}
-                          compact
-                        />
-                      ))
-                      : mailPagedItems.map((item) => (
-                        <StorageMailCard
-                          key={item.id}
-                          prefix={prefix}
-                          item={item}
-                          checked={isItemChecked(item.id)}
-                          toggle={toggle}
-                          selectionMode={selectionMode}
-                          onOpen={openMailStorageDetail}
-                          onLongSelect={enterSelectionMode}
-                          compact
-                        />
-                      ))}
-            </View>
-          ) : (
-            <EmptyState
-              title={isTrash ? '휴지통이 비어있어요' : isDrive ? '현재 폴더가 비어있어요' : '메일이 없어요'}
-              desc={isDrive && !isTrash ? '이 위치 아래에 표시할 폴더나 파일이 없어요.' : '현재 표시할 항목이 없어요.'}
-            />
-          )}
-        </View>
-      )}
-    </ScreenShell>
-    {deleteSheetMode ? (
-      <StorageDeleteSheet
-        permanent={deleteSheetMode === 'permanent'}
-        count={selectedItems.length}
-        checked={deleteConfirmChecked}
-        onToggle={() => setDeleteConfirmChecked((value) => !value)}
-        onCancel={closeDeleteSheet}
-        onConfirm={confirmStorageDelete}
-      />
-    ) : null}
-    {restoreSheetVisible ? (
-      <StorageRestoreSheet
-        count={selectedItems.length}
-        checked={restoreConfirmChecked}
-        onToggle={() => setRestoreConfirmChecked((value) => !value)}
-        onCancel={closeRestoreSheet}
-        onConfirm={confirmStorageRestore}
-      />
-    ) : null}
-    </View>
   );
 }
