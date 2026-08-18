@@ -26,6 +26,7 @@ import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
 import { LineChart } from 'react-native-chart-kit';
 import Constants from 'expo-constants';
 import * as Device from 'expo-device';
+import * as SecureStore from 'expo-secure-store';
 import Svg, { Circle, Defs, Line, LinearGradient as SvgLinearGradient, Path, Stop, Text as SvgText } from 'react-native-svg';
 import { authApi } from './src/api/auth';
 import { DEV_AURA_ACCESS_TOKEN, GOOGLE_OAUTH_REDIRECT_URI, GOOGLE_WEB_CLIENT_ID } from './src/api/config';
@@ -131,6 +132,57 @@ const loadNotificationsModule = () => {
 };
 
 const AURA_NOTIFICATION_CHANNEL_ID = 'aura-default';
+const AURA_AUTH_SESSION_KEY = 'aura.auth.session.v1';
+
+type StoredAuthSession = {
+  accessToken?: string;
+  refreshToken?: string;
+  user?: AuraUser;
+  privacyChecked?: boolean;
+};
+
+type WebStorageLike = {
+  getItem: (key: string) => string | null;
+  setItem: (key: string, value: string) => void;
+  removeItem: (key: string) => void;
+};
+
+const getWebStorage = (): WebStorageLike | null => {
+  if (typeof globalThis === 'undefined') return null;
+  return (globalThis as typeof globalThis & { localStorage?: WebStorageLike }).localStorage ?? null;
+};
+
+const readStoredAuthSession = async (): Promise<StoredAuthSession | null> => {
+  try {
+    const raw =
+      Platform.OS === 'web'
+        ? getWebStorage()?.getItem(AURA_AUTH_SESSION_KEY) ?? null
+        : await SecureStore.getItemAsync(AURA_AUTH_SESSION_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as StoredAuthSession;
+  } catch {
+    return null;
+  }
+};
+
+const saveStoredAuthSession = async (session: StoredAuthSession) => {
+  if (!session.refreshToken) return;
+
+  const value = JSON.stringify(session);
+  if (Platform.OS === 'web') {
+    getWebStorage()?.setItem(AURA_AUTH_SESSION_KEY, value);
+    return;
+  }
+  await SecureStore.setItemAsync(AURA_AUTH_SESSION_KEY, value);
+};
+
+const clearStoredAuthSession = async () => {
+  if (Platform.OS === 'web') {
+    getWebStorage()?.removeItem(AURA_AUTH_SESSION_KEY);
+    return;
+  }
+  await SecureStore.deleteItemAsync(AURA_AUTH_SESSION_KEY);
+};
 
 type FloatingButtonVariant = 'scan' | 'delete' | 'trash' | 'restore';
 type FloatingAction = { variant: Exclude<FloatingButtonVariant, 'scan'>; onPress: () => void; small?: boolean };
@@ -1592,6 +1644,8 @@ export default function App() {
   const cleanupReclaimedOpacity = useRef(new Animated.Value(1)).current;
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const devAccessTokenApplied = useRef(false);
+  const authRestoreAttempted = useRef(false);
+  const latestRefreshTokenRef = useRef<string | null>(null);
   const screenRef = useRef<Screen>('initial');
   const scanSourceLabelRef = useRef('Gmail + Drive');
   const scanResultRef = useRef<ScanSummary>(emptyScanSummary);
@@ -2000,6 +2054,10 @@ export default function App() {
     setPrivacyDetailChecked(false);
     setPermissions({ gmail: false, drive: false, alarm: false });
     setDisabledGooglePermissions({ gmail: false, drive: false });
+    setApiAccessToken(null);
+    setCurrentUser(null);
+    latestRefreshTokenRef.current = null;
+    void clearStoredAuthSession();
     setIncludeInput('');
     setExcludeInput('');
     setIncludeKeywords(['광고', '프로모션', '뉴스레터']);
@@ -2131,6 +2189,23 @@ export default function App() {
     }
   };
 
+  const rememberAuthSession = (
+    accessToken?: string | null,
+    refreshToken?: string | null,
+    user?: AuraUser | null
+  ) => {
+    const nextRefreshToken = refreshToken ?? latestRefreshTokenRef.current;
+    if (!nextRefreshToken) return;
+
+    latestRefreshTokenRef.current = nextRefreshToken;
+    void saveStoredAuthSession({
+      accessToken: accessToken ?? apiAccessToken ?? undefined,
+      refreshToken: nextRefreshToken,
+      user: user ?? currentUser ?? undefined,
+      privacyChecked,
+    });
+  };
+
   const applyApiScanSetting = (setting?: ApiScanSetting | null) => {
     if (!setting) return;
 
@@ -2243,8 +2318,8 @@ export default function App() {
       const next = getGooglePermissionFlags(response);
       setPermissions((items) => ({
         ...items,
-        gmail: next.hasGmail ? next.gmail && !disabledGooglePermissions.gmail : items.gmail,
-        drive: next.hasDrive ? next.drive && !disabledGooglePermissions.drive : items.drive,
+        gmail: next.hasGmail ? next.gmail : items.gmail,
+        drive: next.hasDrive ? next.drive : items.drive,
       }));
       if (showSuccessToast) {
         showToast('Google 권한 상태를 다시 확인했어요');
@@ -2278,6 +2353,7 @@ export default function App() {
               platform: getAuraPlatform(),
             });
             const nextAccessToken = session.accessToken ?? apiAccessToken;
+            rememberAuthSession(nextAccessToken, session.refreshToken, session.user);
 
             if (session.accessToken) {
               setApiAccessToken(session.accessToken);
@@ -2334,37 +2410,97 @@ export default function App() {
     }
   };
 
-  const disableGoogleServicePermission = (serviceType: GoogleServiceType) => {
-    const key = getGoogleServicePermissionKey(serviceType);
-
-    setDisabledGooglePermissions((items) => ({ ...items, [key]: true }));
-    setPermissions((items) => ({ ...items, [key]: false }));
-
-    if (serviceType === 'GMAIL') {
-      setScanSources((items) => ({ ...items, gmail: false }));
-    } else {
-      setScanSources((items) => ({ ...items, drive: false, folder: false }));
-      setSelectedDriveFolders([]);
-      setSelectedDriveFiles([]);
-      setApiDriveFolderOptions([]);
-      setApiDriveFolderIdsByPath({});
-      loadedDriveFolderPaths.current.clear();
+  const enableGoogleServicePermission = async (serviceType: GoogleServiceType) => {
+    if (!apiAccessToken) {
+      showToast('로그인 후 Google 권한 상태를 변경할 수 있어요');
+      return false;
     }
 
-    clearStorageServerPageCache();
-    setApiHomeSummary((summary) =>
-      summary
-        ? {
-            ...summary,
-            permissions: {
-              ...(summary.permissions ?? {}),
-              [serviceType === 'GMAIL' ? 'gmail_status' : 'drive_status']: 'DISCONNECTED',
-            },
-          }
-        : summary
-    );
-    showToast(`${getGoogleServiceLabel(serviceType)} 접근을 해제했어요`);
-    return Promise.resolve(true);
+    const key = getGoogleServicePermissionKey(serviceType);
+
+    setGooglePermissionChecking(true);
+    try {
+      const response = await googleApi.updatePermission(
+        serviceType,
+        { is_connected: true },
+        { accessToken: apiAccessToken }
+      );
+      const next = getGooglePermissionFlags(response);
+      const isConnected = serviceType === 'GMAIL' ? next.gmail : next.drive;
+
+      setDisabledGooglePermissions((items) => ({ ...items, [key]: false }));
+      setPermissions((items) => ({ ...items, [key]: isConnected }));
+      clearStorageServerPageCache();
+      await refreshGooglePermissions(apiAccessToken, false);
+      void refreshAuraApis(apiAccessToken);
+
+      if (!isConnected) {
+        showToast(`${getGoogleServiceLabel(serviceType)} 권한 재연결이 필요해요`, undefined, 2600);
+        return false;
+      }
+
+      showToast(`${getGoogleServiceLabel(serviceType)} 접근을 허용했어요`);
+      return true;
+    } catch (error) {
+      showToast(getErrorMessage(error, `${getGoogleServiceLabel(serviceType)} 접근 허용에 실패했어요`), undefined, 2800);
+      return false;
+    } finally {
+      setGooglePermissionChecking(false);
+    }
+  };
+
+  const disableGoogleServicePermission = async (serviceType: GoogleServiceType) => {
+    if (!apiAccessToken) {
+      showToast('로그인 후 Google 권한 상태를 변경할 수 있어요');
+      return false;
+    }
+
+    const key = getGoogleServicePermissionKey(serviceType);
+
+    setGooglePermissionChecking(true);
+    try {
+      await googleApi.updatePermission(
+        serviceType,
+        { is_connected: false },
+        { accessToken: apiAccessToken }
+      );
+
+      setDisabledGooglePermissions((items) => ({ ...items, [key]: true }));
+      setPermissions((items) => ({ ...items, [key]: false }));
+
+      if (serviceType === 'GMAIL') {
+        setScanSources((items) => ({ ...items, gmail: false }));
+      } else {
+        setScanSources((items) => ({ ...items, drive: false, folder: false }));
+        setSelectedDriveFolders([]);
+        setSelectedDriveFiles([]);
+        setApiDriveFolderOptions([]);
+        setApiDriveFolderIdsByPath({});
+        loadedDriveFolderPaths.current.clear();
+      }
+
+      clearStorageServerPageCache();
+      setApiHomeSummary((summary) =>
+        summary
+          ? {
+              ...summary,
+              permissions: {
+                ...(summary.permissions ?? {}),
+                [serviceType === 'GMAIL' ? 'gmail_status' : 'drive_status']: 'DISCONNECTED',
+              },
+            }
+          : summary
+      );
+      await refreshGooglePermissions(apiAccessToken, false);
+      void refreshAuraApis(apiAccessToken);
+      showToast(`${getGoogleServiceLabel(serviceType)} 접근을 해제했어요`);
+      return true;
+    } catch (error) {
+      showToast(getErrorMessage(error, `${getGoogleServiceLabel(serviceType)} 접근 해제에 실패했어요`), undefined, 2800);
+      return false;
+    } finally {
+      setGooglePermissionChecking(false);
+    }
   };
 
   const handleGoogleOAuthRedirect = async (url: string) => {
@@ -2383,6 +2519,7 @@ export default function App() {
         platform: getAuraPlatform(),
       });
       const nextAccessToken = session.accessToken ?? apiAccessToken;
+      rememberAuthSession(nextAccessToken, session.refreshToken, session.user);
 
       if (session.accessToken) {
         setApiAccessToken(session.accessToken);
@@ -2743,6 +2880,77 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (DEV_AURA_ACCESS_TOKEN || authRestoreAttempted.current) return;
+
+    authRestoreAttempted.current = true;
+    let mounted = true;
+
+    const restoreAuthSession = async () => {
+      const storedSession = await readStoredAuthSession();
+      if (!mounted || !storedSession?.refreshToken) return;
+
+      latestRefreshTokenRef.current = storedSession.refreshToken;
+      if (storedSession.accessToken) {
+        setApiAccessToken(storedSession.accessToken);
+      }
+      if (storedSession.user) {
+        applyApiUser(storedSession.user);
+      }
+      if (storedSession.privacyChecked) {
+        setPrivacyChecked(true);
+        setPrivacyDetailChecked(true);
+      }
+
+      setAuthLoading(true);
+      try {
+        const refreshedSession = await authApi.refresh(storedSession.refreshToken);
+        if (!mounted) return;
+
+        const nextAccessToken = refreshedSession.accessToken ?? storedSession.accessToken ?? null;
+        const nextRefreshToken = refreshedSession.refreshToken ?? storedSession.refreshToken;
+        let nextUser = storedSession.user ?? null;
+
+        latestRefreshTokenRef.current = nextRefreshToken;
+        if (nextAccessToken) {
+          setApiAccessToken(nextAccessToken);
+          try {
+            nextUser = await userApi.getMe({ accessToken: nextAccessToken });
+            if (mounted) {
+              applyApiUser(nextUser);
+            }
+          } catch {
+            if (storedSession.user) {
+              applyApiUser(storedSession.user);
+            }
+          }
+
+          await saveStoredAuthSession({
+            accessToken: nextAccessToken,
+            refreshToken: nextRefreshToken,
+            user: nextUser ?? undefined,
+            privacyChecked: true,
+          });
+          replace('home');
+          void refreshAuraApis(nextAccessToken);
+        }
+      } catch {
+        latestRefreshTokenRef.current = null;
+        await clearStoredAuthSession();
+      } finally {
+        if (mounted) {
+          setAuthLoading(false);
+        }
+      }
+    };
+
+    void restoreAuthSession();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!DEV_AURA_ACCESS_TOKEN || devAccessTokenApplied.current) return;
 
     devAccessTokenApplied.current = true;
@@ -2797,12 +3005,14 @@ export default function App() {
 
       const nextAccessToken = session.accessToken ?? null;
       setApiAccessToken(nextAccessToken);
+      rememberAuthSession(nextAccessToken, session.refreshToken, session.user);
 
       if (session.user) {
         applyApiUser(session.user);
       } else if (nextAccessToken) {
         const user = await userApi.getMe({ accessToken: nextAccessToken });
         applyApiUser(user);
+        rememberAuthSession(nextAccessToken, session.refreshToken, user);
       }
 
       if (nextAccessToken && privacyChecked) {
@@ -2865,12 +3075,14 @@ export default function App() {
 
       const nextAccessToken = session.accessToken ?? null;
       setApiAccessToken(nextAccessToken);
+      rememberAuthSession(nextAccessToken, session.refreshToken, session.user);
 
       if (session.user) {
         applyApiUser(session.user);
       } else if (nextAccessToken) {
         const user = await userApi.getMe({ accessToken: nextAccessToken });
         applyApiUser(user);
+        rememberAuthSession(nextAccessToken, session.refreshToken, user);
       }
 
       if (nextAccessToken && privacyChecked) {
@@ -4890,7 +5102,7 @@ export default function App() {
             back={back}
             onServicePermissionChange={syncUserPermissions}
             requestPushPermission={requestPushPermission}
-            requestGoogleReconnect={requestGoogleReconnect}
+            enableGoogleServicePermission={enableGoogleServicePermission}
             disableGoogleServicePermission={disableGoogleServicePermission}
           />
         );
@@ -5859,14 +6071,27 @@ export default function App() {
               </View>
             </View>
 
-            <SectionTitle>연결된 서비스</SectionTitle>
+            <View style={styles.sectionHeaderRow}>
+              <SectionTitle>연결된 서비스</SectionTitle>
+              <Pressable
+                style={[styles.sectionRefreshButton, googlePermissionChecking && styles.sectionRefreshButtonDisabled]}
+                disabled={googlePermissionChecking}
+                onPress={() => void refreshGooglePermissions()}
+                hitSlop={8}
+              >
+                {googlePermissionChecking ? (
+                  <ActivityIndicator size="small" color="#74C987" />
+                ) : (
+                  <Feather name="refresh-cw" size={18} color="#74C987" />
+                )}
+              </Pressable>
+            </View>
             <View style={styles.groupCard}>
               <ServiceLinkRow service="gmail" title="Gmail" connected={permissions.gmail} checking={googlePermissionChecking} onPress={() => go('gmailPermission')} />
               <View style={styles.thinDivider} />
               <ServiceLinkRow service="drive" title="Google Drive" connected={permissions.drive} checking={googlePermissionChecking} onPress={() => go('drivePermission')} />
             </View>
 
-            <OutlineButton title="Google 권한 다시 확인" onPress={() => void refreshGooglePermissions()} />
             <OutlineButton title="이 계정 연결 해제" onPress={() => showToast('계정 연결 해제는 발표용 화면에서는 실행하지 않아요')} />
           </ScreenShell>
         );
@@ -7382,14 +7607,14 @@ function PermissionDetail({
   back,
   onServicePermissionChange,
   requestPushPermission,
-  requestGoogleReconnect,
+  enableGoogleServicePermission,
   disableGoogleServicePermission,
 }: {
   screen: PermissionScreen;
   back: () => void;
   onServicePermissionChange: (nextPermissions: Partial<AuraServicePermissions>) => Promise<void>;
   requestPushPermission: () => Promise<boolean>;
-  requestGoogleReconnect: (serviceTypes: GoogleServiceType[]) => Promise<boolean>;
+  enableGoogleServicePermission: (serviceType: GoogleServiceType) => Promise<boolean>;
   disableGoogleServicePermission: (serviceType: GoogleServiceType) => Promise<boolean>;
 }) {
   const info = {
@@ -7477,7 +7702,7 @@ function PermissionDetail({
   }[screen];
 
   return (
-    <ScreenShell title={info.title} subtitle={info.subtitle} noNav onBack={back}>
+    <ScreenShell title={info.title} subtitle={info.key === 'alarm' ? info.subtitle : undefined} noNav onBack={back}>
       {screen === 'notificationPermission' ? (
         <PushNotificationPermissionContent />
       ) : (
@@ -7509,8 +7734,8 @@ function PermissionDetail({
           }
 
           const serviceType = info.key === 'gmail' ? 'GMAIL' : 'DRIVE';
-          void requestGoogleReconnect([serviceType]).then((started) => {
-            if (started) {
+          void enableGoogleServicePermission(serviceType).then((enabled) => {
+            if (enabled) {
               back();
             }
           });
@@ -8033,6 +8258,7 @@ function StorageScreen({
   const storageApiPageSize = 20;
   const [serverPage, setServerPage] = useState<StorageServerPageState | null>(null);
   const [serverPageLoading, setServerPageLoading] = useState(false);
+  const [storageActionRefreshing, setStorageActionRefreshing] = useState(false);
   const [serverPageError, setServerPageError] = useState('');
   const serverPageRequestId = useRef(0);
   const serverPageCacheRef = useRef<Record<string, StorageServerPageState>>(storageServerPageCache);
@@ -8251,23 +8477,26 @@ function StorageScreen({
       ? driveTrashUniverse.filter((item) => !isHiddenFromCurrentList(item.id) && isItemChecked(item.id))
     : mailSelectionUniverse.filter((item) => isItemChecked(item.id));
   const selectedActiveItemCount = selectedItems.length;
-  const isStorageLoading = googlePermissionChecking || apiBootstrapLoading || serverPageLoading;
+  const isStorageLoading = googlePermissionChecking || apiBootstrapLoading || serverPageLoading || storageActionRefreshing;
+  const shouldShowStorageLoading = shouldUseServerPagination && isStorageLoading;
   const storageDriveParentId =
     storageServerSource === 'DRIVE' && !isTrash && normalizedStorageDriveFolder !== driveRootPath
       ? driveFolders.find((folder) => normalizeServerDrivePath(folder.name) === normalizedStorageDriveFolder)?.id
       : undefined;
 
-  const loadStorageServerPage = (page: number) => {
-    if (!apiAccessToken || !shouldUseServerPagination) return;
-    if (storageServerSource === 'DRIVE' && !isTrash && normalizedStorageDriveFolder !== driveRootPath && !storageDriveParentId) return;
+  const loadStorageServerPage = (page: number, force = false): Promise<void> => {
+    if (!apiAccessToken || !shouldUseServerPagination) return Promise.resolve();
+    if (storageServerSource === 'DRIVE' && !isTrash && normalizedStorageDriveFolder !== driveRootPath && !storageDriveParentId) {
+      return Promise.resolve();
+    }
 
     const cacheKey = `${apiAccessToken}:${mode}:${storageServerSource}:${page}:${storageDriveParentId ?? 'root'}`;
     const cachedPage = serverPageCacheRef.current[cacheKey];
-    if (cachedPage) {
+    if (cachedPage && !force) {
       setServerPage(cachedPage);
       setServerPageError('');
       setServerPageLoading(false);
-      return;
+      return Promise.resolve();
     }
 
     const requestId = serverPageRequestId.current + 1;
@@ -8281,7 +8510,7 @@ function StorageScreen({
           { accessToken: apiAccessToken }
         );
 
-    void request
+    return request
       .then((result) => {
         if (serverPageRequestId.current !== requestId) return;
         const nextPage = {
@@ -8315,7 +8544,7 @@ function StorageScreen({
 
   useEffect(() => {
     if (!shouldUseServerPagination || !apiAccessToken) return;
-    loadStorageServerPage(storagePage);
+    void loadStorageServerPage(storagePage);
   }, [apiAccessToken, mode, shouldUseServerPagination, storagePage, storageDriveFolder, storageDriveParentId]);
 
   useEffect(() => {
@@ -8468,7 +8697,7 @@ function StorageScreen({
     serverPageCacheRef.current = storageServerPageCache;
     setServerPage(null);
     onServerStorageChanged?.();
-    loadStorageServerPage(safeStoragePage);
+    return loadStorageServerPage(safeStoragePage, true);
   };
   const clearCompletedStorageActionKeys = (selectedKeys: string[], action: 'move' | 'permanent' | 'restore') => {
     if (action === 'move') {
@@ -8482,9 +8711,10 @@ function StorageScreen({
     setStorageRestoredKeys((items) => items.filter((key) => !selectedKeys.includes(key)));
   };
   const refreshStorageServerAfterCleanupJob = (job: ApiCleanupJob | undefined, selectedKeys: string[], action: 'move' | 'permanent' | 'restore') => {
+    setStorageActionRefreshing(true);
     void waitForStorageCleanupJob(job)
-      .then((finishedJob) => {
-        refreshStorageServerAfterAction();
+      .then(async (finishedJob) => {
+        await refreshStorageServerAfterAction();
         if (!finishedJob?.cleanup_job_id || isTerminalCleanupJobStatus(finishedJob.job_status)) {
           clearCompletedStorageActionKeys(selectedKeys, action);
         }
@@ -8495,9 +8725,12 @@ function StorageScreen({
           showToast('항목 처리 작업이 완료되지 못했어요', undefined, 3200);
         }
       })
-      .catch(() => {
-        refreshStorageServerAfterAction();
+      .catch(async () => {
+        await refreshStorageServerAfterAction();
         showToast('작업 완료 상태 확인에 실패했어요. 목록을 다시 불러왔습니다', undefined, 3000);
+      })
+      .finally(() => {
+        setStorageActionRefreshing(false);
       });
   };
 
@@ -8667,23 +8900,27 @@ function StorageScreen({
               </View>
             </View>
           )}
-          {isStorageLoading ? <Text style={styles.infoDesc}>서버 목록을 불러오는 중...</Text> : null}
-          {serverPageError ? (
+          {serverPageError && !shouldShowStorageLoading ? (
             <View style={styles.warningCard}>
               <Text style={styles.warningText}>{serverPageError}</Text>
               <View style={styles.twoButtons}>
-                <OutlineButton title="재시도" onPress={() => loadStorageServerPage(safeStoragePage)} half />
+                <OutlineButton title="재시도" onPress={() => void loadStorageServerPage(safeStoragePage, true)} half />
                 <PrimaryButton title="권한 재연결" onPress={onReconnect} half />
               </View>
             </View>
           ) : null}
-          {activeItems.length > 0 && selectionMode ? (
+          {activeItems.length > 0 && selectionMode && !shouldShowStorageLoading ? (
             <Pressable style={styles.storageSelectAllRowInBox} onPress={toggleAllActiveStorageItems}>
               <CheckBox checked={allChecked} onPress={toggleAllActiveStorageItems} compact />
               <Text style={styles.selectAllText}>{allChecked ? '전체 선택 해제' : '전체 선택'}</Text>
             </Pressable>
           ) : null}
-          {activeItems.length ? (
+          {shouldShowStorageLoading ? (
+            <View style={styles.storageLoadingCard}>
+              <ActivityIndicator color="#74C987" />
+              <Text style={styles.infoDesc}>서버 데이터를 불러오는 중이에요</Text>
+            </View>
+          ) : activeItems.length ? (
             <View style={styles.storageListContent}>
                   {mode === 'storageDriveTrash'
                     ? driveTrashItems.map((item) => (
@@ -8746,11 +8983,6 @@ function StorageScreen({
                           compact
                         />
                       ))}
-            </View>
-          ) : isStorageLoading ? (
-            <View style={styles.storageLoadingCard}>
-              <ActivityIndicator color="#74C987" />
-              <Text style={styles.infoDesc}>서버 데이터를 불러오는 중이에요</Text>
             </View>
           ) : (
             <EmptyState
@@ -9432,14 +9664,18 @@ function CarbonSaveAnimation({ onDone, skip }: { onDone: () => void; skip?: bool
       <View style={styles.historyTotalMiniCard}>
         <View>
           <Text style={styles.onboardingMetricLabel}>전체 누적 삭제 용량</Text>
-          <Text style={styles.historyTotalMiniValue}>{step >= 1 ? '0MB' : '...'}</Text>
+          <Text style={styles.historyTotalMiniValue}>{step >= 1 ? '1.8GB' : '...'}</Text>
         </View>
         <View style={styles.historyMiniPill}>
-          <Text style={styles.historyMiniPillText}>최근 스캔 +0MB</Text>
+          <Text style={styles.historyMiniPillText}>최근 스캔 +620MB</Text>
         </View>
       </View>
       <SectionTitle>스캔별 확보 용량 현황</SectionTitle>
-      <CarbonStatsGraph sizeLabel="0MB" />
+      <CarbonStatsGraph
+        sizeLabel="1.8GB"
+        values={[240, 520, 980, 1840].map((value) => value * 1024 * 1024)}
+        labels={['1회', '2회', '3회', '4회']}
+      />
     </View>
   );
 }
@@ -10402,6 +10638,25 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '900',
     marginTop: 4,
+  },
+  sectionHeaderRow: {
+    marginTop: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  sectionRefreshButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: line,
+    backgroundColor: '#FFFFFF',
+  },
+  sectionRefreshButtonDisabled: {
+    opacity: 0.55,
   },
   body: {
     color: text,

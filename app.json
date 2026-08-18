@@ -18,6 +18,7 @@
     },
     "android": {
       "package": "com.aura.userapp",
+      "googleServicesFile": "./google-services.json",
       "permissions": [
         "POST_NOTIFICATIONS"
       ],
@@ -39,7 +40,8 @@
           "color": "#0D3B66",
           "defaultChannel": "aura-default"
         }
-      ]
+      ],
+      "expo-secure-store"
     ],
     "extra": {
       "eas": {

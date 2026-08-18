@@ -36,6 +36,7 @@ export const API_ENDPOINTS = {
   },
   google: {
     permissions: '/api/google/permissions',
+    permission: (serviceType: 'GMAIL' | 'DRIVE') => `/api/google/permissions/${serviceType}`,
     recheck: '/api/google/permissions/recheck',
     reconnectUrl: '/api/google/permissions/reconnect-url',
     disconnect: '/api/google/connection',

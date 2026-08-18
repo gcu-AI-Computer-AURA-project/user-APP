@@ -88,6 +88,10 @@ export type ApiReconnectUrlResponse = {
   authorization_url?: string;
 };
 
+export type ApiPermissionUpdateRequest = {
+  is_connected: boolean;
+};
+
 export type ApiNotificationSetting = {
   is_scan_complete_enabled?: boolean;
   is_scan_recommend_enabled?: boolean;
@@ -445,6 +449,20 @@ export const googleApi = {
     return unwrap(
       await apiRequest<ApiEnvelope<ApiPermissionResponse>>(API_ENDPOINTS.google.recheck, {
         method: 'POST',
+        accessToken: options?.accessToken,
+        signal: options?.signal,
+      })
+    );
+  },
+  async updatePermission(
+    serviceType: 'GMAIL' | 'DRIVE',
+    payload: ApiPermissionUpdateRequest,
+    options?: ApiRequestOptions
+  ) {
+    return unwrap(
+      await apiRequest<ApiEnvelope<ApiPermissionResponse>>(API_ENDPOINTS.google.permission(serviceType), {
+        method: 'PATCH',
+        body: payload,
         accessToken: options?.accessToken,
         signal: options?.signal,
       })
